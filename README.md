@@ -153,9 +153,15 @@ terminal styling (the raw text is kept for the model and for copying).
 
 Copy to the system clipboard (`pbcopy` / `wl-copy` / `xclip`):
 
+- **Click a code block** to copy it (terminals with mouse support). Each block
+  shows a header like `── rust · ⧉ click to copy · /clip 1 ──`.
+- `/clip <n>` — copy code block *n* by number (works everywhere, incl. SSH).
 - `/clip` — copy the whole last response.
-- `/clip <n>` — copy just code block *n*. When a response contains code blocks,
-  a dim footer shows the per-block copy hints (`⧉ copy:  /clip 1 rust  …`).
+
+> Click-to-copy is best-effort for blocks still on screen in the latest response
+> (Zero uses native terminal scrollback, not a full-screen canvas, so it doesn't
+> track scrolled-off positions). A miss is a no-op — it never copies the wrong
+> block. `/clip <n>` is the always-reliable path.
 
 ## Test & coverage
 

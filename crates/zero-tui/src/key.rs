@@ -30,6 +30,11 @@ pub enum Key {
     ShiftEnter,
     /// A Ctrl-letter chord, normalized to lowercase (`Ctrl('c')` for ^C).
     Ctrl(char),
+    /// A left-button mouse click at 1-based (col, row) — for click-to-copy.
+    Click {
+        col: u16,
+        row: u16,
+    },
 }
 
 /// Outcome of trying to decode one key at the front of a buffer.
@@ -105,6 +110,10 @@ fn decode_escape(buf: &[u8]) -> Step {
 /// is a modifier (2=Shift, 3=Alt, 5=Ctrl), plus the `~`-terminated numeric form
 /// and the CSI-u form `ESC [ <code> ; <mod> u`.
 fn decode_csi(buf: &[u8]) -> Step {
+    // SGR mouse report: `ESC [ < btn ; col ; row (M|m)`.
+    if buf.len() >= 3 && buf[1] == b'[' && buf[2] == b'<' {
+        return decode_mouse(buf);
+    }
     // buf[0] == ESC, buf[1] == '[' or 'O'.
     let mut i = 2;
     // Collect up to two numeric params separated by ';'.
@@ -187,6 +196,50 @@ fn decode_csi(buf: &[u8]) -> Step {
         _ => return Step::Consume(total),
     };
     Step::Key(key, total)
+}
+
+/// Decode an SGR mouse report `ESC [ < btn ; col ; row (M|m)`. Emits a
+/// [`Key::Click`] for a left-button press; ignores releases, drags, and other
+/// buttons (consumed without a key).
+fn decode_mouse(buf: &[u8]) -> Step {
+    // Parse three ';'-separated numbers starting after `ESC [ <`.
+    let mut nums = [0u32; 3];
+    let mut idx = 0usize;
+    let mut i = 3;
+    while i < buf.len() {
+        let c = buf[i];
+        if c.is_ascii_digit() {
+            if idx < nums.len() {
+                nums[idx] = nums[idx].saturating_mul(10) + u32::from(c - b'0');
+            }
+            i += 1;
+        } else if c == b';' {
+            idx += 1;
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if i >= buf.len() {
+        return Step::NeedMore; // terminator not yet arrived
+    }
+    let final_byte = buf[i];
+    let total = i + 1;
+    let (btn, col, row) = (nums[0], nums[1], nums[2]);
+    // 'M' = press, 'm' = release. Low 2 bits select the button (0 = left);
+    // bit 5 (32) marks motion/drag.
+    let is_left_press = final_byte == b'M' && (btn & 0b11) == 0 && (btn & 32) == 0;
+    if is_left_press && col > 0 && row > 0 {
+        Step::Key(
+            Key::Click {
+                col: col.min(u32::from(u16::MAX)) as u16,
+                row: row.min(u32::from(u16::MAX)) as u16,
+            },
+            total,
+        )
+    } else {
+        Step::Consume(total)
+    }
 }
 
 fn decode_utf8(buf: &[u8]) -> Step {
@@ -416,6 +469,25 @@ mod tests {
     #[test]
     fn csi_u_plain_letter_is_a_char() {
         assert_eq!(keys(b"\x1b[97u"), vec![Key::Char('a')]);
+    }
+
+    #[test]
+    fn sgr_mouse_left_press_is_a_click() {
+        assert_eq!(keys(b"\x1b[<0;15;8M"), vec![Key::Click { col: 15, row: 8 }]);
+    }
+
+    #[test]
+    fn sgr_mouse_release_and_other_buttons_ignored() {
+        assert!(keys(b"\x1b[<0;15;8m").is_empty()); // release
+        assert!(keys(b"\x1b[<2;1;1M").is_empty()); // right button
+        assert!(keys(b"\x1b[<35;1;1M").is_empty()); // motion (bit 5 set)
+    }
+
+    #[test]
+    fn partial_mouse_report_waits() {
+        let (k, consumed) = decode_keys(b"\x1b[<0;15");
+        assert!(k.is_empty());
+        assert_eq!(consumed, 0);
     }
 
     #[test]

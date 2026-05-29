@@ -86,6 +86,12 @@ pub struct App<I: Input, W: Write> {
     last_blocks: Vec<crate::markdown::CodeBlock>,
     /// How `/clip` copies — the system clipboard by default; swappable in tests.
     clipboard: ClipboardFn,
+    /// Total content lines emitted (newline count) — the current line's index.
+    printed_lines: usize,
+    /// Absolute line index of the last response's first rendered line.
+    last_anchor: usize,
+    /// Per-rendered-line code-block map for the last response (click-to-copy).
+    last_line_blocks: Vec<Option<usize>>,
 }
 
 impl<I: Input, W: Write> App<I, W> {
@@ -117,6 +123,9 @@ impl<I: Input, W: Write> App<I, W> {
             last_reply: String::new(),
             last_blocks: Vec::new(),
             clipboard: Box::new(clipboard_copy),
+            printed_lines: 0,
+            last_anchor: 0,
+            last_line_blocks: Vec::new(),
         }
     }
 
@@ -150,6 +159,9 @@ impl<I: Input, W: Write> App<I, W> {
         // protocol). On terminals that support it, Shift+Enter then arrives as
         // `ESC [ 13 ; 2 u`; on others this is silently ignored. Popped in finish.
         self.out.write_all(b"\x1b[>1u")?;
+        // Enable SGR mouse reporting so clicks (e.g. on a code block) are
+        // delivered as input; disabled again in finish().
+        self.out.write_all(b"\x1b[?1000h\x1b[?1006h")?;
         self.print_banner()?;
         self.redraw_input()?;
 
@@ -188,7 +200,8 @@ impl<I: Input, W: Write> App<I, W> {
     }
 
     fn finish(&mut self) -> io::Result<()> {
-        // Pop the kitty keyboard-protocol flags we pushed in run().
+        // Disable mouse reporting and pop the kitty keyboard-protocol flags.
+        self.out.write_all(b"\x1b[?1000l\x1b[?1006l")?;
         self.out.write_all(b"\x1b[<u")?;
         self.write_text("\n")?;
         Ok(())
@@ -230,6 +243,7 @@ impl<I: Input, W: Write> App<I, W> {
             Key::WordLeft => self.editor.word_left(),
             Key::WordRight => self.editor.word_right(),
             Key::ShiftEnter => self.editor.insert_newline(),
+            Key::Click { row, .. } => return self.on_click(row).map(|()| Flow::Continue),
             Key::Ctrl(_) | Key::Tab => {} // unmapped; ignore
             Key::Enter => return self.on_submit(),
             Key::Backspace => self.editor.backspace(),
@@ -373,8 +387,11 @@ impl<I: Input, W: Write> App<I, W> {
             let _ = log.record_message(Role::User, &text);
         }
 
+        // The assistant's first rendered line sits on the label line.
+        let anchor = self.printed_lines;
         // Disjoint field borrows let the sink write while the backend is read.
-        let (reply, elapsed) = stream_reply(self.backend.as_ref(), &mut self.out, &self.conv)?;
+        let (reply, elapsed, nl) = stream_reply(self.backend.as_ref(), &mut self.out, &self.conv)?;
+        self.printed_lines += nl;
 
         self.conv.push(Message::assistant(&reply));
         if let Some(log) = self.log.as_mut() {
@@ -383,6 +400,9 @@ impl<I: Input, W: Write> App<I, W> {
         }
         self.last_reply = reply; // remembered for /clip
         self.last_blocks = crate::markdown::code_blocks(&self.last_reply);
+        // Click-to-copy map for this response.
+        self.last_anchor = anchor;
+        self.last_line_blocks = crate::markdown::line_blocks(&self.last_reply);
 
         // Honest, measured elapsed — dimmed, never an estimate. (Each code block
         // already showed its own `⧉ /clip <n>` header inline as it streamed.)
@@ -406,6 +426,32 @@ impl<I: Input, W: Write> App<I, W> {
             }
             _ => self.write_text("\x1b[31mno such code block — see the /clip hints\x1b[0m\n"),
         }
+    }
+
+    /// Handle a mouse click: if it landed on a code block of the last response
+    /// (and that block is still on screen), copy it. A miss is a no-op — never
+    /// copies the wrong block.
+    fn on_click(&mut self, row: u16) -> io::Result<()> {
+        let rows = crate::term::terminal_size().rows as usize;
+        let r = row as usize;
+        if rows == 0 || r == 0 || self.printed_lines + r < rows {
+            return Ok(()); // off-screen / above the scrollback we track
+        }
+        // Map the clicked screen row to an absolute content line, then into the
+        // last response (its first line is at `last_anchor`).
+        let clicked_abs = self.printed_lines + r - rows;
+        let Some(i) = clicked_abs.checked_sub(self.last_anchor) else {
+            return Ok(());
+        };
+        let block = match self.last_line_blocks.get(i).copied().flatten() {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        if let Some(cb) = self.last_blocks.get(block - 1) {
+            let body = cb.body.clone();
+            return self.copy_text(&body);
+        }
+        Ok(())
     }
 
     /// Copy `text` via the configured clipboard and report the result.
@@ -809,8 +855,10 @@ impl<I: Input, W: Write> App<I, W> {
         self.write_text(&out)
     }
 
-    /// Write text, translating `\n` to `\r\n` for raw mode.
+    /// Write text, translating `\n` to `\r\n` for raw mode. Tracks the running
+    /// line count so clicks can be mapped back to on-screen content.
     fn write_text(&mut self, s: &str) -> io::Result<()> {
+        self.printed_lines += s.bytes().filter(|&b| b == b'\n').count();
         write_raw(&mut self.out, s)
     }
 }
@@ -863,18 +911,20 @@ fn write_raw<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Stream a reply from `backend`, echoing tokens live, returning the full text
-/// plus measured elapsed time. Free function so the caller can pass disjoint
-/// `&mut out` and `&backend` borrows.
+/// Stream a reply from `backend`, echoing tokens live. Returns the full raw
+/// text, measured elapsed time, and the number of content lines (newlines) it
+/// emitted — the caller advances its line counter by that. Free function so the
+/// caller can pass disjoint `&mut out` and `&backend` borrows.
 fn stream_reply<W: Write>(
     backend: &dyn Backend,
     out: &mut W,
     conv: &Conversation,
-) -> io::Result<(String, Duration)> {
+) -> io::Result<(String, Duration, usize)> {
     let mut reply = String::new();
     let mut io_err: Option<io::Error> = None;
-    // `reply` keeps the raw markdown (for the model + /clip); `md` renders it to
-    // ANSI for live display so `**bold**`, `*italic*`, `` `code` `` look right.
+    let mut nl = 0usize; // newlines we emit, for line tracking
+                         // `reply` keeps the raw markdown (for the model + /clip); `md` renders it to
+                         // ANSI for live display so `**bold**`, `*italic*`, `` `code` `` look right.
     let mut md = crate::markdown::MarkdownStream::new();
 
     write_raw(
@@ -891,6 +941,7 @@ fn stream_reply<W: Write>(
         if let StreamEvent::Token(t) = ev {
             reply.push_str(&t);
             let rendered = md.feed(&t);
+            nl += rendered.bytes().filter(|&b| b == b'\n').count();
             if let Err(e) = write_raw(out, &rendered).and_then(|()| out.flush()) {
                 io_err = Some(e);
             }
@@ -902,11 +953,14 @@ fn stream_reply<W: Write>(
         return Err(e);
     }
     // Close any styling left open at the end of the response.
-    write_raw(out, &md.finish())?;
+    let tail = md.finish();
+    nl += tail.bytes().filter(|&b| b == b'\n').count();
+    write_raw(out, &tail)?;
     if let Err(e) = stream_res {
         write_raw(out, &format!("\n\x1b[31m[{e}]\x1b[0m"))?;
+        nl += 1;
     }
-    Ok((reply, elapsed))
+    Ok((reply, elapsed, nl))
 }
 
 #[cfg(test)]
@@ -1044,7 +1098,7 @@ mod tests {
         let mut conv = Conversation::new();
         conv.push(Message::user("ping"));
         let mut out = Vec::new();
-        let (reply, _) = stream_reply(&StubBackend::instant(), &mut out, &conv).unwrap();
+        let (reply, _, _) = stream_reply(&StubBackend::instant(), &mut out, &conv).unwrap();
         assert!(reply.contains("ping"));
         let painted = String::from_utf8(out).unwrap();
         assert!(painted.contains("›"));
@@ -1056,7 +1110,7 @@ mod tests {
         let conv = Conversation::new();
         let mut out = Vec::new();
         assert_eq!(FailBackend.name(), "fail");
-        let (reply, _) = stream_reply(&FailBackend, &mut out, &conv).unwrap();
+        let (reply, _, _) = stream_reply(&FailBackend, &mut out, &conv).unwrap();
         assert!(reply.is_empty());
         assert!(String::from_utf8(out).unwrap().contains("boom"));
     }
@@ -1235,6 +1289,44 @@ mod tests {
     }
 
     #[test]
+    fn click_on_a_code_block_line_copies_it() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let captured = Rc::new(RefCell::new(String::new()));
+        let sink = captured.clone();
+        let mut a = app(b"");
+        a.set_clipboard(Box::new(move |s| {
+            *sink.borrow_mut() = s.to_string();
+            Ok(())
+        }));
+        // Post-response state: response line 0 = label, lines 1–2 = a block.
+        a.last_blocks = vec![crate::markdown::CodeBlock {
+            lang: "rust".into(),
+            body: "fn main() {}".into(),
+        }];
+        a.last_anchor = 0;
+        a.last_line_blocks = vec![None, Some(1), Some(1)];
+        a.printed_lines = 2; // body's last line is the current bottom line
+        let rows = crate::term::terminal_size().rows as usize;
+        // Row that maps to absolute line 2 (the body): line = printed + row - rows.
+        let click_row = (rows + 2).saturating_sub(a.printed_lines);
+        a.dispatch(Key::Click {
+            col: 1,
+            row: click_row as u16,
+        })
+        .unwrap();
+        assert_eq!(*captured.borrow(), "fn main() {}");
+    }
+
+    #[test]
+    fn click_off_any_block_is_a_noop() {
+        let mut a = app(b"");
+        a.dispatch(Key::Click { col: 1, row: 1 }).unwrap();
+        a.dispatch(Key::Click { col: 9, row: 99 }).unwrap();
+        assert!(a.last_reply.is_empty());
+    }
+
+    #[test]
     fn clip_with_nothing_says_so() {
         let mut a = app(b"");
         type_str(&mut a, "/clip");
@@ -1274,7 +1366,7 @@ mod tests {
         let mut conv = Conversation::new();
         conv.push(Message::user("x"));
         let mut out = Vec::new();
-        let (reply, _) = stream_reply(&BoldBackend, &mut out, &conv).unwrap();
+        let (reply, _, _) = stream_reply(&BoldBackend, &mut out, &conv).unwrap();
         assert_eq!(reply, "**hi**"); // raw markdown preserved for model/clip
         let painted = String::from_utf8(out).unwrap();
         assert!(painted.contains("\x1b[1mhi")); // displayed bold
