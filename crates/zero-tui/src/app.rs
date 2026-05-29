@@ -644,12 +644,18 @@ impl<I: Input, W: Write> App<I, W> {
     fn on_click(&mut self, row: u16) -> io::Result<()> {
         let rows = crate::term::terminal_size().rows as usize;
         let r = row as usize;
-        if rows == 0 || r == 0 || self.printed_lines + r < rows {
-            return Ok(()); // off-screen / above the scrollback we track
+        if rows == 0 || r == 0 {
+            return Ok(());
         }
-        // Map the clicked screen row to an absolute content line, then into the
-        // last response (its first line is at `last_anchor`).
-        let clicked_abs = self.printed_lines + r - rows;
+        // The input box sits at the bottom: top rule (on content line
+        // `printed_lines`), `input_rows` input lines, then the bottom rule at the
+        // very bottom screen row. So the box bottom rule maps to content line
+        // `printed_lines + input_rows + 1` ↔ screen row `rows`.
+        let input_rows = self.editor.text().split('\n').count();
+        let from_bottom = rows.saturating_sub(input_rows + 1);
+        let Some(clicked_abs) = (self.printed_lines + r).checked_sub(from_bottom) else {
+            return Ok(());
+        };
         let Some(i) = clicked_abs.checked_sub(self.last_anchor) else {
             return Ok(());
         };
@@ -1664,10 +1670,12 @@ mod tests {
         }];
         a.last_anchor = 0;
         a.last_line_blocks = vec![None, Some(1), Some(1)];
-        a.printed_lines = 2; // body's last line is the current bottom line
+        a.printed_lines = 2; // body's last content line index
         let rows = crate::term::terminal_size().rows as usize;
-        // Row that maps to absolute line 2 (the body): line = printed + row - rows.
-        let click_row = (rows + 2).saturating_sub(a.printed_lines);
+        // Empty editor → 1 input row → box bottom rule is 2 rows below content.
+        // clicked_abs = printed_lines + r + (input_rows+1) - rows; want line 2:
+        // 2 = 2 + r + 2 - rows  →  r = rows - 2.
+        let click_row = rows.saturating_sub(2);
         a.dispatch(Key::Click {
             col: 1,
             row: click_row as u16,
