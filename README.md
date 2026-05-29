@@ -14,7 +14,6 @@ zero/
 ├── Cargo.toml              workspace + release profile
 ├── rust-toolchain.toml     pinned to 1.93.1
 ├── README.md
-├── docs/north-stars.md     why this project exists (the design bets)
 ├── scripts/coverage.sh     coverage gate (>=98%, enforced)
 └── crates/
     ├── zero-core/          the engine — std only, no UI, no I/O assumptions
@@ -75,18 +74,6 @@ per clone:
 git config core.hooksPath scripts/hooks
 ```
 
-## North stars
-
-The bets that justify building this — full reasoning in
-[docs/north-stars.md](docs/north-stars.md):
-
-1. **Claude-Code terminal feel** — inline render, native scrollback.
-2. **Terminal ≡ app** — every capability lives in `zero-core`; UIs are shells.
-3. **Honest timestamps** — measure real elapsed time, never estimate.
-4. **Rich logging** — JSONL transcript, real wall-clock stamps.
-5. **Compaction done right** — the hard problem; its own slice later.
-6. **Instructions actually followed** — the `CLAUDE.md` problem, made reliable.
-
 ## Renaming
 
 - **Display name / config dir / prompt label** come from
@@ -101,14 +88,6 @@ Pinned to Rust **1.93.1** because the machine's `stable` toolchain has a
 corrupted `rust-std` (missing std libs → "can't find crate for std"). Repair:
 `rustup toolchain uninstall stable && rustup toolchain install stable`, then
 bump the pin.
-
-## Roadmap
-
-- [x] Slice 1 — terminal feel (this MVP)
-- [ ] Slice 2 — OpenAI-compatible HTTP client → point at the qwen box
-- [ ] Slice 3 — agentic loop (tools: read/write/edit/bash/ls)
-- [ ] Slice 4 — compaction
-- [ ] Slice 5 — app frontend over the same `zero-core`
 
 ## License
 

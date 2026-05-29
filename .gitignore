@@ -4,3 +4,7 @@
 # session transcripts / logs are local, never committed
 /sessions
 *.jsonl
+# planning docs + roadmap are local-only, never committed
+/docs
+ROADMAP.md
+*.roadmap.md
