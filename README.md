@@ -72,6 +72,23 @@ zero --config ./other.json   # use a specific config file
 `/config` inside the app shows the active backend and model. Plain `http://`
 only (Zero is local-first; no TLS).
 
+### Auto-discovery
+
+Don't know the URL? Let Zero find it:
+
+```
+/scan            scan the local network for OpenAI-compatible servers
+/connect <n>     attach to one from the list (swaps the live backend)
+/servers         list servers found before
+```
+
+`/scan` probes the local `/24` on common LLM ports (8000, 8080, 11434, 1234, …),
+reads each server's `/v1/models`, and lists what it found. `/connect` attaches
+immediately and saves the choice to `config.json`, so next launch auto-connects.
+Discovered servers are remembered in `~/.zero/servers.json`; re-scanning
+refreshes their model lists and drops a saved model if the box now serves a
+different one.
+
 Sessions log to `~/.zero/sessions/zero-<unixtime>.jsonl`.
 
 ### Keys

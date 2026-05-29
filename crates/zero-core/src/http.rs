@@ -6,7 +6,8 @@
 //! round-trip is covered by an in-process localhost mock server in the tests.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 /// A parsed `http://host[:port]/path` URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,32 +68,7 @@ pub fn post_stream(
     stream.flush()?;
 
     let mut reader = BufReader::new(stream);
-
-    // Status line.
-    let mut status = String::new();
-    reader.read_line(&mut status)?;
-    let code: u16 = status
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    // Headers.
-    let mut chunked = false;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        let line = line.trim_end();
-        if line.is_empty() {
-            break;
-        }
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
-            chunked = true;
-        }
-    }
+    let (code, chunked) = read_status_and_headers(&mut reader)?;
 
     if !(200..300).contains(&code) {
         let mut err = String::new();
@@ -111,6 +87,87 @@ pub fn post_stream(
     // Flush a trailing line that had no terminator.
     if !linebuf.is_empty() {
         on_line(&String::from_utf8_lossy(&linebuf));
+    }
+    Ok(())
+}
+
+/// GET `url` (with connect + read timeouts) and return `(status_code, body)`.
+/// Used for short, non-streamed responses like `/v1/models` during discovery.
+pub fn get(url: &str, timeout: Duration) -> io::Result<(u16, String)> {
+    let u = parse_url(url).map_err(io::Error::other)?;
+    let addr = (u.host.as_str(), u.port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::other("could not resolve host"))?;
+    let stream = TcpStream::connect_timeout(&addr, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let mut stream = stream;
+
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        u.path, u.host
+    );
+    stream.write_all(req.as_bytes())?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let (code, chunked) = read_status_and_headers(&mut reader)?;
+
+    let mut body = Vec::new();
+    if chunked {
+        read_chunked_raw(&mut reader, &mut body)?;
+    } else {
+        reader.read_to_end(&mut body)?;
+    }
+    Ok((code, String::from_utf8_lossy(&body).into_owned()))
+}
+
+/// Read the HTTP status line and headers; return `(status_code, is_chunked)`.
+fn read_status_and_headers<R: BufRead>(reader: &mut R) -> io::Result<(u16, bool)> {
+    let mut status = String::new();
+    reader.read_line(&mut status)?;
+    let code: u16 = status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let mut chunked = false;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
+            chunked = true;
+        }
+    }
+    Ok((code, chunked))
+}
+
+/// Decode a chunked body into `out` as raw bytes (for non-streamed GETs).
+fn read_chunked_raw<R: BufRead>(reader: &mut R, out: &mut Vec<u8>) -> io::Result<()> {
+    loop {
+        let mut size_line = String::new();
+        if reader.read_line(&mut size_line)? == 0 {
+            break;
+        }
+        let hex = size_line.trim().split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(hex, 16).unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        let mut chunk = vec![0u8; size];
+        reader.read_exact(&mut chunk)?;
+        out.extend_from_slice(&chunk);
+        let mut crlf = [0u8; 2];
+        let _ = reader.read_exact(&mut crlf);
     }
     Ok(())
 }
@@ -296,6 +353,29 @@ mod tests {
         let mut lines = Vec::new();
         post_stream(&url, &[], "{}", &mut |l| lines.push(l.to_string())).unwrap();
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn get_reads_status_and_body() {
+        let url = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"data\":[]}".to_vec(),
+        );
+        let (code, body) = get(&url, Duration::from_secs(2)).unwrap();
+        assert_eq!(code, 200);
+        assert!(body.contains("data"));
+    }
+
+    #[test]
+    fn get_reads_chunked_body() {
+        let url = serve_once(chunked(&[b"{\"mod", b"els\":[]}"]));
+        let (code, body) = get(&url, Duration::from_secs(2)).unwrap();
+        assert_eq!(code, 200);
+        assert!(body.contains("models"));
+    }
+
+    #[test]
+    fn get_on_refused_port_errors() {
+        assert!(get("http://127.0.0.1:1/v1/models", Duration::from_millis(200)).is_err());
     }
 
     #[test]

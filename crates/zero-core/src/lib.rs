@@ -16,11 +16,13 @@ pub mod backend;
 pub mod brand;
 pub mod clock;
 pub mod config;
+pub mod discovery;
 pub mod http;
 pub mod json;
 pub mod message;
 pub mod openai;
 pub mod safety;
+pub mod servers;
 pub mod session;
 
 pub use backend::{Backend, BackendError, StopReason, StreamEvent, StubBackend};

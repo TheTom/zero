@@ -77,6 +77,7 @@ fn run(args: &Args) -> std::io::Result<()> {
         )
     })?;
     let mut app = App::new(term, std::io::stdout(), backend, log);
+    app.set_config(cfg.clone(), Some(cfg_path.clone()), servers_path());
     app.set_info(format!("{}\nconfig: {}", cfg.summary(), cfg_path.display()));
     app.run()
 }
@@ -107,6 +108,10 @@ fn config_path() -> Option<std::path::PathBuf> {
 
 fn session_dir() -> Option<std::path::PathBuf> {
     home().map(|h| h.join(zero_core::brand::dot_dir()).join("sessions"))
+}
+
+fn servers_path() -> Option<std::path::PathBuf> {
+    home().map(|h| h.join(zero_core::brand::dot_dir()).join("servers.json"))
 }
 
 /// Dependency-free argument parsing with valued flags.

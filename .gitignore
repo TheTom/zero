@@ -8,3 +8,6 @@
 /docs
 ROADMAP.md
 *.roadmap.md
+# local config / discovered servers
+/config.json
+/servers.json

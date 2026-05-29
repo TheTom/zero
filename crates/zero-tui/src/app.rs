@@ -12,10 +12,15 @@
 use crate::editor::LineEditor;
 use crate::key::{decode_keys, Key};
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 use zero_core::backend::{Backend, StreamEvent};
 use zero_core::clock::{format_duration, Stopwatch};
+use zero_core::config::Config;
+use zero_core::discovery::Discovered;
 use zero_core::message::{Conversation, Message, Role};
+use zero_core::openai::OpenAiBackend;
+use zero_core::servers::ServerStore;
 use zero_core::session::SessionLog;
 
 /// Prefix drawn before continuation rows of a multiline input (aligns under the
@@ -65,6 +70,12 @@ pub struct App<I: Input, W: Write> {
     pending_shell: Option<String>,
     /// Human-readable backend/config summary, shown by `/config`.
     info: String,
+    /// Live config, mutated by `/connect` and persisted to `config_path`.
+    config: Config,
+    config_path: Option<PathBuf>,
+    servers_path: Option<PathBuf>,
+    /// Servers found by the last `/scan`, for `/connect <n>`.
+    scan_results: Vec<Discovered>,
 }
 
 impl<I: Input, W: Write> App<I, W> {
@@ -89,12 +100,29 @@ impl<I: Input, W: Write> App<I, W> {
             search: None,
             pending_shell: None,
             info: String::new(),
+            config: Config::default(),
+            config_path: None,
+            servers_path: None,
+            scan_results: Vec::new(),
         }
     }
 
     /// Set the summary shown by `/config` (backend, model, config path).
     pub fn set_info(&mut self, info: impl Into<String>) {
         self.info = info.into();
+    }
+
+    /// Provide the live config and where to persist config + known servers, so
+    /// `/connect` can attach to a discovered server and remember it.
+    pub fn set_config(
+        &mut self,
+        config: Config,
+        config_path: Option<PathBuf>,
+        servers_path: Option<PathBuf>,
+    ) {
+        self.config = config;
+        self.config_path = config_path;
+        self.servers_path = servers_path;
     }
 
     /// Run the event loop until the user quits.
@@ -290,6 +318,25 @@ impl<I: Input, W: Write> App<I, W> {
             self.write_text(&format!("\x1b[2m{info}\x1b[0m\n"))?;
             return Ok(Flow::Continue);
         }
+        if trimmed == "/scan" {
+            self.echo_committed(&text)?;
+            self.write_text("\x1b[2mscanning local network…\x1b[0m\n")?;
+            self.out.flush()?;
+            let results = zero_core::discovery::scan(Duration::from_millis(300));
+            self.apply_scan(results)?;
+            return Ok(Flow::Continue);
+        }
+        if trimmed == "/servers" {
+            self.echo_committed(&text)?;
+            self.print_servers()?;
+            return Ok(Flow::Continue);
+        }
+        if let Some(rest) = trimmed.strip_prefix("/connect") {
+            self.echo_committed(&text)?;
+            let n = rest.trim().parse::<usize>().unwrap_or(0);
+            self.connect_index(n)?;
+            return Ok(Flow::Continue);
+        }
 
         self.echo_committed(&text)?;
         self.conv.push(Message::user(&text));
@@ -360,6 +407,89 @@ impl<I: Input, W: Write> App<I, W> {
             Err(e) => self.write_text(&format!("\x1b[31m[shell error: {e}]\x1b[0m\n"))?,
         }
         self.cursor_row = 0;
+        Ok(())
+    }
+
+    // --- network discovery (/scan, /connect, /servers) -------------------
+
+    /// Record scan results, refresh the saved server list, and print a picker.
+    fn apply_scan(&mut self, results: Vec<Discovered>) -> io::Result<()> {
+        if let Some(path) = &self.servers_path {
+            let mut store = ServerStore::load(path).unwrap_or_default();
+            for d in &results {
+                store.upsert(d);
+            }
+            let _ = store.save(path);
+        }
+        self.scan_results = results;
+        if self.scan_results.is_empty() {
+            self.write_text("\x1b[2mno OpenAI-compatible servers found on the LAN\x1b[0m\n")?;
+            return Ok(());
+        }
+        let mut out = String::from("\x1b[1mdiscovered servers\x1b[0m\n");
+        for (i, d) in self.scan_results.iter().enumerate() {
+            let model = d
+                .models
+                .first()
+                .map(String::as_str)
+                .unwrap_or("(no models)");
+            out.push_str(&format!(
+                "  {}) {model}  \x1b[2m{}\x1b[0m\n",
+                i + 1,
+                d.base_url
+            ));
+        }
+        out.push_str("\x1b[2muse /connect <n> to attach\x1b[0m\n");
+        self.write_text(&out)?;
+        Ok(())
+    }
+
+    /// Attach to the nth server from the last `/scan` (1-based): swap the live
+    /// backend, persist the choice to the config file.
+    fn connect_index(&mut self, n: usize) -> io::Result<()> {
+        let Some(d) = n
+            .checked_sub(1)
+            .and_then(|i| self.scan_results.get(i))
+            .cloned()
+        else {
+            self.write_text("\x1b[31mno such server — run /scan first\x1b[0m\n")?;
+            return Ok(());
+        };
+        self.config.base_url = Some(d.base_url.clone());
+        if let Some(m) = d.models.first() {
+            self.config.model = m.clone();
+        }
+        match OpenAiBackend::from_config(&self.config) {
+            Some(b) => self.backend = Box::new(b),
+            None => {
+                self.write_text("\x1b[31mcould not build backend\x1b[0m\n")?;
+                return Ok(());
+            }
+        }
+        if let Some(path) = &self.config_path {
+            let _ = self.config.save(path);
+        }
+        self.info = self.config.summary();
+        let msg = format!("connected: {}", self.config.summary());
+        self.write_text(&format!("\x1b[2m{msg}\x1b[0m\n"))
+    }
+
+    /// List the locally-saved servers (`~/.zero/servers.json`).
+    fn print_servers(&mut self) -> io::Result<()> {
+        let store = self
+            .servers_path
+            .as_ref()
+            .and_then(|p| ServerStore::load(p).ok())
+            .unwrap_or_default();
+        if store.servers.is_empty() {
+            self.write_text("\x1b[2mno saved servers — run /scan\x1b[0m\n")?;
+            return Ok(());
+        }
+        self.write_text("\x1b[1msaved servers\x1b[0m\n")?;
+        for s in &store.servers {
+            let model = s.model.as_deref().unwrap_or("(none selected)");
+            self.write_text(&format!("  {model}  \x1b[2m{}\x1b[0m\n", s.base_url))?;
+        }
         Ok(())
     }
 
@@ -539,6 +669,9 @@ impl<I: Input, W: Write> App<I, W> {
             ('K', "/help", "show this help"),
             ('K', "/quit  /exit", "leave Zero"),
             ('K', "/config", "show the active backend and model"),
+            ('K', "/scan", "find model servers on your network"),
+            ('K', "/connect <n>", "attach to a discovered server"),
+            ('K', "/servers", "list saved servers"),
             (
                 'K',
                 "!<cmd>",
@@ -893,6 +1026,90 @@ mod tests {
         type_str(&mut a, "/config");
         a.dispatch(Key::Enter).unwrap();
         assert!(rendered(&a).contains("stub"));
+    }
+
+    fn disc(url: &str, models: &[&str]) -> Discovered {
+        Discovered {
+            base_url: url.to_string(),
+            models: models.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn apply_scan_lists_results_and_saves_servers() {
+        let dir =
+            std::env::temp_dir().join(format!("zero-scan-{}", zero_core::clock::unix_millis()));
+        let spath = dir.join("servers.json");
+        let mut a = app(b"");
+        a.set_config(Config::default(), None, Some(spath.clone()));
+        a.apply_scan(vec![
+            disc("http://h:8000", &["qwen"]),
+            disc("http://h:1234", &["llama"]),
+        ])
+        .unwrap();
+        let out = rendered(&a);
+        assert!(out.contains("discovered servers"));
+        assert!(out.contains("qwen"));
+        assert!(out.contains("/connect"));
+        // Persisted to the server store.
+        let store = zero_core::servers::ServerStore::load(&spath).unwrap();
+        assert_eq!(store.servers.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_scan_reports_when_empty() {
+        let mut a = app(b"");
+        a.apply_scan(Vec::new()).unwrap();
+        assert!(rendered(&a).contains("no OpenAI-compatible servers"));
+    }
+
+    #[test]
+    fn connect_index_swaps_backend_and_persists_config() {
+        let dir =
+            std::env::temp_dir().join(format!("zero-conn-{}", zero_core::clock::unix_millis()));
+        let cpath = dir.join("config.json");
+        let mut a = app(b"");
+        a.set_config(Config::default(), Some(cpath.clone()), None);
+        a.apply_scan(vec![disc("http://gx10:8000", &["qwen"])])
+            .unwrap();
+        a.connect_index(1).unwrap();
+        // Backend is now the OpenAI one; its name carries the model + url.
+        assert!(a.backend.name().contains("qwen"));
+        assert!(a.backend.name().contains("gx10"));
+        // Config persisted for next launch.
+        let saved = Config::load(&cpath).unwrap();
+        assert_eq!(saved.base_url.as_deref(), Some("http://gx10:8000"));
+        assert_eq!(saved.model, "qwen");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connect_index_out_of_range_is_reported() {
+        let mut a = app(b"");
+        a.connect_index(5).unwrap();
+        assert!(rendered(&a).contains("no such server"));
+    }
+
+    #[test]
+    fn servers_command_lists_saved_and_handles_empty() {
+        let dir =
+            std::env::temp_dir().join(format!("zero-srvlist-{}", zero_core::clock::unix_millis()));
+        let spath = dir.join("servers.json");
+        let mut a = app(b"");
+        a.set_config(Config::default(), None, Some(spath.clone()));
+        // Empty first.
+        a.print_servers().unwrap();
+        assert!(rendered(&a).contains("no saved servers"));
+        // After a scan, it lists them.
+        a.apply_scan(vec![disc("http://h:8000", &["qwen"])])
+            .unwrap();
+        a.out.clear();
+        a.print_servers().unwrap();
+        let out = rendered(&a);
+        assert!(out.contains("saved servers"));
+        assert!(out.contains("qwen"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
