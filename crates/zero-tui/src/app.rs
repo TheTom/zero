@@ -384,22 +384,9 @@ impl<I: Input, W: Write> App<I, W> {
         self.last_reply = reply; // remembered for /clip
         self.last_blocks = crate::markdown::code_blocks(&self.last_reply);
 
-        // Honest, measured elapsed — dimmed, never an estimate.
+        // Honest, measured elapsed — dimmed, never an estimate. (Each code block
+        // already showed its own `⧉ /clip <n>` header inline as it streamed.)
         self.write_text(&format!("\n\x1b[2m  {}\x1b[0m\n", format_duration(elapsed)))?;
-        // Per-block copy affordance: /clip <n> grabs just that code block.
-        if !self.last_blocks.is_empty() {
-            let mut hint = String::from("\x1b[2m  ⧉ copy:");
-            for (i, b) in self.last_blocks.iter().enumerate() {
-                let tag = if b.lang.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {}", b.lang)
-                };
-                hint.push_str(&format!("  /clip {}{tag}", i + 1));
-            }
-            hint.push_str("  (or /clip for all)\x1b[0m\n");
-            self.write_text(&hint)?;
-        }
         Ok(Flow::Continue)
     }
 
@@ -1230,8 +1217,8 @@ mod tests {
         }));
         type_str(&mut a, "go");
         a.dispatch(Key::Enter).unwrap();
-        // The footer advertises a per-block copy.
-        assert!(rendered(&a).contains("⧉ copy:"));
+        // The block streamed an inline copy header.
+        assert!(rendered(&a).contains("/clip 1"));
         assert_eq!(a.last_blocks.len(), 1);
         // /clip 1 copies just the block body, not the whole response.
         type_str(&mut a, "/clip 1");

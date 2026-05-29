@@ -34,8 +34,13 @@ pub struct MarkdownStream {
     line_only_backticks: bool,
     /// Cursor is at the start of a line.
     at_line_start: bool,
-    /// Swallow the rest of the line (a fence's language tag).
+    /// Swallow the rest of the line (trailing text after a closing fence).
     suppress_eol: bool,
+    /// Accumulating a fence's language tag before emitting the block header.
+    collecting_lang: bool,
+    lang_buf: String,
+    /// 1-based index of the current/last code block (matches `/clip <n>`).
+    block_count: usize,
     heading: bool,
     heading_marker: bool,
 }
@@ -53,6 +58,15 @@ impl MarkdownStream {
     pub fn feed(&mut self, chunk: &str) -> String {
         let mut out = String::with_capacity(chunk.len() + 8);
         for ch in chunk.chars() {
+            // Collect a fence's language tag, then emit the block header.
+            if self.collecting_lang {
+                if ch == '\n' {
+                    self.emit_block_header(&mut out);
+                } else {
+                    self.lang_buf.push(ch);
+                }
+                continue;
+            }
             if self.suppress_eol {
                 if ch == '\n' {
                     self.newline(&mut out);
@@ -70,9 +84,15 @@ impl MarkdownStream {
                 if self.pending_backticks == 3 {
                     self.pending_backticks = 0;
                     self.line_only_backticks = false;
-                    self.suppress_eol = true; // ignore the language tag
-                    self.in_fence = !self.in_fence;
-                    out.push_str(if self.in_fence { DIM_ON } else { DIM_OFF });
+                    if self.in_fence {
+                        self.in_fence = false;
+                        self.suppress_eol = true; // skip trailing after closing ```
+                    } else {
+                        self.in_fence = true;
+                        self.block_count += 1;
+                        self.collecting_lang = true;
+                        self.lang_buf.clear();
+                    }
                 }
                 continue;
             }
@@ -131,6 +151,20 @@ impl MarkdownStream {
                 self.heading_marker = false;
             }
         }
+    }
+
+    /// Emit the dim header that opens a code block and carries its `/clip` index.
+    fn emit_block_header(&mut self, out: &mut String) {
+        let lang = self.lang_buf.trim();
+        let label = if lang.is_empty() {
+            format!("── ⧉ /clip {} ──", self.block_count)
+        } else {
+            format!("── {lang} · ⧉ /clip {} ──", self.block_count)
+        };
+        out.push_str(&format!("{DIM_ON}{label}{DIM_OFF}\n"));
+        self.collecting_lang = false;
+        self.at_line_start = true;
+        self.line_only_backticks = true;
     }
 
     fn newline(&mut self, out: &mut String) {
@@ -289,13 +323,20 @@ mod tests {
     }
 
     #[test]
-    fn fenced_block_renders_dim_and_hides_markers() {
+    fn fenced_block_shows_header_and_hides_fences() {
         let out = render("```rust\nlet x = 1;\n```\n");
-        // Fence lines and language tag are not shown; body is dimmed.
+        // The ``` markers are gone; a header with the lang + /clip index appears.
         assert!(!out.contains("```"));
-        assert!(!out.contains("rust"));
-        assert!(out.contains("let x = 1;"));
-        assert!(out.contains(DIM_ON));
+        assert!(out.contains("/clip 1"));
+        assert!(out.contains("rust")); // lang shown in the header
+        assert!(out.contains("let x = 1;")); // body rendered
+    }
+
+    #[test]
+    fn two_blocks_get_sequential_clip_indices() {
+        let out = render("```\na\n```\ntext\n```\nb\n```\n");
+        assert!(out.contains("/clip 1"));
+        assert!(out.contains("/clip 2"));
     }
 
     #[test]
