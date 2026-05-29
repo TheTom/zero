@@ -267,33 +267,6 @@ pub fn code_blocks(text: &str) -> Vec<CodeBlock> {
     blocks
 }
 
-/// For each *rendered output line*, which code block (1-based) it belongs to,
-/// or `None` for prose. Aligns with [`render`]'s line count: a fence-open line
-/// becomes the block's header line; the fence-close line emits nothing.
-///
-/// Used for click-to-copy: map a clicked screen line back to a code block.
-pub fn line_blocks(text: &str) -> Vec<Option<usize>> {
-    let mut out = Vec::new();
-    let mut in_fence = false;
-    let mut block = 0usize;
-    for line in text.split('\n') {
-        if line.trim_start().starts_with("```") {
-            if in_fence {
-                in_fence = false;
-                out.push(Some(block)); // close fence renders the footer line
-            } else {
-                in_fence = true;
-                block += 1; // open fence emits no output line
-            }
-        } else if in_fence {
-            out.push(Some(block)); // body line
-        } else {
-            out.push(None); // prose line
-        }
-    }
-    out
-}
-
 /// Convenience: render a whole string in one shot.
 pub fn render(text: &str) -> String {
     let mut md = MarkdownStream::new();
@@ -406,16 +379,5 @@ mod tests {
     #[test]
     fn code_blocks_none_when_no_fences() {
         assert!(code_blocks("just prose, `inline` only").is_empty());
-    }
-
-    #[test]
-    fn line_blocks_maps_rendered_lines_to_blocks() {
-        // prose, then a 2-line block (header + body), then trailing prose.
-        let lb = line_blocks("intro\n```rust\nx\n```\nbye");
-        // prose, body, footer(close), prose. (Open fence emits no line.)
-        assert_eq!(lb, vec![None, Some(1), Some(1), None]);
-        // The map length matches the rendered line count.
-        let rendered_lines = render("intro\n```rust\nx\n```\nbye").split('\n').count();
-        assert_eq!(lb.len(), rendered_lines);
     }
 }

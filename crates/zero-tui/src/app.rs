@@ -64,8 +64,6 @@ struct StreamState {
     reply: String,
     md: MarkdownStream,
     sw: Stopwatch,
-    /// Absolute line index of this response's first rendered line.
-    anchor: usize,
 }
 
 /// The running terminal application.
@@ -102,15 +100,6 @@ pub struct App<I: Input, W: Write> {
     last_blocks: Vec<crate::markdown::CodeBlock>,
     /// How `/clip` copies — the system clipboard by default; swappable in tests.
     clipboard: ClipboardFn,
-    /// Total content lines emitted (newline count) — the current line's index.
-    printed_lines: usize,
-    /// Absolute line index of the last response's first rendered line.
-    last_anchor: usize,
-    /// Per-rendered-line code-block map for the last response (click-to-copy).
-    last_line_blocks: Vec<Option<usize>>,
-    /// Whether mouse reporting is on (opt-in: enables click-to-copy but the
-    /// terminal then needs Shift+wheel to scroll). Off by default.
-    mouse_on: bool,
     /// The current in-flight turn, if a reply is streaming.
     streaming: Option<StreamState>,
     /// Messages typed while a reply was streaming, run in order afterward.
@@ -148,10 +137,6 @@ impl<I: Input, W: Write> App<I, W> {
             last_reply: String::new(),
             last_blocks: Vec::new(),
             clipboard: Box::new(clipboard_copy),
-            printed_lines: 0,
-            last_anchor: 0,
-            last_line_blocks: Vec::new(),
-            mouse_on: false,
             streaming: None,
             queue: VecDeque::new(),
             synchronous: false,
@@ -237,10 +222,7 @@ impl<I: Input, W: Write> App<I, W> {
     }
 
     fn finish(&mut self) -> io::Result<()> {
-        // Disable mouse reporting if it was on, and pop kitty-protocol flags.
-        if self.mouse_on {
-            self.out.write_all(b"\x1b[?1000l\x1b[?1006l")?;
-        }
+        // Pop the kitty keyboard-protocol flags we pushed in run().
         self.out.write_all(b"\x1b[<u")?;
         self.write_text("\n")?;
         Ok(())
@@ -285,7 +267,6 @@ impl<I: Input, W: Write> App<I, W> {
             Key::WordLeft => self.editor.word_left(),
             Key::WordRight => self.editor.word_right(),
             Key::ShiftEnter => self.editor.insert_newline(),
-            Key::Click { row, .. } => return self.on_click(row).map(|()| Flow::Continue),
             Key::Ctrl(_) | Key::Tab => {} // unmapped; ignore
             Key::Enter => return self.on_submit(),
             Key::Backspace => self.editor.backspace(),
@@ -422,11 +403,6 @@ impl<I: Input, W: Write> App<I, W> {
             self.do_clip(rest.trim())?;
             return Ok(Flow::Continue);
         }
-        if trimmed == "/mouse" {
-            self.echo_committed(&text)?;
-            self.toggle_mouse()?;
-            return Ok(Flow::Continue);
-        }
 
         // A normal message: start a streaming turn (on a background thread, so
         // the loop stays free to queue more input or interrupt).
@@ -452,7 +428,6 @@ impl<I: Input, W: Write> App<I, W> {
         }
         self.write_text(&format!("\x1b[2m{}›\x1b[0m ", zero_core::brand::slug()))?;
         self.out.flush()?;
-        let anchor = self.printed_lines;
 
         let (tx, rx) = mpsc::channel();
         let backend = Arc::clone(&self.backend);
@@ -486,7 +461,6 @@ impl<I: Input, W: Write> App<I, W> {
             reply: String::new(),
             md: MarkdownStream::new(),
             sw: Stopwatch::start(),
-            anchor,
         });
         Ok(())
     }
@@ -551,8 +525,6 @@ impl<I: Input, W: Write> App<I, W> {
         }
         self.last_reply = reply.clone();
         self.last_blocks = crate::markdown::code_blocks(&reply);
-        self.last_anchor = s.anchor;
-        self.last_line_blocks = crate::markdown::line_blocks(&reply);
         self.write_text(&format!("\n\x1b[2m  {}\x1b[0m\n", format_duration(elapsed)))?;
 
         if let Some(next) = self.queue.pop_front() {
@@ -618,8 +590,6 @@ impl<I: Input, W: Write> App<I, W> {
             self.conv.push(Message::assistant(&reply));
             self.last_reply = reply.clone();
             self.last_blocks = crate::markdown::code_blocks(&reply);
-            self.last_line_blocks = crate::markdown::line_blocks(&reply);
-            self.last_anchor = s.anchor;
         }
         self.queue.clear();
         self.cursor_row = 0;
@@ -644,53 +614,6 @@ impl<I: Input, W: Write> App<I, W> {
                 self.copy_text(&body)
             }
             _ => self.write_text("\x1b[31mno such code block — see the /clip hints\x1b[0m\n"),
-        }
-    }
-
-    /// Handle a mouse click: if it landed on a code block of the last response
-    /// (and that block is still on screen), copy it. A miss is a no-op — never
-    /// copies the wrong block.
-    fn on_click(&mut self, row: u16) -> io::Result<()> {
-        let rows = crate::term::terminal_size().rows as usize;
-        let r = row as usize;
-        if rows == 0 || r == 0 {
-            return Ok(());
-        }
-        // The input box sits at the bottom: top rule (on content line
-        // `printed_lines`), `input_rows` input lines, then the bottom rule at the
-        // very bottom screen row. So the box bottom rule maps to content line
-        // `printed_lines + input_rows + 1` ↔ screen row `rows`.
-        let input_rows = self.editor.text().split('\n').count();
-        let from_bottom = rows.saturating_sub(input_rows + 1);
-        let Some(clicked_abs) = (self.printed_lines + r).checked_sub(from_bottom) else {
-            return Ok(());
-        };
-        let Some(i) = clicked_abs.checked_sub(self.last_anchor) else {
-            return Ok(());
-        };
-        let block = match self.last_line_blocks.get(i).copied().flatten() {
-            Some(b) => b,
-            None => return Ok(()),
-        };
-        if let Some(cb) = self.last_blocks.get(block - 1) {
-            let body = cb.body.clone();
-            return self.copy_text(&body);
-        }
-        Ok(())
-    }
-
-    /// Toggle mouse reporting. On → clicks copy code blocks, but the terminal
-    /// needs Shift+wheel to scroll. Off → plain scroll wheel works again.
-    fn toggle_mouse(&mut self) -> io::Result<()> {
-        self.mouse_on = !self.mouse_on;
-        if self.mouse_on {
-            self.out.write_all(b"\x1b[?1000h\x1b[?1006h")?;
-            self.write_text(
-                "\x1b[2mmouse on — click a code block to copy (scroll: Shift+wheel)\x1b[0m\n",
-            )
-        } else {
-            self.out.write_all(b"\x1b[?1000l\x1b[?1006l")?;
-            self.write_text("\x1b[2mmouse off — scroll wheel restored\x1b[0m\n")
         }
     }
 
@@ -1060,11 +983,6 @@ impl<I: Input, W: Write> App<I, W> {
             ),
             (
                 'K',
-                "/mouse",
-                "toggle click-to-copy (captures the scroll wheel)",
-            ),
-            (
-                'K',
                 "!<cmd>",
                 "run a shell command — dangerous ones ask first",
             ),
@@ -1113,10 +1031,8 @@ impl<I: Input, W: Write> App<I, W> {
         self.write_text(&out)
     }
 
-    /// Write text, translating `\n` to `\r\n` for raw mode. Tracks the running
-    /// line count so clicks can be mapped back to on-screen content.
+    /// Write text, translating `\n` to `\r\n` for raw mode.
     fn write_text(&mut self, s: &str) -> io::Result<()> {
-        self.printed_lines += s.bytes().filter(|&b| b == b'\n').count();
         write_raw(&mut self.out, s)
     }
 }
@@ -1469,7 +1385,6 @@ mod tests {
             reply: String::new(),
             md: MarkdownStream::new(),
             sw: Stopwatch::start(),
-            anchor: a.printed_lines,
         });
         (a, tx)
     }
@@ -1537,14 +1452,6 @@ mod tests {
         assert!(out.contains("no such entry"));
         assert!(out.contains("model set: qwen"));
         assert!(out.contains("model: qwen"));
-    }
-
-    #[test]
-    fn mouse_is_disabled_on_exit() {
-        let mut a = multi_app(&[b"/mouse\r", b"/quit\r"]);
-        a.run().unwrap();
-        // The disable sequence was emitted at teardown.
-        assert!(rendered(&a).contains("\x1b[?1000l"));
     }
 
     #[test]
@@ -1691,60 +1598,6 @@ mod tests {
         type_str(&mut a, "/clip 9");
         a.dispatch(Key::Enter).unwrap();
         assert!(rendered(&a).contains("no such code block"));
-    }
-
-    #[test]
-    fn click_on_a_code_block_line_copies_it() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-        let captured = Rc::new(RefCell::new(String::new()));
-        let sink = captured.clone();
-        let mut a = app(b"");
-        a.set_clipboard(Box::new(move |s| {
-            *sink.borrow_mut() = s.to_string();
-            Ok(())
-        }));
-        // Post-response state: response line 0 = label, lines 1–2 = a block.
-        a.last_blocks = vec![crate::markdown::CodeBlock {
-            lang: "rust".into(),
-            body: "fn main() {}".into(),
-        }];
-        a.last_anchor = 0;
-        a.last_line_blocks = vec![None, Some(1), Some(1)];
-        a.printed_lines = 2; // body's last content line index
-        let rows = crate::term::terminal_size().rows as usize;
-        // Empty editor → 1 input row → box bottom rule is 2 rows below content.
-        // clicked_abs = printed_lines + r + (input_rows+1) - rows; want line 2:
-        // 2 = 2 + r + 2 - rows  →  r = rows - 2.
-        let click_row = rows.saturating_sub(2);
-        a.dispatch(Key::Click {
-            col: 1,
-            row: click_row as u16,
-        })
-        .unwrap();
-        assert_eq!(*captured.borrow(), "fn main() {}");
-    }
-
-    #[test]
-    fn mouse_toggle_flips_state_and_reports() {
-        let mut a = app(b"");
-        type_str(&mut a, "/mouse");
-        a.dispatch(Key::Enter).unwrap();
-        assert!(a.mouse_on);
-        assert!(rendered(&a).contains("mouse on"));
-        a.out.clear();
-        type_str(&mut a, "/mouse");
-        a.dispatch(Key::Enter).unwrap();
-        assert!(!a.mouse_on);
-        assert!(rendered(&a).contains("mouse off"));
-    }
-
-    #[test]
-    fn click_off_any_block_is_a_noop() {
-        let mut a = app(b"");
-        a.dispatch(Key::Click { col: 1, row: 1 }).unwrap();
-        a.dispatch(Key::Click { col: 9, row: 99 }).unwrap();
-        assert!(a.last_reply.is_empty());
     }
 
     #[test]

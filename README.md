@@ -164,10 +164,7 @@ terminal styling (the raw text is kept for the model and for copying).
 Copy to the system clipboard (`pbcopy` / `wl-copy` / `xclip`):
 
 - `/clip <n>` — copy code block *n* (blocks render a `── rust · ⧉ copy ──`
-  footer). `/clip` copies the whole last response.
-- `/mouse` — toggle click-to-copy. **Off by default** so the scroll wheel works.
-  When on, click a code block to copy it — but mouse capture means the terminal
-  needs **Shift+wheel** to scroll. Your call which you'd rather have.
+  footer marking the target). `/clip` copies the whole last response.
 
 ## Test & coverage
 
