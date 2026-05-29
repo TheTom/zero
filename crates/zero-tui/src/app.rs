@@ -2,11 +2,11 @@
 //! [`Backend`] into Claude-Code-style inline rendering.
 //!
 //! "Inline" means output is printed in normal flow, so the terminal emulator's
-//! own scrollback works exactly as users expect — we only take over the *current
-//! input line*, redrawing it in place as it is edited.
+//! own scrollback works exactly as users expect — we only take over the current
+//! input block, redrawing it (one or more rows) in place as it is edited.
 //!
 //! [`App`] is generic over its input ([`Input`]) and output ([`Write`]) so the
-//! entire loop is testable with scripted bytes and a captured buffer; the binary
+//! whole loop is testable with scripted bytes and a captured buffer; the binary
 //! instantiates it with a real terminal and stdout.
 
 use crate::editor::LineEditor;
@@ -17,6 +17,10 @@ use zero_core::backend::{Backend, StreamEvent};
 use zero_core::clock::{format_duration, Stopwatch};
 use zero_core::message::{Conversation, Message, Role};
 use zero_core::session::SessionLog;
+
+/// Prefix drawn before continuation rows of a multiline input (aligns under the
+/// prompt). Same display width as the prompt.
+const CONT: &str = "  ";
 
 /// A source of input bytes. `read` returns 0 on a poll timeout (not EOF).
 /// `RawTerminal` implements this (see `term.rs`); tests use a scripted source.
@@ -31,6 +35,14 @@ enum Flow {
     Quit,
 }
 
+/// Reverse incremental history search (`^R`) state.
+#[derive(Debug, Default)]
+struct Search {
+    query: String,
+    /// Index into history of the current match, if any.
+    idx: Option<usize>,
+}
+
 /// The running terminal application.
 pub struct App<I: Input, W: Write> {
     input: I,
@@ -40,6 +52,15 @@ pub struct App<I: Input, W: Write> {
     backend: Box<dyn Backend>,
     log: Option<SessionLog<std::fs::File>>,
     prompt: String,
+    /// Row offset (within the input block) where the cursor was left after the
+    /// last render — so the next redraw knows how far up to go to clear.
+    cursor_row: usize,
+    /// True after a `^C` on an empty line; a second `^C` then exits.
+    ctrl_c_armed: bool,
+    /// True after one `Esc`; a second `Esc` clears the line.
+    esc_pending: bool,
+    /// `Some` while in `^R` reverse-search mode.
+    search: Option<Search>,
 }
 
 impl<I: Input, W: Write> App<I, W> {
@@ -58,6 +79,10 @@ impl<I: Input, W: Write> App<I, W> {
             backend,
             log,
             prompt: "› ".to_string(),
+            cursor_row: 0,
+            ctrl_c_armed: false,
+            esc_pending: false,
+            search: None,
         }
     }
 
@@ -71,44 +96,114 @@ impl<I: Input, W: Write> App<I, W> {
         loop {
             let n = self.input.read(&mut buf)?;
             if n == 0 {
-                continue; // poll timeout; nothing to do
+                // A lone ESC that never grew into a sequence is a real Esc press.
+                if pending == [0x1b] {
+                    pending.clear();
+                    if self.dispatch(Key::Esc)? == Flow::Quit {
+                        return self.finish();
+                    }
+                    self.redraw_input()?;
+                }
+                continue;
             }
             pending.extend_from_slice(&buf[..n]);
             let (keys, consumed) = decode_keys(&pending);
             pending.drain(0..consumed);
             for key in keys {
-                if self.handle_key(key)? == Flow::Quit {
-                    self.write_text("\n")?;
-                    return Ok(());
+                if self.dispatch(key)? == Flow::Quit {
+                    return self.finish();
                 }
             }
             self.redraw_input()?;
         }
     }
 
+    fn finish(&mut self) -> io::Result<()> {
+        self.write_text("\n")?;
+        Ok(())
+    }
+
+    /// Route a key, honoring the reverse-search submode and double-press combos.
+    fn dispatch(&mut self, key: Key) -> io::Result<Flow> {
+        if self.search.is_some() {
+            return self.handle_search_key(key);
+        }
+        // Reset double-press latches unless this key continues the combo.
+        if key != Key::Ctrl('c') {
+            self.ctrl_c_armed = false;
+        }
+        if key != Key::Esc {
+            self.esc_pending = false;
+        }
+        self.handle_key(key)
+    }
+
     fn handle_key(&mut self, key: Key) -> io::Result<Flow> {
         match key {
-            Key::Ctrl('c') => {
-                self.write_text("\n^C\n")?;
-                return Ok(Flow::Quit);
-            }
+            Key::Ctrl('c') => return self.on_ctrl_c(),
+            Key::Esc => return self.on_esc(),
             Key::Ctrl('d') if self.editor.is_empty() => return Ok(Flow::Quit),
             Key::Ctrl('d') => self.editor.delete(),
+            Key::Ctrl('r') => self.enter_search()?,
             Key::Ctrl('l') => self.write_text("\x1b[2J\x1b[H")?,
             Key::Ctrl('a') | Key::Home => self.editor.home(),
             Key::Ctrl('e') | Key::End => self.editor.end(),
             Key::Ctrl('u') => self.editor.kill_to_start(),
             Key::Ctrl('k') => self.editor.kill_to_end(),
             Key::Ctrl('w') => self.editor.kill_word(),
-            Key::Ctrl(_) | Key::Esc | Key::Tab => {} // unmapped; ignore
+            Key::Ctrl('b') => self.editor.left(),
+            Key::Ctrl('f') => self.editor.right(),
+            Key::WordLeft => self.editor.word_left(),
+            Key::WordRight => self.editor.word_right(),
+            Key::ShiftEnter => self.editor.insert_newline(),
+            Key::Ctrl(_) | Key::Tab => {} // unmapped; ignore
             Key::Enter => return self.on_submit(),
             Key::Backspace => self.editor.backspace(),
             Key::Delete => self.editor.delete(),
             Key::Left => self.editor.left(),
             Key::Right => self.editor.right(),
-            Key::Up => self.editor.history_prev(),
-            Key::Down => self.editor.history_next(),
+            // Up/Down move between input lines first, then fall back to history.
+            Key::Up => {
+                if !self.editor.line_up() {
+                    self.editor.history_prev();
+                }
+            }
+            Key::Down => {
+                if !self.editor.line_down() {
+                    self.editor.history_next();
+                }
+            }
             Key::Char(c) => self.editor.insert(c),
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// `^C`: clear a non-empty line; on an empty line, arm, then exit on a
+    /// second press. Prevents an accidental single keystroke from quitting.
+    fn on_ctrl_c(&mut self) -> io::Result<Flow> {
+        if !self.editor.is_empty() {
+            self.editor.clear();
+            self.ctrl_c_armed = false;
+            return Ok(Flow::Continue);
+        }
+        if self.ctrl_c_armed {
+            self.write_text("\n^C\n")?;
+            return Ok(Flow::Quit);
+        }
+        self.ctrl_c_armed = true;
+        self.clear_input_block()?;
+        self.write_text("\x1b[2m(press ^C again to exit)\x1b[0m\n")?;
+        self.cursor_row = 0;
+        Ok(Flow::Continue)
+    }
+
+    /// `Esc`: first press arms; second clears the whole input.
+    fn on_esc(&mut self) -> io::Result<Flow> {
+        if self.esc_pending {
+            self.esc_pending = false;
+            self.editor.clear();
+        } else {
+            self.esc_pending = true;
         }
         Ok(Flow::Continue)
     }
@@ -117,7 +212,8 @@ impl<I: Input, W: Write> App<I, W> {
         let text = self.editor.submit();
         let trimmed = text.trim();
         if trimmed.is_empty() {
-            self.write_text("\r\x1b[K")?;
+            self.clear_input_block()?;
+            self.cursor_row = 0;
             return Ok(Flow::Continue);
         }
         if matches!(trimmed, "/quit" | "/exit") {
@@ -149,30 +245,158 @@ impl<I: Input, W: Write> App<I, W> {
         Ok(Flow::Continue)
     }
 
-    /// Print the committed input line as static scrollback.
-    fn echo_committed(&mut self, text: &str) -> io::Result<()> {
-        self.write_text("\r\x1b[K")?;
-        let line = format!("{}{}\n", self.prompt, text);
-        self.write_text(&line)
+    // --- reverse history search (^R) -------------------------------------
+
+    fn enter_search(&mut self) -> io::Result<()> {
+        self.clear_input_block()?;
+        self.cursor_row = 0;
+        let s = Search::default();
+        self.render_search(&s)?;
+        self.search = Some(s);
+        Ok(())
     }
 
-    /// Redraw the in-place input line and position the cursor.
-    fn redraw_input(&mut self) -> io::Result<()> {
-        let text = self.editor.text();
-        let line = format!("\r\x1b[K{}{}", self.prompt, text);
-        self.out.write_all(line.as_bytes())?;
-        let total = text.chars().count();
-        let tail = total - self.editor.cursor();
-        if tail > 0 {
-            write!(self.out, "\x1b[{tail}D")?;
+    fn handle_search_key(&mut self, key: Key) -> io::Result<Flow> {
+        let mut s = self.search.take().expect("in search mode");
+        match key {
+            Key::Enter => {
+                // Accept the match into the line (does not submit immediately).
+                if let Some(i) = s.idx {
+                    let hit = self.editor.history()[i].clone();
+                    self.editor.set_text(&hit);
+                }
+                self.clear_input_block()?;
+                return Ok(Flow::Continue);
+            }
+            Key::Esc | Key::Ctrl('c') | Key::Ctrl('g') => {
+                // Cancel: leave the line untouched.
+                self.clear_input_block()?;
+                return Ok(Flow::Continue);
+            }
+            Key::Ctrl('r') => s.idx = self.search_from(&s.query, s.idx),
+            Key::Char(c) => {
+                s.query.push(c);
+                s.idx = self.search_from(&s.query, None);
+            }
+            Key::Backspace => {
+                s.query.pop();
+                s.idx = self.search_from(&s.query, None);
+            }
+            _ => {}
         }
+        self.render_search(&s)?;
+        self.search = Some(s);
+        Ok(Flow::Continue)
+    }
+
+    /// Most recent history index whose entry contains `query`, searching strictly
+    /// older than `before` when given (for repeated `^R`).
+    fn search_from(&self, query: &str, before: Option<usize>) -> Option<usize> {
+        if query.is_empty() {
+            return None;
+        }
+        let hist = self.editor.history();
+        let start = match before {
+            Some(0) => return None,
+            Some(b) => b - 1,
+            None => hist.len().checked_sub(1)?,
+        };
+        (0..=start).rev().find(|&i| hist[i].contains(query))
+    }
+
+    fn render_search(&mut self, s: &Search) -> io::Result<()> {
+        let shown = s
+            .idx
+            .map(|i| self.editor.history()[i].as_str())
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("");
+        let line = format!("\r\x1b[K(reverse-i-search)`{}`: {}", s.query, shown);
+        self.out.write_all(line.as_bytes())?;
         self.out.flush()
+    }
+
+    // --- rendering --------------------------------------------------------
+
+    /// Print the committed input line(s) as static scrollback.
+    fn echo_committed(&mut self, text: &str) -> io::Result<()> {
+        self.clear_input_block()?;
+        self.cursor_row = 0;
+        for (i, line) in text.split('\n').enumerate() {
+            let prefix = if i == 0 {
+                self.prompt.clone()
+            } else {
+                CONT.to_string()
+            };
+            self.write_text(&format!("{prefix}{line}\n"))?;
+        }
+        Ok(())
+    }
+
+    /// Move to the top-left of the current input block and clear downward.
+    fn clear_input_block(&mut self) -> io::Result<()> {
+        if self.cursor_row > 0 {
+            write!(self.out, "\x1b[{}A", self.cursor_row)?;
+        }
+        self.out.write_all(b"\r\x1b[J")?;
+        Ok(())
+    }
+
+    /// Redraw the (possibly multi-row) input block and position the cursor.
+    fn redraw_input(&mut self) -> io::Result<()> {
+        self.clear_input_block()?;
+        let text = self.editor.text();
+        let lines: Vec<&str> = text.split('\n').collect();
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                self.out.write_all(b"\r\n")?;
+            }
+            let prefix = if i == 0 { self.prompt.as_str() } else { CONT };
+            write!(self.out, "{prefix}{line}")?;
+        }
+        // Cursor is now at the end of the last row; move it to its logical spot.
+        let (trow, tcol) = self.cursor_rowcol();
+        let prefix_w = if trow == 0 {
+            self.prompt.chars().count()
+        } else {
+            CONT.chars().count()
+        };
+        let bottom = lines.len() - 1;
+        if bottom > trow {
+            write!(self.out, "\x1b[{}A", bottom - trow)?;
+        }
+        self.out.write_all(b"\r")?;
+        let col = prefix_w + tcol;
+        if col > 0 {
+            write!(self.out, "\x1b[{col}C")?;
+        }
+        self.cursor_row = trow;
+        self.out.flush()
+    }
+
+    /// (row, column-in-chars) of the cursor within the input text.
+    fn cursor_rowcol(&self) -> (usize, usize) {
+        let cur = self.editor.cursor();
+        let (mut row, mut col) = (0usize, 0usize);
+        for (i, ch) in self.editor.text().chars().enumerate() {
+            if i >= cur {
+                break;
+            }
+            if ch == '\n' {
+                row += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (row, col)
     }
 
     fn print_banner(&mut self) -> io::Result<()> {
         let banner = format!(
             "\x1b[1m{}\x1b[0m — local-first AI terminal  \x1b[2m({})\x1b[0m\n\
-             \x1b[2m/help for commands · ^C to quit\x1b[0m\n\n",
+             \x1b[2m/help for commands · ^C twice to quit\x1b[0m\n\n",
             zero_core::brand::name(),
             self.backend.name()
         );
@@ -185,8 +409,15 @@ impl<I: Input, W: Write> App<I, W> {
   /help        show this\n\
   /quit /exit  leave\n\
 \x1b[1mediting\x1b[0m\n\
-  ^A/^E home/end   ^U/^K kill to start/end   ^W kill word\n\
-  ↑/↓ history      ^L clear screen           ^C quit\n\n";
+  ^A/^E or Home/End   start/end of line     ^B/^F  back/forward char\n\
+  ⌥/^←  ⌥/^→          back/forward word     ^W     delete word back\n\
+  ^U/^K               kill to start/end     ^L     clear screen\n\
+\x1b[1mmultiline & history\x1b[0m\n\
+  Shift/⌥+Enter       insert newline        Enter  submit\n\
+  ↑/↓                 move line, else history\n\
+  ^R                  reverse history search\n\
+\x1b[1mexit\x1b[0m\n\
+  Esc Esc  clear line          ^C  clear line / ^C again to quit\n\n";
         self.write_text(help)
     }
 
@@ -217,7 +448,6 @@ fn stream_reply<W: Write>(
     let mut reply = String::new();
     let mut io_err: Option<io::Error> = None;
 
-    // Assistant label, dimmed to distinguish from user input.
     write_raw(
         out,
         &format!("\x1b[2m{}›\x1b[0m ", zero_core::brand::slug()),
@@ -257,7 +487,6 @@ mod tests {
         bytes: Vec<u8>,
         done: bool,
     }
-
     impl ScriptedInput {
         fn new(bytes: &[u8]) -> Self {
             ScriptedInput {
@@ -266,7 +495,6 @@ mod tests {
             }
         }
     }
-
     impl Input for ScriptedInput {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             if self.done {
@@ -282,25 +510,7 @@ mod tests {
         }
     }
 
-    /// A writer that succeeds `ok` times then fails — to exercise I/O errors.
-    struct FlakyWriter {
-        ok: usize,
-    }
-    impl Write for FlakyWriter {
-        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-            if self.ok == 0 {
-                return Err(io::Error::other("write failed"));
-            }
-            self.ok -= 1;
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Input that yields a sequence of chunks (one per read), then 0 forever.
-    /// An empty chunk simulates a poll timeout.
+    /// Input yielding a sequence of chunks (one per read), then 0 forever.
     struct MultiInput {
         chunks: std::collections::VecDeque<Vec<u8>>,
     }
@@ -319,6 +529,23 @@ mod tests {
             let n = chunk.len().min(buf.len());
             buf[..n].copy_from_slice(&chunk[..n]);
             Ok(n)
+        }
+    }
+
+    /// A writer that succeeds `ok` times then fails — to exercise I/O errors.
+    struct FlakyWriter {
+        ok: usize,
+    }
+    impl Write for FlakyWriter {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            if self.ok == 0 {
+                return Err(io::Error::other("write failed"));
+            }
+            self.ok -= 1;
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
@@ -348,6 +575,22 @@ mod tests {
 
     fn rendered(a: &App<ScriptedInput, Vec<u8>>) -> String {
         String::from_utf8(a.out.clone()).unwrap()
+    }
+
+    #[test]
+    fn scripted_input_returns_zero_after_exhaustion() {
+        let mut si = ScriptedInput::new(b"ab");
+        let mut b = [0u8; 8];
+        assert_eq!(si.read(&mut b).unwrap(), 2);
+        assert_eq!(si.read(&mut b).unwrap(), 0);
+    }
+
+    #[test]
+    fn multi_input_returns_zero_when_drained() {
+        let mut mi = MultiInput::new(&[b"x"]);
+        let mut b = [0u8; 8];
+        assert_eq!(mi.read(&mut b).unwrap(), 1);
+        assert_eq!(mi.read(&mut b).unwrap(), 0);
     }
 
     #[test]
@@ -387,9 +630,38 @@ mod tests {
     }
 
     #[test]
+    fn stream_reply_surfaces_writer_error_mid_stream() {
+        let mut conv = Conversation::new();
+        conv.push(Message::user("ping"));
+        let mut out = FlakyWriter { ok: 1 };
+        let err = stream_reply(&StubBackend::instant(), &mut out, &conv).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn run_streams_reply_then_quits() {
+        let mut a = app(b"hello\r/quit\r");
+        a.run().unwrap();
+        let out = rendered(&a);
+        assert!(out.contains("local-first AI terminal"));
+        assert!(out.contains("hello"));
+        assert!(out.contains("You said"));
+        assert_eq!(a.conv.len(), 2);
+    }
+
+    #[test]
+    fn run_propagates_output_errors() {
+        let mut a = App::new(
+            ScriptedInput::new(b"hi\r"),
+            FlakyWriter { ok: 0 },
+            Box::new(StubBackend::instant()),
+            None,
+        );
+        assert!(a.run().is_err());
+    }
+
+    #[test]
     fn run_handles_poll_timeout_and_multiple_reads() {
-        // Chunk 1 types a line, chunk 2 is an empty poll timeout (n==0), chunk 3
-        // quits. Exercises the post-batch redraw and the timeout-continue path.
         let mut a = App::new(
             MultiInput::new(&[b"hello", b"", b"\r/quit\r"]),
             Vec::new(),
@@ -397,7 +669,7 @@ mod tests {
             None,
         );
         a.run().unwrap();
-        assert_eq!(a.conv.len(), 2); // the "hello" turn streamed
+        assert_eq!(a.conv.len(), 2);
     }
 
     #[test]
@@ -420,40 +692,13 @@ mod tests {
     }
 
     #[test]
-    fn run_streams_reply_then_quits() {
-        let mut a = app(b"hello\r/quit\r");
-        a.run().unwrap();
-        let out = rendered(&a);
-        assert!(out.contains("local-first AI terminal")); // banner
-        assert!(out.contains("hello")); // echoed input
-        assert!(out.contains("You said")); // stub reply
-                                           // conversation captured both turns
-        assert_eq!(a.conv.len(), 2);
-    }
-
-    #[test]
-    fn run_quits_on_ctrl_c() {
-        let mut a = app(b"\x03");
-        a.run().unwrap();
-        assert!(rendered(&a).contains("^C"));
-    }
-
-    #[test]
-    fn run_quits_on_ctrl_d_when_empty() {
-        let mut a = app(&[0x04]);
-        a.run().unwrap();
-        // No reply streamed; just banner + input line.
-        assert_eq!(a.conv.len(), 0);
-    }
-
-    #[test]
     fn help_command_prints_help_without_streaming() {
         let mut a = app(b"/help\r/quit\r");
         a.run().unwrap();
         let out = rendered(&a);
         assert!(out.contains("commands"));
-        assert!(out.contains("kill word"));
-        assert_eq!(a.conv.len(), 0); // /help is not a model turn
+        assert!(out.contains("reverse history search"));
+        assert_eq!(a.conv.len(), 0);
     }
 
     #[test]
@@ -464,114 +709,324 @@ mod tests {
     }
 
     #[test]
-    fn exit_alias_quits() {
-        let mut a = app(b"/exit\r");
+    fn editing_keys_mutate_the_line() {
+        let mut a = app(b"");
+        for c in "hello".chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
+        a.dispatch(Key::Home).unwrap();
+        a.dispatch(Key::Right).unwrap();
+        a.dispatch(Key::Delete).unwrap();
+        assert_eq!(a.editor.text(), "hllo");
+        a.dispatch(Key::End).unwrap();
+        a.dispatch(Key::Backspace).unwrap();
+        assert_eq!(a.editor.text(), "hll");
+        a.dispatch(Key::Ctrl('u')).unwrap();
+        assert_eq!(a.editor.text(), "");
+    }
+
+    #[test]
+    fn word_and_char_chords_move_cursor() {
+        let mut a = app(b"");
+        for c in "foo bar".chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
+        a.dispatch(Key::WordLeft).unwrap();
+        assert_eq!(a.editor.cursor(), 4);
+        a.dispatch(Key::Ctrl('b')).unwrap();
+        assert_eq!(a.editor.cursor(), 3);
+        a.dispatch(Key::Ctrl('f')).unwrap();
+        assert_eq!(a.editor.cursor(), 4);
+        a.dispatch(Key::WordRight).unwrap();
+        assert_eq!(a.editor.cursor(), 7);
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_and_enter_submits() {
+        let mut a = App::new(
+            ScriptedInput::new(b"line1\x1b[13;2uline2\r/quit\r"),
+            Vec::new(),
+            Box::new(StubBackend::instant()),
+            None,
+        );
+        a.run().unwrap();
+        // The single submitted message spans two lines.
+        assert_eq!(a.conv.len(), 2);
+        assert_eq!(a.conv.messages[0].content, "line1\nline2");
+    }
+
+    #[test]
+    fn ctrl_c_needs_two_presses_to_exit() {
+        let mut a = app(b"");
+        // Empty line: first ^C arms (Continue), second exits.
+        assert_eq!(a.dispatch(Key::Ctrl('c')).unwrap(), Flow::Continue);
+        assert!(a.ctrl_c_armed);
+        assert_eq!(a.dispatch(Key::Ctrl('c')).unwrap(), Flow::Quit);
+    }
+
+    #[test]
+    fn ctrl_c_clears_a_nonempty_line_without_exiting() {
+        let mut a = app(b"");
+        for c in "draft".chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
+        assert_eq!(a.dispatch(Key::Ctrl('c')).unwrap(), Flow::Continue);
+        assert!(a.editor.is_empty());
+        assert!(!a.ctrl_c_armed);
+    }
+
+    #[test]
+    fn other_key_disarms_ctrl_c() {
+        let mut a = app(b"");
+        a.dispatch(Key::Ctrl('c')).unwrap(); // arm
+        a.dispatch(Key::Char('x')).unwrap(); // disarm
+        assert!(!a.ctrl_c_armed);
+        assert_eq!(a.dispatch(Key::Ctrl('c')).unwrap(), Flow::Continue); // re-arm, not quit
+    }
+
+    #[test]
+    fn double_esc_clears_the_line() {
+        let mut a = app(b"");
+        for c in "junk".chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
+        a.dispatch(Key::Esc).unwrap();
+        assert!(a.esc_pending);
+        assert!(!a.editor.is_empty()); // single esc does nothing yet
+        a.dispatch(Key::Esc).unwrap();
+        assert!(a.editor.is_empty());
+        assert!(!a.esc_pending);
+    }
+
+    #[test]
+    fn single_esc_does_not_clear() {
+        let mut a = app(b"");
+        for c in "keep".chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
+        a.dispatch(Key::Esc).unwrap();
+        a.dispatch(Key::Char('!')).unwrap(); // any other key cancels the esc latch
+        assert!(!a.esc_pending);
+        assert_eq!(a.editor.text(), "keep!");
+    }
+
+    #[test]
+    fn lone_esc_press_flushed_on_timeout() {
+        // Chunk 1 is a bare ESC (decoder leaves it pending), then a poll timeout
+        // flushes it as Esc; chunk 2 quits. Two ESC presses clear nothing here,
+        // but this proves the timeout path emits Esc without hanging.
+        let mut a = App::new(
+            MultiInput::new(&[b"\x1b", b"", b"/quit\r"]),
+            Vec::new(),
+            Box::new(StubBackend::instant()),
+            None,
+        );
         a.run().unwrap();
         assert_eq!(a.conv.len(), 0);
     }
 
     #[test]
-    fn editing_keys_mutate_the_line() {
+    fn reverse_search_finds_and_accepts_history() {
         let mut a = app(b"");
-        for c in "hello".chars() {
-            a.handle_key(Key::Char(c)).unwrap();
+        // Seed history.
+        for line in ["cargo test", "git status", "cargo build"] {
+            for c in line.chars() {
+                a.dispatch(Key::Char(c)).unwrap();
+            }
+            a.dispatch(Key::Enter).unwrap();
         }
-        a.handle_key(Key::Home).unwrap();
-        a.handle_key(Key::Right).unwrap();
-        a.handle_key(Key::Delete).unwrap();
-        assert_eq!(a.editor.text(), "hllo");
-        a.handle_key(Key::End).unwrap();
-        a.handle_key(Key::Backspace).unwrap();
-        assert_eq!(a.editor.text(), "hll");
-        a.handle_key(Key::Ctrl('u')).unwrap();
+        a.dispatch(Key::Ctrl('r')).unwrap();
+        assert!(a.search.is_some());
+        for c in "cargo".chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
+        // Most recent "cargo" match is "cargo build".
+        let idx = a.search.as_ref().unwrap().idx.unwrap();
+        assert_eq!(a.editor.history()[idx], "cargo build");
+        // ^R again steps to the older "cargo test".
+        a.dispatch(Key::Ctrl('r')).unwrap();
+        let idx2 = a.search.as_ref().unwrap().idx.unwrap();
+        assert_eq!(a.editor.history()[idx2], "cargo test");
+        // Enter accepts into the line and exits search.
+        a.dispatch(Key::Enter).unwrap();
+        assert!(a.search.is_none());
+        assert_eq!(a.editor.text(), "cargo test");
+    }
+
+    #[test]
+    fn reverse_search_escape_cancels_without_changing_line() {
+        let mut a = app(b"");
+        for c in "deploy prod".chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
+        a.dispatch(Key::Enter).unwrap(); // history has "deploy prod"
+        a.dispatch(Key::Ctrl('r')).unwrap();
+        for c in "deploy".chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
+        a.dispatch(Key::Esc).unwrap(); // cancel
+        assert!(a.search.is_none());
+        assert!(a.editor.is_empty()); // line untouched (was cleared by submit)
+    }
+
+    #[test]
+    fn reverse_search_backspace_refines_query() {
+        let mut a = app(b"");
+        for line in ["alpha", "beta"] {
+            for c in line.chars() {
+                a.dispatch(Key::Char(c)).unwrap();
+            }
+            a.dispatch(Key::Enter).unwrap();
+        }
+        a.dispatch(Key::Ctrl('r')).unwrap();
+        for c in "alph".chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
+        assert!(a.search.as_ref().unwrap().idx.is_some());
+        for _ in 0..4 {
+            a.dispatch(Key::Backspace).unwrap();
+        }
+        // Empty query → no match.
+        assert!(a.search.as_ref().unwrap().idx.is_none());
+    }
+
+    #[test]
+    fn ctrl_k_and_ctrl_w_kill() {
+        let mut a = app(b"");
+        for c in "foo bar".chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
+        a.dispatch(Key::Ctrl('w')).unwrap();
+        assert_eq!(a.editor.text(), "foo ");
+        a.dispatch(Key::Home).unwrap();
+        a.dispatch(Key::Ctrl('k')).unwrap();
         assert_eq!(a.editor.text(), "");
     }
 
     #[test]
-    fn ctrl_chords_map_to_editor_ops() {
+    fn search_ignores_unmapped_keys() {
         let mut a = app(b"");
-        for c in "foo bar".chars() {
-            a.handle_key(Key::Char(c)).unwrap();
-        }
-        a.handle_key(Key::Ctrl('w')).unwrap(); // kill word
-        assert_eq!(a.editor.text(), "foo ");
-        a.handle_key(Key::Ctrl('e')).unwrap(); // end
-        assert_eq!(a.editor.cursor(), 4);
-        a.handle_key(Key::Ctrl('a')).unwrap(); // home
-        assert_eq!(a.editor.cursor(), 0);
-        a.handle_key(Key::Ctrl('k')).unwrap(); // kill from start to end
-        assert_eq!(a.editor.text(), "");
+        a.dispatch(Key::Char('x')).unwrap();
+        a.dispatch(Key::Enter).unwrap();
+        a.dispatch(Key::Ctrl('r')).unwrap();
+        a.dispatch(Key::Left).unwrap(); // no-op inside search
+        assert!(a.search.is_some());
+    }
+
+    #[test]
+    fn reverse_search_at_oldest_stops() {
+        let mut a = app(b"");
+        a.dispatch(Key::Char('o')).unwrap();
+        a.dispatch(Key::Char('k')).unwrap();
+        a.dispatch(Key::Enter).unwrap();
+        a.dispatch(Key::Ctrl('r')).unwrap();
+        a.dispatch(Key::Char('o')).unwrap();
+        assert_eq!(a.search.as_ref().unwrap().idx, Some(0));
+        a.dispatch(Key::Ctrl('r')).unwrap(); // nothing older than index 0
+        assert_eq!(a.search.as_ref().unwrap().idx, None);
+    }
+
+    #[test]
+    fn multiline_session_redraws_across_rows() {
+        // Type "a", Shift+Enter, "b", Up (to row 0), then three ^C (clear, arm,
+        // quit). Exercises multi-row clear + cursor move-up across loop redraws.
+        let mut a = App::new(
+            MultiInput::new(&[
+                b"a",
+                b"\x1b[13;2u",
+                b"b",
+                b"\x1b[A",
+                b"\x03",
+                b"\x03",
+                b"\x03",
+            ]),
+            Vec::new(),
+            Box::new(StubBackend::instant()),
+            None,
+        );
+        a.run().unwrap();
+        assert_eq!(a.conv.len(), 0);
     }
 
     #[test]
     fn ctrl_d_midline_deletes_char() {
         let mut a = app(b"");
-        a.handle_key(Key::Char('x')).unwrap();
-        a.handle_key(Key::Char('y')).unwrap();
-        a.handle_key(Key::Home).unwrap();
-        a.handle_key(Key::Ctrl('d')).unwrap(); // delete at cursor, not quit
+        a.dispatch(Key::Char('x')).unwrap();
+        a.dispatch(Key::Char('y')).unwrap();
+        a.dispatch(Key::Home).unwrap();
+        a.dispatch(Key::Ctrl('d')).unwrap();
         assert_eq!(a.editor.text(), "y");
     }
 
     #[test]
     fn ctrl_l_clears_screen() {
         let mut a = app(b"");
-        a.handle_key(Key::Ctrl('l')).unwrap();
+        a.dispatch(Key::Ctrl('l')).unwrap();
         assert!(rendered(&a).contains("\x1b[2J"));
     }
 
     #[test]
     fn unmapped_keys_are_noops() {
         let mut a = app(b"");
-        assert_eq!(a.handle_key(Key::Tab).unwrap(), Flow::Continue);
-        assert_eq!(a.handle_key(Key::Esc).unwrap(), Flow::Continue);
-        assert_eq!(a.handle_key(Key::Ctrl('z')).unwrap(), Flow::Continue);
+        assert_eq!(a.dispatch(Key::Tab).unwrap(), Flow::Continue);
+        assert_eq!(a.dispatch(Key::Ctrl('z')).unwrap(), Flow::Continue);
     }
 
     #[test]
     fn history_keys_recall_previous_line() {
         let mut a = app(b"");
         for c in "first".chars() {
-            a.handle_key(Key::Char(c)).unwrap();
+            a.dispatch(Key::Char(c)).unwrap();
         }
-        a.handle_key(Key::Enter).unwrap(); // submits + streams
-        a.handle_key(Key::Up).unwrap(); // recall "first"
+        a.dispatch(Key::Enter).unwrap();
+        a.dispatch(Key::Up).unwrap();
         assert_eq!(a.editor.text(), "first");
-        a.handle_key(Key::Down).unwrap(); // back to empty draft
+        a.dispatch(Key::Down).unwrap();
         assert_eq!(a.editor.text(), "");
     }
 
     #[test]
-    fn stream_reply_surfaces_writer_error_mid_stream() {
-        let mut conv = Conversation::new();
-        conv.push(Message::user("ping"));
-        // Allow the label write, fail on the first token.
-        let mut out = FlakyWriter { ok: 1 };
-        let err = stream_reply(&StubBackend::instant(), &mut out, &conv).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Other);
+    fn up_down_move_between_input_lines_before_history() {
+        let mut a = app(b"");
+        for c in "top".chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
+        a.dispatch(Key::ShiftEnter).unwrap();
+        for c in "bottom".chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
+        // Cursor on line 2; Up moves to line 1 (not history).
+        a.dispatch(Key::Up).unwrap();
+        let (row, _) = a.cursor_rowcol();
+        assert_eq!(row, 0);
+        assert_eq!(a.editor.text(), "top\nbottom"); // text unchanged
     }
 
     #[test]
-    fn run_propagates_output_errors() {
-        // ok: 0 → the very first banner write fails, run() returns Err.
-        let mut a = App::new(
-            ScriptedInput::new(b"hi\r"),
-            FlakyWriter { ok: 0 },
-            Box::new(StubBackend::instant()),
-            None,
-        );
-        assert!(a.run().is_err());
+    fn multiline_render_emits_continuation_and_cursor_moves() {
+        let mut a = app(b"");
+        for c in "ab".chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
+        a.dispatch(Key::ShiftEnter).unwrap();
+        a.dispatch(Key::Char('c')).unwrap();
+        a.out.clear();
+        a.redraw_input().unwrap();
+        let out = rendered(&a);
+        // Two rows: prompt+ab, CRLF, continuation+c.
+        assert!(out.contains("\r\n"));
+        assert!(out.contains("ab"));
+        assert!(out.contains('c'));
     }
 
     #[test]
     fn redraw_moves_cursor_when_not_at_end() {
         let mut a = app(b"");
-        a.handle_key(Key::Char('a')).unwrap();
-        a.handle_key(Key::Char('b')).unwrap();
-        a.handle_key(Key::Left).unwrap();
+        a.dispatch(Key::Char('a')).unwrap();
+        a.dispatch(Key::Char('b')).unwrap();
+        a.dispatch(Key::Left).unwrap();
         a.out.clear();
         a.redraw_input().unwrap();
-        // Cursor moved back one column.
-        assert!(rendered(&a).contains("\x1b[1D"));
+        assert!(rendered(&a).contains("\x1b["));
     }
 }

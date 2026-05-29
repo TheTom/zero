@@ -45,8 +45,30 @@ cargo build --release
 ```
 
 Sessions log to `~/.zero/sessions/zero-<unixtime>.jsonl`.
-Keys: `^A`/`^E` home/end · `^U`/`^K` kill · `^W` kill word · `↑`/`↓` history ·
-`^L` clear · `^C` / `/quit` exit.
+
+### Keys
+
+| Keys | Action |
+|------|--------|
+| `^A` / `^E`, `Home` / `End` | start / end of line |
+| `^B` / `^F` | back / forward one char |
+| `⌥←` / `⌥→`, `^←` / `^→` | back / forward one word |
+| `^W` | delete word back |
+| `^U` / `^K` | kill to start / end of line |
+| `^L` | clear screen |
+| `Shift+Enter` / `⌥+Enter` | insert newline (multiline input) |
+| `Enter` | submit |
+| `↑` / `↓` | move between input lines, else recall history |
+| `^R` | reverse history search (type to match, `^R` for older, `Enter` accept, `Esc` cancel) |
+| `Esc Esc` | clear the line |
+| `^C` | clear the line; on an empty line, `^C` again to exit |
+| `^D` | exit on an empty line |
+
+> **Shift+Enter caveat:** terminals only send a distinct Shift+Enter when they
+> support the modern CSI-u/kitty keyboard protocol (kitty, WezTerm, recent
+> iTerm2). Elsewhere it reads as plain Enter; use `⌥+Enter` (meta+Enter), which
+> more terminals send as `ESC CR`. Word-wise moves (`⌥`/`^` + arrows) likewise
+> depend on the terminal sending the modifier sequence.
 
 ## Test & coverage
 

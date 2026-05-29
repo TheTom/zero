@@ -22,6 +22,12 @@ pub enum Key {
     Right,
     Home,
     End,
+    /// Word-wise cursor moves (Ctrl/Alt + Left/Right).
+    WordLeft,
+    WordRight,
+    /// Shift/Alt+Enter — insert a newline instead of submitting. Only sent by
+    /// terminals that distinguish it (CSI-u, or meta+Enter as `ESC CR`).
+    ShiftEnter,
     /// A Ctrl-letter chord, normalized to lowercase (`Ctrl('c')` for ^C).
     Ctrl(char),
 }
@@ -81,52 +87,74 @@ fn decode_escape(buf: &[u8]) -> Step {
     }
     match buf[1] {
         b'[' | b'O' => decode_csi(buf),
+        // Meta/Alt + Enter (`ESC CR`/`ESC LF`) → insert a newline.
+        b'\r' | b'\n' => Step::Key(Key::ShiftEnter, 2),
         // ESC followed by something else: treat the ESC alone as a press and
         // let the following byte decode on its own next iteration.
         _ => Step::Key(Key::Esc, 1),
     }
 }
 
-/// Decode a CSI / SS3 sequence: `ESC [ ...` or `ESC O ...`.
+/// Decode a CSI / SS3 sequence: `ESC [ …` or `ESC O …`.
+///
+/// Handles the modern parameterized form `ESC [ <p1> ; <p2> <final>` where `p2`
+/// is a modifier (2=Shift, 3=Alt, 5=Ctrl), plus the `~`-terminated numeric form
+/// and the CSI-u form `ESC [ <code> ; <mod> u`.
 fn decode_csi(buf: &[u8]) -> Step {
     // buf[0] == ESC, buf[1] == '[' or 'O'.
-    if buf.len() < 3 {
-        return Step::NeedMore;
-    }
-    let final_byte = buf[2];
-    match final_byte {
-        b'A' => Step::Key(Key::Up, 3),
-        b'B' => Step::Key(Key::Down, 3),
-        b'C' => Step::Key(Key::Right, 3),
-        b'D' => Step::Key(Key::Left, 3),
-        b'H' => Step::Key(Key::Home, 3),
-        b'F' => Step::Key(Key::End, 3),
-        // Numeric "ESC [ N ~" form: read digits, expect a trailing '~'.
-        b'0'..=b'9' => decode_csi_numeric(buf),
-        // Unknown CSI final byte — consume the 3 bytes and move on.
-        _ => Step::Consume(3),
-    }
-}
-
-fn decode_csi_numeric(buf: &[u8]) -> Step {
-    // Scan digits starting at index 2 until a terminator.
     let mut i = 2;
-    while i < buf.len() && buf[i].is_ascii_digit() {
-        i += 1;
+    // Collect up to two numeric params separated by ';'.
+    let mut params = [0u32; 2];
+    let mut nparams = 0usize;
+    while i < buf.len() {
+        let c = buf[i];
+        if c.is_ascii_digit() {
+            if nparams == 0 {
+                nparams = 1;
+            }
+            let slot = nparams - 1;
+            if slot < params.len() {
+                params[slot] = params[slot].saturating_mul(10) + u32::from(c - b'0');
+            }
+            i += 1;
+        } else if c == b';' {
+            nparams = (nparams + 1).min(params.len() + 1);
+            i += 1;
+        } else {
+            break;
+        }
     }
     if i >= buf.len() {
-        return Step::NeedMore; // digits not yet terminated
+        return Step::NeedMore; // final byte not yet arrived
     }
-    if buf[i] != b'~' {
-        // e.g. modifier sequences like "ESC [ 1 ; 2 A" — skip the whole run.
-        return Step::Consume(i + 1);
-    }
-    let num = &buf[2..i];
-    let total = i + 1; // include the '~'
-    let key = match num {
-        b"1" | b"7" => Key::Home,
-        b"4" | b"8" => Key::End,
-        b"3" => Key::Delete,
+    let final_byte = buf[i];
+    let total = i + 1;
+    let modifier = params.get(1).copied().unwrap_or(0);
+    let is_word = matches!(modifier, 3 | 5 | 7); // Alt / Ctrl (7 = Ctrl+Alt)
+
+    let key = match final_byte {
+        b'A' => Key::Up,
+        b'B' => Key::Down,
+        b'C' if is_word => Key::WordRight,
+        b'D' if is_word => Key::WordLeft,
+        b'C' => Key::Right,
+        b'D' => Key::Left,
+        b'H' => Key::Home,
+        b'F' => Key::End,
+        b'u' => {
+            // CSI-u: param0 = codepoint. 13 = Enter → newline when modified.
+            return match params[0] {
+                13 => Step::Key(Key::ShiftEnter, total),
+                _ => Step::Consume(total),
+            };
+        }
+        b'~' => match params[0] {
+            1 | 7 => Key::Home,
+            4 | 8 => Key::End,
+            3 => Key::Delete,
+            _ => return Step::Consume(total),
+        },
+        // Unknown final byte; drop the whole sequence.
         _ => return Step::Consume(total),
     };
     Step::Key(key, total)
@@ -313,9 +341,55 @@ mod tests {
     }
 
     #[test]
-    fn unknown_csi_modifier_is_skipped() {
-        // "ESC [ 1 ; 2 A" (shift-up) — we don't model modifiers; drop it.
-        let ks = keys(b"\x1b[1;2A");
-        assert!(ks.is_empty() || !ks.contains(&Key::Up));
+    fn shift_modifier_on_arrow_falls_back_to_plain_arrow() {
+        // "ESC [ 1 ; 2 A" (shift-up): we don't model shift on arrows → Up.
+        assert_eq!(keys(b"\x1b[1;2A"), vec![Key::Up]);
+    }
+
+    #[test]
+    fn ctrl_and_alt_arrows_are_word_moves() {
+        assert_eq!(keys(b"\x1b[1;5D"), vec![Key::WordLeft]); // ctrl+left
+        assert_eq!(keys(b"\x1b[1;5C"), vec![Key::WordRight]); // ctrl+right
+        assert_eq!(keys(b"\x1b[1;3D"), vec![Key::WordLeft]); // alt+left
+        assert_eq!(keys(b"\x1b[1;3C"), vec![Key::WordRight]); // alt+right
+    }
+
+    #[test]
+    fn shift_enter_via_csi_u() {
+        assert_eq!(keys(b"\x1b[13;2u"), vec![Key::ShiftEnter]);
+    }
+
+    #[test]
+    fn meta_enter_inserts_newline() {
+        assert_eq!(keys(b"\x1b\r"), vec![Key::ShiftEnter]);
+        assert_eq!(keys(b"\x1b\n"), vec![Key::ShiftEnter]);
+    }
+
+    #[test]
+    fn ctrl_r_decodes_as_chord() {
+        assert_eq!(keys(&[0x12]), vec![Key::Ctrl('r')]);
+    }
+
+    #[test]
+    fn unknown_csi_u_codepoint_is_dropped() {
+        // CSI-u for some other key we don't map.
+        let (k, consumed) = decode_keys(b"\x1b[99;2u");
+        assert!(k.is_empty());
+        assert_eq!(consumed, 7);
+    }
+
+    #[test]
+    fn unmapped_numeric_csi_is_dropped() {
+        // ESC [ 5 ~ (PageUp) — we don't map it; consumed, no key.
+        let (k, consumed) = decode_keys(b"\x1b[5~");
+        assert!(k.is_empty());
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn partial_modifier_sequence_waits_for_more() {
+        let (k, consumed) = decode_keys(b"\x1b[1;");
+        assert!(k.is_empty());
+        assert_eq!(consumed, 0);
     }
 }

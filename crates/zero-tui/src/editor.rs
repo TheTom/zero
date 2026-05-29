@@ -68,32 +68,127 @@ impl LineEditor {
         }
     }
 
+    /// Insert a newline at the cursor (Shift/Alt+Enter) — enables multiline.
+    pub fn insert_newline(&mut self) {
+        self.insert('\n');
+    }
+
+    /// True if the buffer spans more than one line.
+    pub fn is_multiline(&self) -> bool {
+        self.buf.contains(&'\n')
+    }
+
+    /// Start index of the line the cursor is on (just after the previous `\n`).
+    fn line_start(&self) -> usize {
+        self.buf[..self.cursor]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map_or(0, |i| i + 1)
+    }
+
+    /// End index of the current line (index of the next `\n`, or buffer end).
+    fn line_end(&self) -> usize {
+        self.buf[self.cursor..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(self.buf.len(), |i| self.cursor + i)
+    }
+
+    /// Move to the start of the current line (Home / ^A).
     pub fn home(&mut self) {
-        self.cursor = 0;
+        self.cursor = self.line_start();
     }
 
+    /// Move to the end of the current line (End / ^E).
     pub fn end(&mut self) {
+        self.cursor = self.line_end();
+    }
+
+    /// Move the cursor left by one word (over whitespace, then over the word).
+    pub fn word_left(&mut self) {
+        let is_ws = |c: char| c.is_whitespace();
+        while self.cursor > 0 && is_ws(self.buf[self.cursor - 1]) {
+            self.cursor -= 1;
+        }
+        while self.cursor > 0 && !is_ws(self.buf[self.cursor - 1]) {
+            self.cursor -= 1;
+        }
+    }
+
+    /// Move the cursor right by one word (over the word, then over whitespace).
+    pub fn word_right(&mut self) {
+        let n = self.buf.len();
+        let is_ws = |c: char| c.is_whitespace();
+        while self.cursor < n && !is_ws(self.buf[self.cursor]) {
+            self.cursor += 1;
+        }
+        while self.cursor < n && is_ws(self.buf[self.cursor]) {
+            self.cursor += 1;
+        }
+    }
+
+    /// Move up one visual line, keeping the column. Returns false if already on
+    /// the first line (so the caller can fall back to history recall).
+    pub fn line_up(&mut self) -> bool {
+        let start = self.line_start();
+        if start == 0 {
+            return false;
+        }
+        let col = self.cursor - start;
+        let prev_start = self.buf[..start - 1]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map_or(0, |i| i + 1);
+        let prev_end = start - 1; // the '\n' position
+        self.cursor = (prev_start + col).min(prev_end);
+        true
+    }
+
+    /// Move down one visual line, keeping the column. Returns false if already on
+    /// the last line (so the caller can fall back to history).
+    pub fn line_down(&mut self) -> bool {
+        let end = self.line_end();
+        if end >= self.buf.len() {
+            return false;
+        }
+        let col = self.cursor - self.line_start();
+        let next_start = end + 1;
+        let next_end = self.buf[next_start..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(self.buf.len(), |i| next_start + i);
+        self.cursor = (next_start + col).min(next_end);
+        true
+    }
+
+    /// Replace the whole buffer (used to accept a history-search match).
+    pub fn set_text(&mut self, text: &str) {
+        self.buf = text.chars().collect();
         self.cursor = self.buf.len();
+        self.hist_pos = None;
     }
 
-    /// Kill from the cursor to end of line (^K).
+    /// Kill from the cursor to the end of the current line (^K).
     pub fn kill_to_end(&mut self) {
-        self.buf.truncate(self.cursor);
+        let end = self.line_end();
+        self.buf.drain(self.cursor..end);
     }
 
-    /// Kill from start of line to the cursor (^U).
+    /// Kill from the start of the current line to the cursor (^U).
     pub fn kill_to_start(&mut self) {
-        self.buf.drain(0..self.cursor);
-        self.cursor = 0;
+        let start = self.line_start();
+        self.buf.drain(start..self.cursor);
+        self.cursor = start;
     }
 
-    /// Kill the word before the cursor (^W): trailing spaces, then the word.
+    /// Kill the word before the cursor (^W): trailing whitespace, then the word.
     pub fn kill_word(&mut self) {
+        let is_ws = |c: char| c.is_whitespace();
         let mut start = self.cursor;
-        while start > 0 && self.buf[start - 1] == ' ' {
+        while start > 0 && is_ws(self.buf[start - 1]) {
             start -= 1;
         }
-        while start > 0 && self.buf[start - 1] != ' ' {
+        while start > 0 && !is_ws(self.buf[start - 1]) {
             start -= 1;
         }
         self.buf.drain(start..self.cursor);
@@ -310,6 +405,77 @@ mod tests {
         e.clear();
         assert!(e.is_empty());
         assert_eq!(e.cursor(), 0);
+    }
+
+    #[test]
+    fn newline_makes_multiline_and_home_end_are_line_local() {
+        let mut e = typed("ab");
+        e.insert_newline();
+        for c in "cd".chars() {
+            e.insert(c);
+        }
+        assert_eq!(e.text(), "ab\ncd");
+        assert!(e.is_multiline());
+        // Cursor on the second line; Home/End stay on that line.
+        e.home();
+        assert_eq!(e.cursor(), 3); // start of "cd"
+        e.end();
+        assert_eq!(e.cursor(), 5); // end of "cd"
+    }
+
+    #[test]
+    fn line_up_down_keep_column_and_report_edges() {
+        let mut e = LineEditor::new();
+        for c in "abc\nde\nfghi".chars() {
+            if c == '\n' {
+                e.insert_newline();
+            } else {
+                e.insert(c);
+            }
+        }
+        // Cursor at end of "fghi" (col 4 on last line).
+        assert!(!e.line_down(), "already on last line");
+        assert!(e.line_up()); // to "de" — clamps to its end (col 2)
+        assert_eq!(e.cursor(), 6); // index of 'd'(4) 'e'(5) end=6
+        assert!(e.line_up()); // to "abc"
+        assert!(!e.line_up(), "already on first line");
+        e.line_down();
+        assert!(e.is_multiline());
+    }
+
+    #[test]
+    fn word_moves_skip_words_and_whitespace() {
+        let mut e = typed("foo bar baz");
+        e.word_left();
+        assert_eq!(e.cursor(), 8); // start of "baz"
+        e.word_left();
+        assert_eq!(e.cursor(), 4); // start of "bar"
+        e.home();
+        e.word_right();
+        assert_eq!(e.cursor(), 4); // past "foo " to start of "bar"
+    }
+
+    #[test]
+    fn kill_to_end_is_line_local_in_multiline() {
+        let mut e = LineEditor::new();
+        for c in "abc\ndef".chars() {
+            if c == '\n' {
+                e.insert_newline();
+            } else {
+                e.insert(c);
+            }
+        }
+        e.home(); // start of "def"
+        e.kill_to_end();
+        assert_eq!(e.text(), "abc\n");
+    }
+
+    #[test]
+    fn set_text_replaces_buffer_and_parks_cursor_at_end() {
+        let mut e = typed("old");
+        e.set_text("recalled command");
+        assert_eq!(e.text(), "recalled command");
+        assert_eq!(e.cursor(), 16);
     }
 
     #[test]
