@@ -77,17 +77,33 @@ only (Zero is local-first; no TLS).
 Don't know the URL? Let Zero find it:
 
 ```
-/scan            scan the local network for OpenAI-compatible servers
-/connect <n>     attach to one from the list (swaps the live backend)
+/scan            scan this device + the local network for model servers
+/connect <n>     attach to a discovered model (swaps the live backend)
+/model <name>    switch model on the current endpoint
 /servers         list servers found before
 ```
 
-`/scan` probes the local `/24` on common LLM ports (8000, 8080, 11434, 1234, …),
-reads each server's `/v1/models`, and lists what it found. `/connect` attaches
-immediately and saves the choice to `config.json`, so next launch auto-connects.
-Discovered servers are remembered in `~/.zero/servers.json`; re-scanning
-refreshes their model lists and drops a saved model if the box now serves a
-different one.
+`/scan` probes **loopback** (servers running on this device, like LM Studio or
+Ollama) *and* the local `/24` on common LLM ports (8000, 8080, 11434, 1234, …),
+reads each server's `/v1/models`, and lists every model it found — a host serving
+several models shows up as several pick choices:
+
+```
+discovered models
+  1) qwen-heretic     http://192.168.50.125:8000
+  2) llama-3.1-8b     http://127.0.0.1:1234
+  3) mistral          http://127.0.0.1:1234
+use /connect <n> to attach
+```
+
+`/connect <n>` attaches immediately and saves the choice to `config.json`
+(next launch auto-connects). `/model <name>` switches the model on the current
+endpoint. Discovered servers are remembered in `~/.zero/servers.json`;
+re-scanning refreshes their model lists and drops a saved model if the box now
+serves a different one.
+
+> Cloud endpoints (`https://`) aren't supported yet — Zero is local-first and
+> currently speaks plain `http` only. TLS is a later addition.
 
 Sessions log to `~/.zero/sessions/zero-<unixtime>.jsonl`.
 

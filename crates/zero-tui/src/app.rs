@@ -337,6 +337,11 @@ impl<I: Input, W: Write> App<I, W> {
             self.connect_index(n)?;
             return Ok(Flow::Continue);
         }
+        if let Some(rest) = trimmed.strip_prefix("/model") {
+            self.echo_committed(&text)?;
+            self.set_model(rest.trim())?;
+            return Ok(Flow::Continue);
+        }
 
         self.echo_committed(&text)?;
         self.conv.push(Message::user(&text));
@@ -422,56 +427,85 @@ impl<I: Input, W: Write> App<I, W> {
             let _ = store.save(path);
         }
         self.scan_results = results;
-        if self.scan_results.is_empty() {
-            self.write_text("\x1b[2mno OpenAI-compatible servers found on the LAN\x1b[0m\n")?;
+        let targets = self.connect_targets();
+        if targets.is_empty() {
+            self.write_text(
+                "\x1b[2mno OpenAI-compatible servers found (loopback or LAN)\x1b[0m\n",
+            )?;
             return Ok(());
         }
-        let mut out = String::from("\x1b[1mdiscovered servers\x1b[0m\n");
-        for (i, d) in self.scan_results.iter().enumerate() {
-            let model = d
-                .models
-                .first()
-                .map(String::as_str)
-                .unwrap_or("(no models)");
-            out.push_str(&format!(
-                "  {}) {model}  \x1b[2m{}\x1b[0m\n",
-                i + 1,
-                d.base_url
-            ));
+        // Each model on each server is its own connectable row.
+        let mut out = String::from("\x1b[1mdiscovered models\x1b[0m\n");
+        for (i, (url, model)) in targets.iter().enumerate() {
+            let m = if model.is_empty() {
+                "(no models)"
+            } else {
+                model
+            };
+            out.push_str(&format!("  {}) {m}  \x1b[2m{url}\x1b[0m\n", i + 1));
         }
         out.push_str("\x1b[2muse /connect <n> to attach\x1b[0m\n");
         self.write_text(&out)?;
         Ok(())
     }
 
-    /// Attach to the nth server from the last `/scan` (1-based): swap the live
-    /// backend, persist the choice to the config file.
+    /// Flatten the last scan into one `(url, model)` row per model — so a host
+    /// serving several models offers several pick choices.
+    fn connect_targets(&self) -> Vec<(String, String)> {
+        let mut targets = Vec::new();
+        for d in &self.scan_results {
+            if d.models.is_empty() {
+                targets.push((d.base_url.clone(), String::new()));
+            } else {
+                for m in &d.models {
+                    targets.push((d.base_url.clone(), m.clone()));
+                }
+            }
+        }
+        targets
+    }
+
+    /// Attach to the nth discovered (server, model) pair (1-based): swap the
+    /// live backend and persist the choice to the config file.
     fn connect_index(&mut self, n: usize) -> io::Result<()> {
-        let Some(d) = n
-            .checked_sub(1)
-            .and_then(|i| self.scan_results.get(i))
-            .cloned()
-        else {
-            self.write_text("\x1b[31mno such server — run /scan first\x1b[0m\n")?;
+        let targets = self.connect_targets();
+        let Some((url, model)) = n.checked_sub(1).and_then(|i| targets.get(i)).cloned() else {
+            self.write_text("\x1b[31mno such entry — run /scan first\x1b[0m\n")?;
             return Ok(());
         };
-        self.config.base_url = Some(d.base_url.clone());
-        if let Some(m) = d.models.first() {
-            self.config.model = m.clone();
+        self.config.base_url = Some(url);
+        self.config.model = model;
+        self.rebuild_backend();
+        self.write_text(&format!(
+            "\x1b[2mconnected: {}\x1b[0m\n",
+            self.config.summary()
+        ))
+    }
+
+    /// Set the model on the current endpoint (`/model <name>`), or show it.
+    fn set_model(&mut self, name: &str) -> io::Result<()> {
+        if name.is_empty() {
+            let cur = if self.config.model.is_empty() {
+                "(none)"
+            } else {
+                &self.config.model
+            };
+            return self.write_text(&format!("\x1b[2mmodel: {cur}\x1b[0m\n"));
         }
-        match OpenAiBackend::from_config(&self.config) {
-            Some(b) => self.backend = Box::new(b),
-            None => {
-                self.write_text("\x1b[31mcould not build backend\x1b[0m\n")?;
-                return Ok(());
-            }
+        self.config.model = name.to_string();
+        self.rebuild_backend();
+        self.write_text(&format!("\x1b[2mmodel set: {}\x1b[0m\n", self.config.model))
+    }
+
+    /// Rebuild the live backend from the current config and persist it.
+    fn rebuild_backend(&mut self) {
+        if let Some(b) = OpenAiBackend::from_config(&self.config) {
+            self.backend = Box::new(b);
         }
         if let Some(path) = &self.config_path {
             let _ = self.config.save(path);
         }
         self.info = self.config.summary();
-        let msg = format!("connected: {}", self.config.summary());
-        self.write_text(&format!("\x1b[2m{msg}\x1b[0m\n"))
     }
 
     /// List the locally-saved servers (`~/.zero/servers.json`).
@@ -670,7 +704,8 @@ impl<I: Input, W: Write> App<I, W> {
             ('K', "/quit  /exit", "leave Zero"),
             ('K', "/config", "show the active backend and model"),
             ('K', "/scan", "find model servers on your network"),
-            ('K', "/connect <n>", "attach to a discovered server"),
+            ('K', "/connect <n>", "attach to a discovered model"),
+            ('K', "/model <name>", "switch model on the current endpoint"),
             ('K', "/servers", "list saved servers"),
             (
                 'K',
@@ -1048,7 +1083,7 @@ mod tests {
         ])
         .unwrap();
         let out = rendered(&a);
-        assert!(out.contains("discovered servers"));
+        assert!(out.contains("discovered models"));
         assert!(out.contains("qwen"));
         assert!(out.contains("/connect"));
         // Persisted to the server store.
@@ -1088,7 +1123,53 @@ mod tests {
     fn connect_index_out_of_range_is_reported() {
         let mut a = app(b"");
         a.connect_index(5).unwrap();
-        assert!(rendered(&a).contains("no such server"));
+        assert!(rendered(&a).contains("no such entry"));
+    }
+
+    #[test]
+    fn multi_model_host_offers_one_entry_per_model() {
+        let mut a = app(b"");
+        // One host serving two models → two connectable rows.
+        a.apply_scan(vec![disc("http://h:8000", &["qwen", "llama"])])
+            .unwrap();
+        let targets = a.connect_targets();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0], ("http://h:8000".into(), "qwen".into()));
+        assert_eq!(targets[1], ("http://h:8000".into(), "llama".into()));
+        // Connect to the second model specifically.
+        a.connect_index(2).unwrap();
+        assert!(a.backend.name().contains("llama"));
+    }
+
+    #[test]
+    fn model_command_switches_model_on_current_endpoint() {
+        let mut a = app(b"");
+        a.set_config(
+            Config {
+                base_url: Some("http://h:8000".into()),
+                model: "qwen".into(),
+                ..Config::default()
+            },
+            None,
+            None,
+        );
+        a.set_model("llama-3.1-8b").unwrap();
+        assert_eq!(a.config.model, "llama-3.1-8b");
+        assert!(a.backend.name().contains("llama-3.1-8b"));
+        // No-arg form reports the current model.
+        a.out.clear();
+        a.set_model("").unwrap();
+        assert!(rendered(&a).contains("llama-3.1-8b"));
+    }
+
+    #[test]
+    fn server_with_no_models_still_connectable() {
+        let mut a = app(b"");
+        a.apply_scan(vec![disc("http://h:8000", &[])]).unwrap();
+        assert!(rendered(&a).contains("(no models)"));
+        let targets = a.connect_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].1, ""); // empty model
     }
 
     #[test]

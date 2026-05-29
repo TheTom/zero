@@ -35,6 +35,15 @@ pub fn local_ipv4() -> Option<[u8; 4]> {
     }
 }
 
+/// Loopback candidates — servers bound to `127.0.0.1` on this very device
+/// (LM Studio, Ollama, llama.cpp run locally). Easy to miss otherwise.
+pub fn loopback_candidates(ports: &[u16]) -> Vec<SocketAddr> {
+    ports
+        .iter()
+        .map(|&p| SocketAddr::from(([127, 0, 0, 1], p)))
+        .collect()
+}
+
 /// Build candidate `host:port` addresses across the local `/24` and `ports`.
 pub fn local_candidates(ports: &[u16]) -> Vec<SocketAddr> {
     let Some([a, b, c, _]) = local_ipv4() else {
@@ -126,9 +135,11 @@ pub fn scan_candidates(
     found
 }
 
-/// Scan the local subnet on the default ports.
+/// Scan this device (loopback) and the local subnet on the default ports.
 pub fn scan(timeout: Duration) -> Vec<Discovered> {
-    scan_candidates(&local_candidates(DEFAULT_PORTS), timeout, 64)
+    let mut candidates = loopback_candidates(DEFAULT_PORTS);
+    candidates.extend(local_candidates(DEFAULT_PORTS));
+    scan_candidates(&candidates, timeout, 64)
 }
 
 #[cfg(test)]
@@ -154,6 +165,13 @@ mod tests {
         assert!(parse_models("not json").is_empty());
         assert!(parse_models("{}").is_empty());
         assert!(parse_models(r#"{"data":[]}"#).is_empty());
+    }
+
+    #[test]
+    fn loopback_candidates_one_per_port() {
+        let c = loopback_candidates(&[8000, 11434]);
+        assert_eq!(c.len(), 2);
+        assert!(c.iter().all(|a| a.ip().is_loopback()));
     }
 
     #[test]
