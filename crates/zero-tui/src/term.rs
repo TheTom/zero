@@ -90,19 +90,22 @@ pub fn stdin_is_tty() -> bool {
     unsafe { isatty(STDIN_FD) == 1 }
 }
 
-/// Query the current terminal size, falling back to 80x24 if the ioctl fails.
+/// Query the current terminal size, falling back to 80x24 if no tty fd answers.
+/// Tries stdout/stderr/stdin — stdin alone can miss (e.g. when it's piped while
+/// the real terminal is on stdout).
 pub fn terminal_size() -> Size {
-    let mut ws = WinSize::default();
-    // SAFETY: ws is a valid, sized-out WinSize for the kernel to fill.
-    let rc = unsafe { ioctl(STDIN_FD, TIOCGWINSZ, &mut ws) };
-    if rc == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-        Size {
-            cols: ws.ws_col,
-            rows: ws.ws_row,
+    for fd in [1, 2, 0] {
+        let mut ws = WinSize::default();
+        // SAFETY: ws is a valid, sized-out WinSize for the kernel to fill.
+        let rc = unsafe { ioctl(fd, TIOCGWINSZ, &mut ws) };
+        if rc == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+            return Size {
+                cols: ws.ws_col,
+                rows: ws.ws_row,
+            };
         }
-    } else {
-        Size { cols: 80, rows: 24 }
     }
+    Size { cols: 80, rows: 24 }
 }
 
 /// RAII guard that puts the terminal in raw mode and restores it on drop.
