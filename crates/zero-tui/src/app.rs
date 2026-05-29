@@ -63,6 +63,8 @@ pub struct App<I: Input, W: Write> {
     search: Option<Search>,
     /// A dangerous shell command awaiting `y/N` confirmation.
     pending_shell: Option<String>,
+    /// Human-readable backend/config summary, shown by `/config`.
+    info: String,
 }
 
 impl<I: Input, W: Write> App<I, W> {
@@ -86,11 +88,21 @@ impl<I: Input, W: Write> App<I, W> {
             esc_pending: false,
             search: None,
             pending_shell: None,
+            info: String::new(),
         }
+    }
+
+    /// Set the summary shown by `/config` (backend, model, config path).
+    pub fn set_info(&mut self, info: impl Into<String>) {
+        self.info = info.into();
     }
 
     /// Run the event loop until the user quits.
     pub fn run(&mut self) -> io::Result<()> {
+        // Ask the terminal to report disambiguated keys (kitty keyboard
+        // protocol). On terminals that support it, Shift+Enter then arrives as
+        // `ESC [ 13 ; 2 u`; on others this is silently ignored. Popped in finish.
+        self.out.write_all(b"\x1b[>1u")?;
         self.print_banner()?;
         self.redraw_input()?;
 
@@ -129,6 +141,8 @@ impl<I: Input, W: Write> App<I, W> {
     }
 
     fn finish(&mut self) -> io::Result<()> {
+        // Pop the kitty keyboard-protocol flags we pushed in run().
+        self.out.write_all(b"\x1b[<u")?;
         self.write_text("\n")?;
         Ok(())
     }
@@ -264,6 +278,16 @@ impl<I: Input, W: Write> App<I, W> {
         if trimmed == "/help" {
             self.echo_committed(&text)?;
             self.print_help()?;
+            return Ok(Flow::Continue);
+        }
+        if trimmed == "/config" {
+            self.echo_committed(&text)?;
+            let info = if self.info.is_empty() {
+                "no backend configured (stub)".to_string()
+            } else {
+                self.info.clone()
+            };
+            self.write_text(&format!("\x1b[2m{info}\x1b[0m\n"))?;
             return Ok(Flow::Continue);
         }
 
@@ -514,6 +538,7 @@ impl<I: Input, W: Write> App<I, W> {
             ('H', "Commands", ""),
             ('K', "/help", "show this help"),
             ('K', "/quit  /exit", "leave Zero"),
+            ('K', "/config", "show the active backend and model"),
             (
                 'K',
                 "!<cmd>",
@@ -850,6 +875,24 @@ mod tests {
         assert!(out.contains("Commands"));
         assert!(out.contains("reverse history search"));
         assert_eq!(a.conv.len(), 0);
+    }
+
+    #[test]
+    fn config_command_shows_info() {
+        let mut a = app(b"");
+        a.set_info("qwen @ http://gx10:8000");
+        type_str(&mut a, "/config");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("qwen @ http://gx10:8000"));
+        assert_eq!(a.conv.len(), 0);
+    }
+
+    #[test]
+    fn config_command_without_info_says_stub() {
+        let mut a = app(b"");
+        type_str(&mut a, "/config");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("stub"));
     }
 
     #[test]

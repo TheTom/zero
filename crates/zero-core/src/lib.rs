@@ -15,13 +15,18 @@
 pub mod backend;
 pub mod brand;
 pub mod clock;
+pub mod config;
+pub mod http;
 pub mod json;
 pub mod message;
+pub mod openai;
 pub mod safety;
 pub mod session;
 
 pub use backend::{Backend, BackendError, StopReason, StreamEvent, StubBackend};
 pub use clock::{format_duration, Stopwatch};
+pub use config::Config;
 pub use json::Value;
 pub use message::{Conversation, Message, Role};
+pub use openai::OpenAiBackend;
 pub use session::SessionLog;

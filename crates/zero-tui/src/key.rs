@@ -146,9 +146,21 @@ fn decode_csi(buf: &[u8]) -> Step {
         b'H' => Key::Home,
         b'F' => Key::End,
         b'u' => {
-            // CSI-u: param0 = codepoint. 13 = Enter → newline when modified.
+            // CSI-u (kitty keyboard protocol): param0 = codepoint, param1 = mods.
+            // With the protocol enabled, Shift+Enter arrives here as `13;2u`.
             return match params[0] {
-                13 => Step::Key(Key::ShiftEnter, total),
+                // Enter: plain → submit; with any modifier (Shift) → newline.
+                13 => Step::Key(
+                    if modifier >= 2 {
+                        Key::ShiftEnter
+                    } else {
+                        Key::Enter
+                    },
+                    total,
+                ),
+                27 => Step::Key(Key::Esc, total),
+                9 => Step::Key(Key::Tab, total),
+                127 => Step::Key(Key::Backspace, total),
                 _ => Step::Consume(total),
             };
         }
@@ -367,6 +379,15 @@ mod tests {
     #[test]
     fn shift_enter_via_csi_u() {
         assert_eq!(keys(b"\x1b[13;2u"), vec![Key::ShiftEnter]);
+    }
+
+    #[test]
+    fn csi_u_legacy_keys_when_kitty_protocol_enabled() {
+        // With the kitty protocol on, these report as CSI-u.
+        assert_eq!(keys(b"\x1b[13u"), vec![Key::Enter]); // plain Enter → submit
+        assert_eq!(keys(b"\x1b[27u"), vec![Key::Esc]);
+        assert_eq!(keys(b"\x1b[9u"), vec![Key::Tab]);
+        assert_eq!(keys(b"\x1b[127u"), vec![Key::Backspace]);
     }
 
     #[test]

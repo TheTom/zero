@@ -1,0 +1,268 @@
+//! An OpenAI-compatible streaming chat backend (llama.cpp / vLLM / Ollama shim).
+//! Builds the `/v1/chat/completions` request from a [`Conversation`], POSTs it
+//! with `stream: true` via [`crate::http`], and turns the SSE `data:` deltas
+//! into [`StreamEvent`]s.
+//!
+//! Request building and SSE-line parsing are pure and unit-tested; the network
+//! round-trip rides on the localhost-mock-tested `http` module.
+
+use crate::backend::{Backend, BackendError, StopReason, StreamEvent};
+use crate::config::Config;
+use crate::http;
+use crate::json::Value;
+use crate::message::{Conversation, Message, Role};
+
+/// A backend that streams from an OpenAI-compatible server.
+pub struct OpenAiBackend {
+    endpoint: String,
+    model: String,
+    api_key: Option<String>,
+    temperature: Option<f64>,
+    system_prompt: Option<String>,
+    name: String,
+}
+
+impl OpenAiBackend {
+    /// Build from a [`Config`]. Returns `None` if no `base_url` is configured.
+    pub fn from_config(cfg: &Config) -> Option<OpenAiBackend> {
+        let base = cfg.base_url.as_ref()?;
+        let endpoint = format!("{}/v1/chat/completions", base.trim_end_matches('/'));
+        Some(OpenAiBackend {
+            endpoint,
+            model: cfg.model.clone(),
+            api_key: cfg.api_key.clone(),
+            temperature: cfg.temperature,
+            system_prompt: cfg.system_prompt.clone(),
+            name: cfg.summary(),
+        })
+    }
+
+    /// The JSON request body for `conv`.
+    fn build_body(&self, conv: &Conversation) -> String {
+        let mut messages: Vec<Value> = Vec::new();
+        if let Some(sys) = &self.system_prompt {
+            messages.push(Message::new(Role::System, sys.clone()).to_value());
+        }
+        messages.extend(conv.messages.iter().map(Message::to_value));
+
+        let mut obj = vec![
+            ("model".to_string(), Value::Str(self.model.clone())),
+            ("stream".to_string(), Value::Bool(true)),
+            ("messages".to_string(), Value::Array(messages)),
+        ];
+        if let Some(t) = self.temperature {
+            obj.push(("temperature".to_string(), Value::Num(t)));
+        }
+        Value::Object(obj).to_json()
+    }
+}
+
+impl Backend for OpenAiBackend {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn stream(
+        &self,
+        conv: &Conversation,
+        sink: &mut dyn FnMut(StreamEvent),
+    ) -> Result<(), BackendError> {
+        let body = self.build_body(conv);
+        let mut headers: Vec<(String, String)> = Vec::new();
+        if let Some(key) = &self.api_key {
+            headers.push(("Authorization".to_string(), format!("Bearer {key}")));
+        }
+
+        http::post_stream(&self.endpoint, &headers, &body, &mut |line| {
+            if let Some(SseEvent::Token(t)) = parse_sse_line(line) {
+                sink(StreamEvent::Token(t));
+            }
+        })
+        .map_err(|e| BackendError(e.to_string()))?;
+
+        sink(StreamEvent::Done(StopReason::EndTurn));
+        Ok(())
+    }
+}
+
+/// What an SSE line meant, if anything.
+#[derive(Debug, PartialEq, Eq)]
+enum SseEvent {
+    Token(String),
+    Done,
+}
+
+/// Parse one SSE line into an event. Returns `None` for blanks, comments,
+/// keep-alives, role-only deltas, and anything unrecognized.
+fn parse_sse_line(line: &str) -> Option<SseEvent> {
+    let data = line.strip_prefix("data:")?.trim();
+    if data == "[DONE]" {
+        return Some(SseEvent::Done);
+    }
+    let v = Value::parse(data).ok()?;
+    let delta = v.get("choices")?.as_array()?.first()?.get("delta")?;
+    let content = delta.get("content").and_then(Value::as_str)?;
+    if content.is_empty() {
+        None
+    } else {
+        Some(SseEvent::Token(content.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> Config {
+        Config {
+            base_url: Some("http://gx10:8000/".to_string()),
+            model: "qwen".to_string(),
+            api_key: Some("tok".to_string()),
+            temperature: Some(0.3),
+            system_prompt: Some("be terse".to_string()),
+        }
+    }
+
+    #[test]
+    fn from_config_requires_base_url() {
+        assert!(OpenAiBackend::from_config(&Config::default()).is_none());
+        let b = OpenAiBackend::from_config(&cfg()).unwrap();
+        // Trailing slash on base_url is normalized.
+        assert_eq!(b.endpoint, "http://gx10:8000/v1/chat/completions");
+        assert!(b.name().contains("qwen"));
+    }
+
+    #[test]
+    fn build_body_includes_system_prompt_and_params() {
+        let b = OpenAiBackend::from_config(&cfg()).unwrap();
+        let mut conv = Conversation::new();
+        conv.push(Message::user("hi"));
+        let body = b.build_body(&conv);
+        let v = Value::parse(&body).unwrap();
+        assert_eq!(v.get("model").and_then(Value::as_str), Some("qwen"));
+        assert_eq!(v.get("stream").and_then(Value::as_bool), Some(true));
+        assert_eq!(v.get("temperature").and_then(Value::as_f64), Some(0.3));
+        let msgs = v.get("messages").and_then(Value::as_array).unwrap();
+        assert_eq!(msgs.len(), 2); // system + user
+        assert_eq!(msgs[0].get("role").and_then(Value::as_str), Some("system"));
+        assert_eq!(msgs[1].get("content").and_then(Value::as_str), Some("hi"));
+    }
+
+    #[test]
+    fn build_body_omits_optional_fields_when_unset() {
+        let cfg = Config {
+            base_url: Some("http://h:1".to_string()),
+            model: "m".to_string(),
+            ..Config::default()
+        };
+        let b = OpenAiBackend::from_config(&cfg).unwrap();
+        let body = b.build_body(&Conversation::new());
+        let v = Value::parse(&body).unwrap();
+        assert!(v.get("temperature").is_none());
+        // No system prompt → empty messages array.
+        assert_eq!(
+            v.get("messages").and_then(Value::as_array).map(<[_]>::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn parses_token_delta() {
+        let line = r#"data: {"choices":[{"delta":{"content":"Hel"}}]}"#;
+        assert_eq!(
+            parse_sse_line(line),
+            Some(SseEvent::Token("Hel".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_done_marker() {
+        assert_eq!(parse_sse_line("data: [DONE]"), Some(SseEvent::Done));
+    }
+
+    #[test]
+    fn ignores_non_token_lines() {
+        assert_eq!(parse_sse_line(""), None);
+        assert_eq!(parse_sse_line(": keep-alive comment"), None);
+        // Role-only opening delta has no content.
+        assert_eq!(
+            parse_sse_line(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#),
+            None
+        );
+        // Empty content string.
+        assert_eq!(
+            parse_sse_line(r#"data: {"choices":[{"delta":{"content":""}}]}"#),
+            None
+        );
+        // Malformed JSON after data:.
+        assert_eq!(parse_sse_line("data: {not json"), None);
+    }
+
+    #[test]
+    fn end_to_end_against_a_localhost_mock() {
+        use crate::backend::Backend;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // Drain the request fully (idle timeout) to avoid a RST-on-close race.
+            sock.set_read_timeout(Some(std::time::Duration::from_millis(150)))
+                .ok();
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = sock.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n\
+                        data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n\
+                        data: [DONE]\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+
+        let cfg = Config {
+            base_url: Some(format!("http://127.0.0.1:{port}")),
+            model: "m".to_string(),
+            api_key: Some("tok".to_string()), // exercises the Authorization header
+            ..Config::default()
+        };
+        let backend = OpenAiBackend::from_config(&cfg).unwrap();
+        let mut conv = Conversation::new();
+        conv.push(Message::user("hi"));
+
+        let mut text = String::new();
+        let mut stop = None;
+        backend
+            .stream(&conv, &mut |ev| match ev {
+                StreamEvent::Token(t) => text.push_str(&t),
+                StreamEvent::Done(r) => stop = Some(r),
+            })
+            .unwrap();
+        assert_eq!(text, "Hello world");
+        assert_eq!(stop, Some(StopReason::EndTurn));
+    }
+
+    #[test]
+    fn stream_reports_connection_errors() {
+        use crate::backend::Backend;
+        let cfg = Config {
+            base_url: Some("http://127.0.0.1:1".to_string()),
+            model: "m".to_string(),
+            ..Config::default()
+        };
+        let backend = OpenAiBackend::from_config(&cfg).unwrap();
+        let err = backend
+            .stream(&Conversation::new(), &mut |_| {})
+            .unwrap_err();
+        assert!(!err.0.is_empty());
+    }
+}
