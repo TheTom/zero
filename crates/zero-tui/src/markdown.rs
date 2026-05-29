@@ -58,10 +58,13 @@ impl MarkdownStream {
     pub fn feed(&mut self, chunk: &str) -> String {
         let mut out = String::with_capacity(chunk.len() + 8);
         for ch in chunk.chars() {
-            // Collect a fence's language tag, then emit the block header.
+            // Collect (and suppress) a fence's language tag. The `/clip` marker
+            // is emitted as a FOOTER when the block closes, not here.
             if self.collecting_lang {
                 if ch == '\n' {
-                    self.emit_block_header(&mut out);
+                    self.collecting_lang = false;
+                    self.at_line_start = true;
+                    self.line_only_backticks = true;
                 } else {
                     self.lang_buf.push(ch);
                 }
@@ -86,7 +89,10 @@ impl MarkdownStream {
                     self.line_only_backticks = false;
                     if self.in_fence {
                         self.in_fence = false;
-                        self.suppress_eol = true; // skip trailing after closing ```
+                        // Footer below the block; its line ends with the close
+                        // fence's own newline (suppress_eol).
+                        self.emit_block_footer(&mut out);
+                        self.suppress_eol = true;
                     } else {
                         self.in_fence = true;
                         self.block_count += 1;
@@ -153,8 +159,9 @@ impl MarkdownStream {
         }
     }
 
-    /// Emit the dim header that opens a code block and carries its `/clip` index.
-    fn emit_block_header(&mut self, out: &mut String) {
+    /// Emit the dim footer below a closed code block, carrying its `/clip`
+    /// index. No trailing newline — the close fence's own newline ends the line.
+    fn emit_block_footer(&mut self, out: &mut String) {
         let lang = self.lang_buf.trim();
         let n = self.block_count;
         let label = if lang.is_empty() {
@@ -162,10 +169,7 @@ impl MarkdownStream {
         } else {
             format!("── {lang} · ⧉ /clip {n} ──")
         };
-        out.push_str(&format!("{DIM_ON}{label}{DIM_OFF}\n"));
-        self.collecting_lang = false;
-        self.at_line_start = true;
-        self.line_only_backticks = true;
+        out.push_str(&format!("{DIM_ON}{label}{DIM_OFF}"));
     }
 
     fn newline(&mut self, out: &mut String) {
@@ -280,11 +284,10 @@ pub fn line_blocks(text: &str) -> Vec<Option<usize>> {
         if line.trim_start().starts_with("```") {
             if in_fence {
                 in_fence = false;
-                out.push(None); // close fence: its trailing newline = a blank line
+                out.push(Some(block)); // close fence renders the footer line
             } else {
                 in_fence = true;
-                block += 1;
-                out.push(Some(block)); // header line
+                block += 1; // open fence emits no output line
             }
         } else if in_fence {
             out.push(Some(block)); // body line
@@ -414,8 +417,8 @@ mod tests {
     fn line_blocks_maps_rendered_lines_to_blocks() {
         // prose, then a 2-line block (header + body), then trailing prose.
         let lb = line_blocks("intro\n```rust\nx\n```\nbye");
-        // prose, header, body, blank(close), prose.
-        assert_eq!(lb, vec![None, Some(1), Some(1), None, None]);
+        // prose, body, footer(close), prose. (Open fence emits no line.)
+        assert_eq!(lb, vec![None, Some(1), Some(1), None]);
         // The map length matches the rendered line count.
         let rendered_lines = render("intro\n```rust\nx\n```\nbye").split('\n').count();
         assert_eq!(lb.len(), rendered_lines);
