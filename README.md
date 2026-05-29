@@ -153,14 +153,11 @@ terminal styling (the raw text is kept for the model and for copying).
 
 Copy to the system clipboard (`pbcopy` / `wl-copy` / `xclip`):
 
-- `/clip <n>` — copy code block *n*. Each block shows a header with its index:
-  `── rust · ⧉ /clip 1 ──`.
-- `/clip` — copy the whole last response.
-
-> No mouse click-to-copy: capturing clicks requires terminal mouse reporting,
-> which steals the scroll wheel and breaks native scrollback. Zero keeps
-> scrollback and uses `/clip <n>` instead. Clickable widgets will come with a
-> future full-screen mode (its own canvas, where mouse capture is appropriate).
+- `/clip <n>` — copy code block *n* (blocks render a `── rust · ⧉ copy ──`
+  footer). `/clip` copies the whole last response.
+- `/mouse` — toggle click-to-copy. **Off by default** so the scroll wheel works.
+  When on, click a code block to copy it — but mouse capture means the terminal
+  needs **Shift+wheel** to scroll. Your call which you'd rather have.
 
 ## Test & coverage
 

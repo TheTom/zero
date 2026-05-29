@@ -92,6 +92,9 @@ pub struct App<I: Input, W: Write> {
     last_anchor: usize,
     /// Per-rendered-line code-block map for the last response (click-to-copy).
     last_line_blocks: Vec<Option<usize>>,
+    /// Whether mouse reporting is on (opt-in: enables click-to-copy but the
+    /// terminal then needs Shift+wheel to scroll). Off by default.
+    mouse_on: bool,
 }
 
 impl<I: Input, W: Write> App<I, W> {
@@ -126,6 +129,7 @@ impl<I: Input, W: Write> App<I, W> {
             printed_lines: 0,
             last_anchor: 0,
             last_line_blocks: Vec::new(),
+            mouse_on: false,
         }
     }
 
@@ -201,7 +205,10 @@ impl<I: Input, W: Write> App<I, W> {
     }
 
     fn finish(&mut self) -> io::Result<()> {
-        // Pop the kitty keyboard-protocol flags we pushed in run().
+        // Disable mouse reporting if it was on, and pop kitty-protocol flags.
+        if self.mouse_on {
+            self.out.write_all(b"\x1b[?1000l\x1b[?1006l")?;
+        }
         self.out.write_all(b"\x1b[<u")?;
         self.write_text("\n")?;
         Ok(())
@@ -380,6 +387,11 @@ impl<I: Input, W: Write> App<I, W> {
             self.do_clip(rest.trim())?;
             return Ok(Flow::Continue);
         }
+        if trimmed == "/mouse" {
+            self.echo_committed(&text)?;
+            self.toggle_mouse()?;
+            return Ok(Flow::Continue);
+        }
 
         self.echo_committed(&text)?;
         self.conv.push(Message::user(&text));
@@ -452,6 +464,21 @@ impl<I: Input, W: Write> App<I, W> {
             return self.copy_text(&body);
         }
         Ok(())
+    }
+
+    /// Toggle mouse reporting. On → clicks copy code blocks, but the terminal
+    /// needs Shift+wheel to scroll. Off → plain scroll wheel works again.
+    fn toggle_mouse(&mut self) -> io::Result<()> {
+        self.mouse_on = !self.mouse_on;
+        if self.mouse_on {
+            self.out.write_all(b"\x1b[?1000h\x1b[?1006h")?;
+            self.write_text(
+                "\x1b[2mmouse on — click a code block to copy (scroll: Shift+wheel)\x1b[0m\n",
+            )
+        } else {
+            self.out.write_all(b"\x1b[?1000l\x1b[?1006l")?;
+            self.write_text("\x1b[2mmouse off — scroll wheel restored\x1b[0m\n")
+        }
     }
 
     /// Copy `text` via the configured clipboard and report the result.
@@ -811,6 +838,11 @@ impl<I: Input, W: Write> App<I, W> {
                 'K',
                 "/clip [n]",
                 "copy the last response, or just code block n",
+            ),
+            (
+                'K',
+                "/mouse",
+                "toggle click-to-copy (captures the scroll wheel)",
             ),
             (
                 'K',
@@ -1271,8 +1303,8 @@ mod tests {
         }));
         type_str(&mut a, "go");
         a.dispatch(Key::Enter).unwrap();
-        // The block streamed an inline copy header.
-        assert!(rendered(&a).contains("/clip 1"));
+        // The block streamed a copy footer.
+        assert!(rendered(&a).contains("⧉ copy"));
         assert_eq!(a.last_blocks.len(), 1);
         // /clip 1 copies just the block body, not the whole response.
         type_str(&mut a, "/clip 1");
@@ -1316,6 +1348,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(*captured.borrow(), "fn main() {}");
+    }
+
+    #[test]
+    fn mouse_toggle_flips_state_and_reports() {
+        let mut a = app(b"");
+        type_str(&mut a, "/mouse");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(a.mouse_on);
+        assert!(rendered(&a).contains("mouse on"));
+        a.out.clear();
+        type_str(&mut a, "/mouse");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(!a.mouse_on);
+        assert!(rendered(&a).contains("mouse off"));
     }
 
     #[test]

@@ -39,8 +39,6 @@ pub struct MarkdownStream {
     /// Accumulating a fence's language tag before emitting the block header.
     collecting_lang: bool,
     lang_buf: String,
-    /// 1-based index of the current/last code block (matches `/clip <n>`).
-    block_count: usize,
     heading: bool,
     heading_marker: bool,
 }
@@ -95,7 +93,6 @@ impl MarkdownStream {
                         self.suppress_eol = true;
                     } else {
                         self.in_fence = true;
-                        self.block_count += 1;
                         self.collecting_lang = true;
                         self.lang_buf.clear();
                     }
@@ -163,11 +160,10 @@ impl MarkdownStream {
     /// index. No trailing newline — the close fence's own newline ends the line.
     fn emit_block_footer(&mut self, out: &mut String) {
         let lang = self.lang_buf.trim();
-        let n = self.block_count;
         let label = if lang.is_empty() {
-            format!("── ⧉ /clip {n} ──")
+            "── ⧉ copy ──".to_string()
         } else {
-            format!("── {lang} · ⧉ /clip {n} ──")
+            format!("── {lang} · ⧉ copy ──")
         };
         out.push_str(&format!("{DIM_ON}{label}{DIM_OFF}"));
     }
@@ -355,20 +351,19 @@ mod tests {
     }
 
     #[test]
-    fn fenced_block_shows_header_and_hides_fences() {
+    fn fenced_block_shows_copy_footer_and_hides_fences() {
         let out = render("```rust\nlet x = 1;\n```\n");
-        // The ``` markers are gone; a header with the lang + /clip index appears.
+        // The ``` markers are gone; a copy footer with the lang appears.
         assert!(!out.contains("```"));
-        assert!(out.contains("/clip 1"));
-        assert!(out.contains("rust")); // lang shown in the header
+        assert!(out.contains("⧉ copy"));
+        assert!(out.contains("rust")); // lang shown in the footer
         assert!(out.contains("let x = 1;")); // body rendered
     }
 
     #[test]
-    fn two_blocks_get_sequential_clip_indices() {
+    fn two_blocks_each_get_a_copy_footer() {
         let out = render("```\na\n```\ntext\n```\nb\n```\n");
-        assert!(out.contains("/clip 1"));
-        assert!(out.contains("/clip 2"));
+        assert_eq!(out.matches("⧉ copy").count(), 2);
     }
 
     #[test]
