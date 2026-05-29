@@ -102,10 +102,8 @@ impl<I: Input, W: Write> App<I, W> {
                 // A lone ESC that never grew into a sequence is a real Esc press.
                 if pending == [0x1b] {
                     pending.clear();
-                    if self.dispatch(Key::Esc)? == Flow::Quit {
-                        return self.finish();
-                    }
-                    self.redraw_input()?;
+                    self.dispatch(Key::Esc)?; // Esc never quits, only clears/arms
+                    self.redraw_if_idle()?;
                 }
                 continue;
             }
@@ -117,8 +115,17 @@ impl<I: Input, W: Write> App<I, W> {
                     return self.finish();
                 }
             }
+            self.redraw_if_idle()?;
+        }
+    }
+
+    /// Redraw the input line — unless a submode (search / shell confirm) owns
+    /// the screen, in which case it renders itself and a redraw would clobber it.
+    fn redraw_if_idle(&mut self) -> io::Result<()> {
+        if self.search.is_none() && self.pending_shell.is_none() {
             self.redraw_input()?;
         }
+        Ok(())
     }
 
     fn finish(&mut self) -> io::Result<()> {
@@ -224,6 +231,15 @@ impl<I: Input, W: Write> App<I, W> {
         }
         if matches!(trimmed, "/quit" | "/exit") {
             return Ok(Flow::Quit);
+        }
+        // Bare `exit`/`quit` (shell muscle memory) — don't send it to the model
+        // and don't silently quit; nudge toward the real exit and arm ^C.
+        if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
+            self.echo_committed(&text)?;
+            self.write_text("\x1b[2m(press ^C again to exit)\x1b[0m\n")?;
+            self.ctrl_c_armed = true;
+            self.cursor_row = 0;
+            return Ok(Flow::Continue);
         }
         // `!cmd` — run a shell command inline (gated by the safety classifier).
         if let Some(rest) = trimmed.strip_prefix('!') {
@@ -390,7 +406,17 @@ impl<I: Input, W: Write> App<I, W> {
             .lines()
             .next()
             .unwrap_or("");
-        let line = format!("\r\x1b[K(reverse-i-search)`{}`: {}", s.query, shown);
+        // Match readline: "(failed reverse-i-search)" when a non-empty query has
+        // no match.
+        let label = if s.idx.is_none() && !s.query.is_empty() {
+            "failed reverse-i-search"
+        } else {
+            "reverse-i-search"
+        };
+        let line = format!(
+            "\r\x1b[K\x1b[2m({label})`\x1b[0m{}\x1b[2m`:\x1b[0m {}",
+            s.query, shown
+        );
         self.out.write_all(line.as_bytes())?;
         self.out.flush()
     }
@@ -445,10 +471,10 @@ impl<I: Input, W: Write> App<I, W> {
             write!(self.out, "\x1b[{}A", bottom - trow)?;
         }
         self.out.write_all(b"\r")?;
+        // The prompt/continuation prefix is always >= 1 column wide, so the
+        // cursor always needs advancing past it.
         let col = prefix_w + tcol;
-        if col > 0 {
-            write!(self.out, "\x1b[{col}C")?;
-        }
+        write!(self.out, "\x1b[{col}C")?;
         self.cursor_row = trow;
         self.out.flush()
     }
@@ -482,22 +508,48 @@ impl<I: Input, W: Write> App<I, W> {
     }
 
     fn print_help(&mut self) -> io::Result<()> {
-        let help = "\
-\x1b[1mcommands\x1b[0m\n\
-  /help        show this\n\
-  /quit /exit  leave\n\
-  !<cmd>       run a shell command (dangerous ones ask first)\n\
-\x1b[1mediting\x1b[0m\n\
-  ^A/^E or Home/End   start/end of line     ^B/^F  back/forward char\n\
-  ⌥/^←  ⌥/^→          back/forward word     ^W     delete word back\n\
-  ^U/^K               kill to start/end     ^L     clear screen\n\
-\x1b[1mmultiline & history\x1b[0m\n\
-  Shift/⌥+Enter       insert newline        Enter  submit\n\
-  ↑/↓                 move line, else history\n\
-  ^R                  reverse history search\n\
-\x1b[1mexit\x1b[0m\n\
-  Esc Esc  clear line          ^C  clear line / ^C again to quit\n\n";
-        self.write_text(help)
+        // Hand-aligned single column: bold section headers, cyan keys, dim
+        // descriptions. `H` marks headers, `K` marks key rows.
+        const ROWS: &[(char, &str, &str)] = &[
+            ('H', "Commands", ""),
+            ('K', "/help", "show this help"),
+            ('K', "/quit  /exit", "leave Zero"),
+            (
+                'K',
+                "!<cmd>",
+                "run a shell command — dangerous ones ask first",
+            ),
+            ('H', "Editing", ""),
+            ('K', "^A  ^E   Home End", "start / end of line"),
+            ('K', "^B  ^F", "back / forward one char"),
+            ('K', "⌥←  ⌥→", "back / forward one word"),
+            ('K', "^W", "delete the word before the cursor"),
+            ('K', "^U  ^K", "kill to start / end of line"),
+            ('K', "^L", "clear the screen"),
+            ('H', "Multiline & history", ""),
+            ('K', "⇧⏎  ⌥⏎", "insert a newline"),
+            ('K', "⏎", "submit"),
+            ('K', "↑  ↓", "move between input lines, else recall history"),
+            ('K', "^R", "reverse history search"),
+            ('H', "Exit", ""),
+            ('K', "Esc Esc", "clear the line"),
+            (
+                'K',
+                "^C",
+                "clear the line; on an empty line, ^C again quits",
+            ),
+        ];
+        let mut out = String::from("\n");
+        for (kind, key, desc) in ROWS {
+            match kind {
+                'H' => out.push_str(&format!("\x1b[1m{key}\x1b[0m\n")),
+                _ => out.push_str(&format!(
+                    "  \x1b[36m{key:<18}\x1b[0m \x1b[2m{desc}\x1b[0m\n"
+                )),
+            }
+        }
+        out.push('\n');
+        self.write_text(&out)
     }
 
     /// Write text, translating `\n` to `\r\n` for raw mode.
@@ -790,9 +842,59 @@ mod tests {
         let mut a = app(b"/help\r/quit\r");
         a.run().unwrap();
         let out = rendered(&a);
-        assert!(out.contains("commands"));
+        assert!(out.contains("Commands"));
         assert!(out.contains("reverse history search"));
         assert_eq!(a.conv.len(), 0);
+    }
+
+    #[test]
+    fn bare_exit_nudges_instead_of_quitting() {
+        let mut a = app(b"");
+        type_str(&mut a, "exit");
+        assert_eq!(a.dispatch(Key::Enter).unwrap(), Flow::Continue);
+        assert!(a.ctrl_c_armed);
+        assert_eq!(a.conv.len(), 0); // not sent to the model
+        assert!(rendered(&a).contains("press ^C again to exit"));
+        // Now ^C actually exits (armed + empty line).
+        assert_eq!(a.dispatch(Key::Ctrl('c')).unwrap(), Flow::Quit);
+    }
+
+    #[test]
+    fn bare_quit_is_also_nudged_case_insensitively() {
+        let mut a = app(b"");
+        type_str(&mut a, "QUIT");
+        assert_eq!(a.dispatch(Key::Enter).unwrap(), Flow::Continue);
+        assert!(a.ctrl_c_armed);
+    }
+
+    #[test]
+    fn redraw_is_suppressed_during_search() {
+        // The bug: a redraw after each search keystroke clobbered the search UI.
+        let mut a = app(b"");
+        a.dispatch(Key::Ctrl('r')).unwrap();
+        a.out.clear();
+        a.redraw_if_idle().unwrap();
+        assert!(a.out.is_empty(), "must not draw over the search prompt");
+    }
+
+    #[test]
+    fn redraw_is_suppressed_during_shell_confirm() {
+        let mut a = app(b"");
+        type_str(&mut a, "!rm -rf /tmp/zero-x");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(a.pending_shell.is_some());
+        a.out.clear();
+        a.redraw_if_idle().unwrap();
+        assert!(a.out.is_empty(), "must not draw over the confirm prompt");
+    }
+
+    #[test]
+    fn reverse_search_failed_state_renders() {
+        let mut a = app(b""); // empty history
+        a.dispatch(Key::Ctrl('r')).unwrap();
+        a.dispatch(Key::Char('z')).unwrap(); // nothing matches
+        assert!(a.search.as_ref().unwrap().idx.is_none());
+        assert!(rendered(&a).contains("failed reverse-i-search"));
     }
 
     #[test]
