@@ -557,8 +557,20 @@ impl<I: Input, W: Write> App<I, W> {
     /// Keys during a streaming turn: `^C` interrupts, `Enter` queues the typed
     /// line, `/quit` still exits. Other keys edit the (not-yet-shown) input.
     fn handle_streaming_key(&mut self, key: Key) -> io::Result<Flow> {
+        // `Esc Esc` interrupts too; reset the latch on any other key.
+        if key != Key::Esc {
+            self.esc_pending = false;
+        }
         match key {
-            Key::Ctrl('c') => self.interrupt_stream()?,
+            Key::Ctrl('c') => self.interrupt_stream()?, // single ^C interrupts
+            Key::Esc => {
+                if self.esc_pending {
+                    self.esc_pending = false;
+                    self.interrupt_stream()?;
+                } else {
+                    self.esc_pending = true;
+                }
+            }
             Key::Enter => {
                 let text = self.editor.submit();
                 let trimmed = text.trim();
@@ -948,35 +960,41 @@ impl<I: Input, W: Write> App<I, W> {
         Ok(())
     }
 
-    /// Redraw the (possibly multi-row) input block and position the cursor.
+    /// Redraw the bordered input box and position the cursor. Layout (a future
+    /// status line — token usage, etc. — will sit just below the bottom rule):
+    /// ```text
+    /// ──────────────  (top rule)
+    /// › the input…    (one or more rows)
+    /// ──────────────  (bottom rule)
+    /// ```
     fn redraw_input(&mut self) -> io::Result<()> {
         self.clear_input_block()?;
+        let width = (crate::term::terminal_size().cols as usize).max(1);
+        let rule = "─".repeat(width);
         let text = self.editor.text();
         let lines: Vec<&str> = text.split('\n').collect();
+
+        // Top rule, then each input row, then the bottom rule.
+        write!(self.out, "\x1b[2m{rule}\x1b[0m")?;
         for (i, line) in lines.iter().enumerate() {
-            if i > 0 {
-                self.out.write_all(b"\r\n")?;
-            }
             let prefix = if i == 0 { self.prompt.as_str() } else { CONT };
-            write!(self.out, "{prefix}{line}")?;
+            write!(self.out, "\r\n{prefix}{line}")?;
         }
-        // Cursor is now at the end of the last row; move it to its logical spot.
+        write!(self.out, "\r\n\x1b[2m{rule}\x1b[0m")?;
+
+        // Cursor is on the bottom rule; move it up to its logical input row/col.
         let (trow, tcol) = self.cursor_rowcol();
         let prefix_w = if trow == 0 {
             self.prompt.chars().count()
         } else {
             CONT.chars().count()
         };
-        let bottom = lines.len() - 1;
-        if bottom > trow {
-            write!(self.out, "\x1b[{}A", bottom - trow)?;
-        }
-        self.out.write_all(b"\r")?;
-        // The prompt/continuation prefix is always >= 1 column wide, so the
-        // cursor always needs advancing past it.
+        let up = lines.len() - trow; // bottom rule is `len - trow` rows below it
+        write!(self.out, "\x1b[{up}A\r")?;
         let col = prefix_w + tcol;
         write!(self.out, "\x1b[{col}C")?;
-        self.cursor_row = trow;
+        // Row 0 of the box is the top rule; input row `trow` is at box row 1+trow.
+        self.cursor_row = 1 + trow;
         self.out.flush()
     }
 
@@ -1052,6 +1070,13 @@ impl<I: Input, W: Write> App<I, W> {
             ('K', "⏎", "submit"),
             ('K', "↑  ↓", "move between input lines, else recall history"),
             ('K', "^R", "reverse history search"),
+            ('H', "While a reply is generating", ""),
+            (
+                'K',
+                "type + ⏎",
+                "queue a message — runs after the current reply",
+            ),
+            ('K', "^C  ·  Esc Esc", "interrupt the running reply"),
             ('H', "Exit", ""),
             ('K', "Esc Esc", "clear the line"),
             (
@@ -1481,6 +1506,27 @@ mod tests {
         a.start_turn("go").unwrap();
         type_into(&mut a, "/quit");
         assert_eq!(a.dispatch(Key::Enter).unwrap(), Flow::Quit);
+    }
+
+    #[test]
+    fn esc_twice_interrupts_a_streaming_turn() {
+        let mut a = app(b"");
+        a.start_turn("go").unwrap();
+        a.dispatch(Key::Esc).unwrap(); // arm
+        assert!(a.streaming.is_some());
+        a.dispatch(Key::Esc).unwrap(); // interrupt
+        assert!(a.streaming.is_none());
+        assert!(rendered(&a).contains("interrupted"));
+    }
+
+    #[test]
+    fn typing_between_escs_does_not_interrupt() {
+        let mut a = app(b"");
+        a.start_turn("go").unwrap();
+        a.dispatch(Key::Esc).unwrap(); // arm
+        a.dispatch(Key::Char('x')).unwrap(); // disarms
+        a.dispatch(Key::Esc).unwrap(); // arms again, not interrupt
+        assert!(a.streaming.is_some());
     }
 
     #[test]

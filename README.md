@@ -114,8 +114,8 @@ The model streams on a background thread, so the prompt stays live:
 - **Type ahead / queue** — keep typing; each `Enter` **queues** a message
   (`⏎ queued (n)`) that runs in order once the current reply finishes. Doesn't
   interrupt.
-- **`^C`** — interrupt the in-flight reply (keeps the partial text in context,
-  clears the queue).
+- **`^C` or `Esc Esc`** — interrupt the in-flight reply (keeps the partial text
+  in context, clears the queue), e.g. to redirect it.
 
 ### Keys
 
