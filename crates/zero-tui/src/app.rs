@@ -11,10 +11,14 @@
 
 use crate::editor::LineEditor;
 use crate::key::{decode_keys, Key};
+use crate::markdown::MarkdownStream;
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::time::Duration;
-use zero_core::backend::{Backend, StreamEvent};
+use zero_core::backend::{Backend, StopReason, StreamEvent};
 use zero_core::clock::{format_duration, Stopwatch};
 use zero_core::config::Config;
 use zero_core::discovery::Discovered;
@@ -52,13 +56,25 @@ struct Search {
     idx: Option<usize>,
 }
 
+/// State of an in-flight model turn: the backend streams on another thread and
+/// sends events down `rx`; the event loop drains them so it stays responsive
+/// (can queue more input, or `^C` to interrupt).
+struct StreamState {
+    rx: Receiver<StreamEvent>,
+    reply: String,
+    md: MarkdownStream,
+    sw: Stopwatch,
+    /// Absolute line index of this response's first rendered line.
+    anchor: usize,
+}
+
 /// The running terminal application.
 pub struct App<I: Input, W: Write> {
     input: I,
     out: W,
     editor: LineEditor,
     conv: Conversation,
-    backend: Box<dyn Backend>,
+    backend: Arc<dyn Backend>,
     log: Option<SessionLog<std::fs::File>>,
     prompt: String,
     /// Row offset (within the input block) where the cursor was left after the
@@ -95,6 +111,12 @@ pub struct App<I: Input, W: Write> {
     /// Whether mouse reporting is on (opt-in: enables click-to-copy but the
     /// terminal then needs Shift+wheel to scroll). Off by default.
     mouse_on: bool,
+    /// The current in-flight turn, if a reply is streaming.
+    streaming: Option<StreamState>,
+    /// Messages typed while a reply was streaming, run in order afterward.
+    queue: VecDeque<String>,
+    /// Run the backend inline instead of on a thread — deterministic for tests.
+    synchronous: bool,
 }
 
 impl<I: Input, W: Write> App<I, W> {
@@ -102,7 +124,7 @@ impl<I: Input, W: Write> App<I, W> {
     pub fn new(
         input: I,
         out: W,
-        backend: Box<dyn Backend>,
+        backend: Arc<dyn Backend>,
         log: Option<SessionLog<std::fs::File>>,
     ) -> Self {
         App {
@@ -130,6 +152,9 @@ impl<I: Input, W: Write> App<I, W> {
             last_anchor: 0,
             last_line_blocks: Vec::new(),
             mouse_on: false,
+            streaming: None,
+            queue: VecDeque::new(),
+            synchronous: false,
         }
     }
 
@@ -173,9 +198,12 @@ impl<I: Input, W: Write> App<I, W> {
         let mut pending: Vec<u8> = Vec::new();
         let mut buf = [0u8; 1024];
         loop {
-            let n = self.input.read(&mut buf)?;
+            // Drain any streamed tokens first so the reply renders promptly.
+            if self.streaming.is_some() {
+                self.pump_stream()?;
+            }
+            let n = self.input.read(&mut buf)?; // returns within ~100ms (VTIME)
             if n == 0 {
-                // A lone ESC that never grew into a sequence is a real Esc press.
                 if pending == [0x1b] {
                     pending.clear();
                     self.dispatch(Key::Esc)?; // Esc never quits, only clears/arms
@@ -191,7 +219,11 @@ impl<I: Input, W: Write> App<I, W> {
                     return self.finish();
                 }
             }
-            self.redraw_if_idle()?;
+            // While streaming we don't draw a live input line (it would collide
+            // with the in-place reply); the input shows once the turn finishes.
+            if self.streaming.is_none() {
+                self.redraw_if_idle()?;
+            }
         }
     }
 
@@ -214,13 +246,16 @@ impl<I: Input, W: Write> App<I, W> {
         Ok(())
     }
 
-    /// Route a key, honoring submodes (confirm, search) and double-press combos.
+    /// Route a key, honoring submodes (confirm, search, streaming) and combos.
     fn dispatch(&mut self, key: Key) -> io::Result<Flow> {
         if self.pending_shell.is_some() {
             return self.handle_confirm_key(key);
         }
         if self.search.is_some() {
             return self.handle_search_key(key);
+        }
+        if self.streaming.is_some() {
+            return self.handle_streaming_key(key);
         }
         // Reset double-press latches unless this key continues the combo.
         if key != Key::Ctrl('c') {
@@ -393,33 +428,184 @@ impl<I: Input, W: Write> App<I, W> {
             return Ok(Flow::Continue);
         }
 
-        self.echo_committed(&text)?;
-        self.conv.push(Message::user(&text));
-        if let Some(log) = self.log.as_mut() {
-            let _ = log.record_message(Role::User, &text);
+        // A normal message: start a streaming turn (on a background thread, so
+        // the loop stays free to queue more input or interrupt).
+        self.start_turn(&text)?;
+        if self.synchronous {
+            // Tests: drive the (inline-filled) turn to completion now.
+            while self.streaming.is_some() {
+                self.pump_stream()?;
+            }
         }
+        Ok(Flow::Continue)
+    }
 
-        // The assistant's first rendered line sits on the label line.
+    // --- streaming turns (threaded) --------------------------------------
+
+    /// Echo the user line, then kick off a streamed reply. The backend runs on a
+    /// thread (or inline when `synchronous`), sending events down a channel.
+    fn start_turn(&mut self, prompt: &str) -> io::Result<()> {
+        self.echo_committed(prompt)?;
+        self.conv.push(Message::user(prompt));
+        if let Some(log) = self.log.as_mut() {
+            let _ = log.record_message(Role::User, prompt);
+        }
+        self.write_text(&format!("\x1b[2m{}›\x1b[0m ", zero_core::brand::slug()))?;
+        self.out.flush()?;
         let anchor = self.printed_lines;
-        // Disjoint field borrows let the sink write while the backend is read.
-        let (reply, elapsed, nl) = stream_reply(self.backend.as_ref(), &mut self.out, &self.conv)?;
-        self.printed_lines += nl;
 
+        let (tx, rx) = mpsc::channel();
+        let backend = Arc::clone(&self.backend);
+        let conv = self.conv.clone();
+        let run = move || {
+            // Surface a backend error as a visible token, then a Done so the
+            // turn finalizes cleanly.
+            if let Err(e) = backend.stream(&conv, &mut |ev| {
+                let _ = tx.send(ev);
+            }) {
+                let _ = tx.send(StreamEvent::Token(format!("\n\x1b[31m[{e}]\x1b[0m")));
+                let _ = tx.send(StreamEvent::Done(StopReason::EndTurn));
+            }
+        };
+        if self.synchronous {
+            run(); // fill the channel now — deterministic for tests
+        } else {
+            std::thread::spawn(run);
+        }
+        self.streaming = Some(StreamState {
+            rx,
+            reply: String::new(),
+            md: MarkdownStream::new(),
+            sw: Stopwatch::start(),
+            anchor,
+        });
+        Ok(())
+    }
+
+    /// Drain available streamed tokens, rendering them in place; finalize when
+    /// the turn completes.
+    fn pump_stream(&mut self) -> io::Result<()> {
+        let mut tokens = Vec::new();
+        let mut done = false;
+        if let Some(s) = &self.streaming {
+            loop {
+                match s.rx.try_recv() {
+                    Ok(StreamEvent::Token(t)) => tokens.push(t),
+                    Ok(StreamEvent::Done(_)) => {
+                        done = true;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !tokens.is_empty() {
+            // Render markdown without overlapping the &mut self borrow.
+            let mut chunks = Vec::with_capacity(tokens.len());
+            if let Some(s) = self.streaming.as_mut() {
+                for t in &tokens {
+                    s.reply.push_str(t);
+                    chunks.push(s.md.feed(t));
+                }
+            }
+            for c in &chunks {
+                self.write_text(c)?;
+            }
+            self.out.flush()?;
+        }
+        if done {
+            self.finalize_stream()?;
+        }
+        Ok(())
+    }
+
+    /// The streamed turn finished: close styling, record it, then start the next
+    /// queued message (if any).
+    fn finalize_stream(&mut self) -> io::Result<()> {
+        let Some(mut s) = self.streaming.take() else {
+            return Ok(());
+        };
+        let tail = s.md.finish();
+        if !tail.is_empty() {
+            self.write_text(&tail)?;
+        }
+        let elapsed = s.sw.elapsed();
+        let reply = std::mem::take(&mut s.reply);
         self.conv.push(Message::assistant(&reply));
         if let Some(log) = self.log.as_mut() {
             let _ = log.record_message(Role::Assistant, &reply);
             let _ = log.record_turn_done(elapsed.as_millis());
         }
-        self.last_reply = reply; // remembered for /clip
-        self.last_blocks = crate::markdown::code_blocks(&self.last_reply);
-        // Click-to-copy map for this response.
-        self.last_anchor = anchor;
-        self.last_line_blocks = crate::markdown::line_blocks(&self.last_reply);
-
-        // Honest, measured elapsed — dimmed, never an estimate. (Each code block
-        // already showed its own `⧉ /clip <n>` header inline as it streamed.)
+        self.last_reply = reply.clone();
+        self.last_blocks = crate::markdown::code_blocks(&reply);
+        self.last_anchor = s.anchor;
+        self.last_line_blocks = crate::markdown::line_blocks(&reply);
         self.write_text(&format!("\n\x1b[2m  {}\x1b[0m\n", format_duration(elapsed)))?;
+
+        if let Some(next) = self.queue.pop_front() {
+            self.start_turn(&next)?;
+        } else {
+            self.redraw_input()?;
+        }
+        Ok(())
+    }
+
+    /// Keys during a streaming turn: `^C` interrupts, `Enter` queues the typed
+    /// line, `/quit` still exits. Other keys edit the (not-yet-shown) input.
+    fn handle_streaming_key(&mut self, key: Key) -> io::Result<Flow> {
+        match key {
+            Key::Ctrl('c') => self.interrupt_stream()?,
+            Key::Enter => {
+                let text = self.editor.submit();
+                let trimmed = text.trim();
+                if matches!(trimmed, "/quit" | "/exit") {
+                    return Ok(Flow::Quit);
+                }
+                if !trimmed.is_empty() {
+                    self.queue.push_back(text.clone());
+                    self.write_text(&format!(
+                        "\n\x1b[2m⏎ queued ({}): {}\x1b[0m\n",
+                        self.queue.len(),
+                        trimmed
+                    ))?;
+                }
+            }
+            Key::Backspace => self.editor.backspace(),
+            Key::Char(c) => self.editor.insert(c),
+            _ => {} // other editing keys: no live echo while streaming
+        }
         Ok(Flow::Continue)
+    }
+
+    /// Abort the in-flight stream (`^C`): keep the partial reply in context,
+    /// drop anything queued, and return to the prompt.
+    fn interrupt_stream(&mut self) -> io::Result<()> {
+        let Some(mut s) = self.streaming.take() else {
+            return Ok(());
+        };
+        let tail = s.md.finish();
+        if !tail.is_empty() {
+            self.write_text(&tail)?;
+        }
+        self.write_text("\n\x1b[2m^C interrupted\x1b[0m\n")?;
+        let reply = std::mem::take(&mut s.reply);
+        if !reply.trim().is_empty() {
+            self.conv.push(Message::assistant(&reply));
+            self.last_reply = reply.clone();
+            self.last_blocks = crate::markdown::code_blocks(&reply);
+            self.last_line_blocks = crate::markdown::line_blocks(&reply);
+            self.last_anchor = s.anchor;
+        }
+        self.queue.clear();
+        self.cursor_row = 0;
+        self.redraw_input()?;
+        // The detached thread (if any) finishes on its own; its sends are
+        // dropped harmlessly now that `rx` is gone.
+        Ok(())
     }
 
     /// `/clip` copies the whole last response; `/clip <n>` copies code block n.
@@ -627,7 +813,7 @@ impl<I: Input, W: Write> App<I, W> {
     /// Rebuild the live backend from the current config and persist it.
     fn rebuild_backend(&mut self) {
         if let Some(b) = OpenAiBackend::from_config(&self.config) {
-            self.backend = Box::new(b);
+            self.backend = Arc::new(b);
         }
         if let Some(path) = &self.config_path {
             let _ = self.config.save(path);
@@ -943,58 +1129,6 @@ fn write_raw<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Stream a reply from `backend`, echoing tokens live. Returns the full raw
-/// text, measured elapsed time, and the number of content lines (newlines) it
-/// emitted — the caller advances its line counter by that. Free function so the
-/// caller can pass disjoint `&mut out` and `&backend` borrows.
-fn stream_reply<W: Write>(
-    backend: &dyn Backend,
-    out: &mut W,
-    conv: &Conversation,
-) -> io::Result<(String, Duration, usize)> {
-    let mut reply = String::new();
-    let mut io_err: Option<io::Error> = None;
-    let mut nl = 0usize; // newlines we emit, for line tracking
-                         // `reply` keeps the raw markdown (for the model + /clip); `md` renders it to
-                         // ANSI for live display so `**bold**`, `*italic*`, `` `code` `` look right.
-    let mut md = crate::markdown::MarkdownStream::new();
-
-    write_raw(
-        out,
-        &format!("\x1b[2m{}›\x1b[0m ", zero_core::brand::slug()),
-    )?;
-    out.flush()?;
-
-    let sw = Stopwatch::start();
-    let stream_res = backend.stream(conv, &mut |ev| {
-        if io_err.is_some() {
-            return;
-        }
-        if let StreamEvent::Token(t) = ev {
-            reply.push_str(&t);
-            let rendered = md.feed(&t);
-            nl += rendered.bytes().filter(|&b| b == b'\n').count();
-            if let Err(e) = write_raw(out, &rendered).and_then(|()| out.flush()) {
-                io_err = Some(e);
-            }
-        }
-    });
-    let elapsed = sw.elapsed();
-
-    if let Some(e) = io_err {
-        return Err(e);
-    }
-    // Close any styling left open at the end of the response.
-    let tail = md.finish();
-    nl += tail.bytes().filter(|&b| b == b'\n').count();
-    write_raw(out, &tail)?;
-    if let Err(e) = stream_res {
-        write_raw(out, &format!("\n\x1b[31m[{e}]\x1b[0m"))?;
-        nl += 1;
-    }
-    Ok((reply, elapsed, nl))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,16 +1217,37 @@ mod tests {
     }
 
     fn app(script: &[u8]) -> App<ScriptedInput, Vec<u8>> {
-        App::new(
+        let mut a = App::new(
             ScriptedInput::new(script),
             Vec::new(),
-            Box::new(StubBackend::instant()),
+            Arc::new(StubBackend::instant()),
             None,
-        )
+        );
+        a.synchronous = true; // run the backend inline → deterministic tests
+        a
     }
 
-    fn rendered(a: &App<ScriptedInput, Vec<u8>>) -> String {
+    /// Build a synchronous app driven by chunked reads (so a streamed turn
+    /// finalizes between reads before the next chunk arrives).
+    fn multi_app(chunks: &[&[u8]]) -> App<MultiInput, Vec<u8>> {
+        let mut a = App::new(
+            MultiInput::new(chunks),
+            Vec::new(),
+            Arc::new(StubBackend::instant()),
+            None,
+        );
+        a.synchronous = true;
+        a
+    }
+
+    fn rendered<I: Input>(a: &App<I, Vec<u8>>) -> String {
         String::from_utf8(a.out.clone()).unwrap()
+    }
+
+    fn type_into<I: Input>(a: &mut App<I, Vec<u8>>, s: &str) {
+        for c in s.chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
     }
 
     #[test]
@@ -1126,35 +1281,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_reply_collects_text_and_writes_label() {
-        let mut conv = Conversation::new();
-        conv.push(Message::user("ping"));
-        let mut out = Vec::new();
-        let (reply, _, _) = stream_reply(&StubBackend::instant(), &mut out, &conv).unwrap();
-        assert!(reply.contains("ping"));
-        let painted = String::from_utf8(out).unwrap();
-        assert!(painted.contains("›"));
-        assert!(painted.contains("ping"));
-    }
-
-    #[test]
-    fn stream_reply_renders_backend_error() {
-        let conv = Conversation::new();
-        let mut out = Vec::new();
-        assert_eq!(FailBackend.name(), "fail");
-        let (reply, _, _) = stream_reply(&FailBackend, &mut out, &conv).unwrap();
-        assert!(reply.is_empty());
-        assert!(String::from_utf8(out).unwrap().contains("boom"));
-    }
-
-    #[test]
-    fn stream_reply_surfaces_label_write_error() {
-        let conv = Conversation::new();
-        let mut out = FlakyWriter { ok: 0 }; // even the label write fails
-        assert!(stream_reply(&StubBackend::instant(), &mut out, &conv).is_err());
-    }
-
-    #[test]
     fn shell_mode_stderr_without_trailing_newline() {
         let mut a = app(b"");
         type_str(&mut a, "!printf oops >&2");
@@ -1163,22 +1289,14 @@ mod tests {
     }
 
     #[test]
-    fn stream_reply_surfaces_writer_error_mid_stream() {
-        let mut conv = Conversation::new();
-        conv.push(Message::user("ping"));
-        let mut out = FlakyWriter { ok: 1 };
-        let err = stream_reply(&StubBackend::instant(), &mut out, &conv).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-    }
-
-    #[test]
     fn run_streams_reply_then_quits() {
-        let mut a = app(b"hello\r/quit\r");
+        // Prompt and quit in separate reads so the turn finalizes between them.
+        let mut a = multi_app(&[b"hello\r", b"/quit\r"]);
         a.run().unwrap();
         let out = rendered(&a);
         assert!(out.contains("local-first AI terminal"));
         assert!(out.contains("hello"));
-        assert!(out.contains("You said"));
+        assert!(out.contains("You said")); // stub reply
         assert_eq!(a.conv.len(), 2);
     }
 
@@ -1187,20 +1305,16 @@ mod tests {
         let mut a = App::new(
             ScriptedInput::new(b"hi\r"),
             FlakyWriter { ok: 0 },
-            Box::new(StubBackend::instant()),
+            Arc::new(StubBackend::instant()),
             None,
         );
+        a.synchronous = true;
         assert!(a.run().is_err());
     }
 
     #[test]
     fn run_handles_poll_timeout_and_multiple_reads() {
-        let mut a = App::new(
-            MultiInput::new(&[b"hello", b"", b"\r/quit\r"]),
-            Vec::new(),
-            Box::new(StubBackend::instant()),
-            None,
-        );
+        let mut a = multi_app(&[b"hello", b"", b"\r", b"/quit\r"]);
         a.run().unwrap();
         assert_eq!(a.conv.len(), 2);
     }
@@ -1211,17 +1325,162 @@ mod tests {
             std::env::temp_dir().join(format!("zero-app-test-{}", zero_core::clock::unix_millis()));
         let (log, path) = SessionLog::create_in(&dir).unwrap();
         let mut a = App::new(
-            ScriptedInput::new(b"hi\r/quit\r"),
+            MultiInput::new(&[b"hi\r", b"/quit\r"]),
             Vec::new(),
-            Box::new(StubBackend::instant()),
+            Arc::new(StubBackend::instant()),
             Some(log),
         );
+        a.synchronous = true;
         a.run().unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("\"role\":\"user\""));
         assert!(contents.contains("\"role\":\"assistant\""));
         assert!(contents.contains("turn_done"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn erroring_backend_surfaces_in_the_turn() {
+        let mut a = App::new(
+            MultiInput::new(&[b"hi\r", b"/quit\r"]),
+            Vec::new(),
+            Arc::new(FailBackend),
+            None,
+        );
+        a.synchronous = true;
+        a.run().unwrap();
+        assert!(rendered(&a).contains("boom")); // error shown as a token
+    }
+
+    #[test]
+    fn messages_typed_while_streaming_are_queued_and_run() {
+        // Start a turn, then (before it's pumped) type another message — it
+        // queues and runs as its own turn after the first finalizes.
+        let mut a = app(b"");
+        a.start_turn("first").unwrap();
+        assert!(a.streaming.is_some());
+        type_into(&mut a, "second");
+        a.dispatch(Key::Enter).unwrap(); // queued, not started
+        assert_eq!(a.queue.len(), 1);
+        assert!(rendered(&a).contains("queued"));
+        // Pump to completion: first finalizes → second starts → finalizes.
+        for _ in 0..4 {
+            a.pump_stream().unwrap();
+        }
+        assert!(a.streaming.is_none());
+        assert!(a.queue.is_empty());
+        // Two user turns + two assistant replies.
+        assert_eq!(a.conv.len(), 4);
+        assert_eq!(a.conv.messages[0].content, "first");
+        assert_eq!(a.conv.messages[2].content, "second");
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_a_streaming_turn() {
+        let mut a = app(b"");
+        a.start_turn("go").unwrap();
+        a.queue.push_back("queued".to_string());
+        a.dispatch(Key::Ctrl('c')).unwrap(); // interrupt
+        assert!(a.streaming.is_none());
+        assert!(a.queue.is_empty()); // interrupt drops the queue
+        assert!(rendered(&a).contains("interrupted"));
+    }
+
+    /// Hand-build a streaming state over a manual channel so the partial-stream
+    /// branches (Empty/Disconnected, partial-reply interrupt) are exercised.
+    fn streaming_app() -> (App<ScriptedInput, Vec<u8>>, mpsc::Sender<StreamEvent>) {
+        let mut a = app(b"");
+        a.conv.push(Message::user("q"));
+        let (tx, rx) = mpsc::channel();
+        a.streaming = Some(StreamState {
+            rx,
+            reply: String::new(),
+            md: MarkdownStream::new(),
+            sw: Stopwatch::start(),
+            anchor: a.printed_lines,
+        });
+        (a, tx)
+    }
+
+    #[test]
+    fn pump_renders_partial_then_waits_when_channel_empty() {
+        let (mut a, tx) = streaming_app();
+        tx.send(StreamEvent::Token("partial ".into())).unwrap();
+        a.pump_stream().unwrap(); // renders, then try_recv → Empty → still streaming
+        assert!(a.streaming.is_some());
+        assert!(rendered(&a).contains("partial"));
+        drop(tx);
+    }
+
+    #[test]
+    fn pump_finalizes_when_channel_disconnects_without_done() {
+        let (mut a, tx) = streaming_app();
+        tx.send(StreamEvent::Token("bit".into())).unwrap();
+        drop(tx); // no Done → disconnect ends the turn
+        a.pump_stream().unwrap();
+        assert!(a.streaming.is_none());
+        assert_eq!(a.conv.len(), 2); // assistant reply recorded
+    }
+
+    #[test]
+    fn interrupt_keeps_partial_reply_and_closes_open_markdown() {
+        let (mut a, tx) = streaming_app();
+        tx.send(StreamEvent::Token("**bold so far".into())).unwrap();
+        a.pump_stream().unwrap(); // render the (unclosed) bold
+        a.dispatch(Key::Ctrl('c')).unwrap();
+        assert!(a.streaming.is_none());
+        // Partial text kept in context; styling reset on interrupt.
+        assert!(a
+            .conv
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("bold so far"));
+        assert!(rendered(&a).contains("\x1b[0m"));
+        drop(tx);
+    }
+
+    #[test]
+    fn streaming_edit_keys_buffer_without_echo() {
+        let (mut a, tx) = streaming_app();
+        a.dispatch(Key::Char('x')).unwrap();
+        a.dispatch(Key::Backspace).unwrap();
+        a.dispatch(Key::Left).unwrap(); // unmapped while streaming → no-op
+        assert!(a.editor.is_empty());
+        assert!(a.streaming.is_some());
+        drop(tx);
+    }
+
+    #[test]
+    fn slash_commands_dispatch_through_submit() {
+        // Exercises the /servers, /connect, /model, /model-empty command branches.
+        let mut a = app(b"");
+        for cmd in ["/servers", "/connect 1", "/model qwen", "/model"] {
+            type_str(&mut a, cmd);
+            a.dispatch(Key::Enter).unwrap();
+        }
+        let out = rendered(&a);
+        assert!(out.contains("no saved servers"));
+        assert!(out.contains("no such entry"));
+        assert!(out.contains("model set: qwen"));
+        assert!(out.contains("model: qwen"));
+    }
+
+    #[test]
+    fn mouse_is_disabled_on_exit() {
+        let mut a = multi_app(&[b"/mouse\r", b"/quit\r"]);
+        a.run().unwrap();
+        // The disable sequence was emitted at teardown.
+        assert!(rendered(&a).contains("\x1b[?1000l"));
+    }
+
+    #[test]
+    fn quit_while_streaming_still_exits() {
+        let mut a = app(b"");
+        a.start_turn("go").unwrap();
+        type_into(&mut a, "/quit");
+        assert_eq!(a.dispatch(Key::Enter).unwrap(), Flow::Quit);
     }
 
     #[test]
@@ -1294,9 +1553,10 @@ mod tests {
         let mut a = App::new(
             ScriptedInput::new(b""),
             Vec::new(),
-            Box::new(CodeBackend),
+            Arc::new(CodeBackend),
             None,
         );
+        a.synchronous = true;
         a.set_clipboard(Box::new(move |s| {
             *sink.borrow_mut() = s.to_string();
             Ok(())
@@ -1405,16 +1665,23 @@ mod tests {
                 sink: &mut dyn FnMut(StreamEvent),
             ) -> Result<(), BackendError> {
                 sink(StreamEvent::Token("**hi**".to_string()));
-                sink(StreamEvent::Done(zero_core::backend::StopReason::EndTurn));
+                sink(StreamEvent::Done(StopReason::EndTurn));
                 Ok(())
             }
         }
-        let mut conv = Conversation::new();
-        conv.push(Message::user("x"));
-        let mut out = Vec::new();
-        let (reply, _, _) = stream_reply(&BoldBackend, &mut out, &conv).unwrap();
-        assert_eq!(reply, "**hi**"); // raw markdown preserved for model/clip
-        let painted = String::from_utf8(out).unwrap();
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(BoldBackend),
+            None,
+        );
+        a.synchronous = true;
+        a.start_turn("x").unwrap();
+        while a.streaming.is_some() {
+            a.pump_stream().unwrap();
+        }
+        assert_eq!(a.last_reply, "**hi**"); // raw markdown preserved for model/clip
+        let painted = rendered(&a);
         assert!(painted.contains("\x1b[1mhi")); // displayed bold
         assert!(!painted.contains("**")); // asterisks not shown
     }
@@ -1662,9 +1929,10 @@ mod tests {
         let mut a = App::new(
             ScriptedInput::new(b"line1\x1b[13;2uline2\r/quit\r"),
             Vec::new(),
-            Box::new(StubBackend::instant()),
+            Arc::new(StubBackend::instant()),
             None,
         );
+        a.synchronous = true;
         a.run().unwrap();
         // The single submitted message spans two lines.
         assert_eq!(a.conv.len(), 2);
@@ -1734,7 +2002,7 @@ mod tests {
         let mut a = App::new(
             MultiInput::new(&[b"\x1b", b"", b"/quit\r"]),
             Vec::new(),
-            Box::new(StubBackend::instant()),
+            Arc::new(StubBackend::instant()),
             None,
         );
         a.run().unwrap();
@@ -1857,7 +2125,7 @@ mod tests {
                 b"\x03",
             ]),
             Vec::new(),
-            Box::new(StubBackend::instant()),
+            Arc::new(StubBackend::instant()),
             None,
         );
         a.run().unwrap();
@@ -1957,7 +2225,7 @@ mod tests {
         let mut a = App::new(
             ScriptedInput::new(b""),
             Vec::new(),
-            Box::new(StubBackend::instant()),
+            Arc::new(StubBackend::instant()),
             Some(log),
         );
         type_str(&mut a, "!echo logged");

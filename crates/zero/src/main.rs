@@ -51,16 +51,16 @@ fn run(args: &Args) -> std::io::Result<()> {
     args.apply_to(&mut cfg);
 
     // Pick the backend: stub if forced or no URL, otherwise OpenAI-compatible.
-    let backend: Box<dyn Backend> = if args.stub || !cfg.has_backend() {
+    let backend: std::sync::Arc<dyn Backend> = if args.stub || !cfg.has_backend() {
         if args.instant {
-            Box::new(StubBackend::instant())
+            std::sync::Arc::new(StubBackend::instant())
         } else {
-            Box::new(StubBackend::paced(Duration::from_millis(18)))
+            std::sync::Arc::new(StubBackend::paced(Duration::from_millis(18)))
         }
     } else {
         match OpenAiBackend::from_config(&cfg) {
-            Some(b) => Box::new(b),
-            None => Box::new(StubBackend::paced(Duration::from_millis(18))),
+            Some(b) => std::sync::Arc::new(b),
+            None => std::sync::Arc::new(StubBackend::paced(Duration::from_millis(18))),
         }
     };
 

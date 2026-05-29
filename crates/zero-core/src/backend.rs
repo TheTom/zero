@@ -45,7 +45,11 @@ impl std::error::Error for BackendError {}
 
 /// A source of model completions. Implementors stream their reply by invoking
 /// `sink` for each [`StreamEvent`], ending with `StreamEvent::Done`.
-pub trait Backend {
+///
+/// `Send + Sync` so a frontend can run the stream on a background thread (via
+/// `Arc<dyn Backend>`) and keep its input loop responsive — that is what lets
+/// the terminal queue messages while a reply is still generating.
+pub trait Backend: Send + Sync {
     /// Short human-readable identity, e.g. `"qwen-heretic (openai-compat)"`.
     fn name(&self) -> &str;
 
