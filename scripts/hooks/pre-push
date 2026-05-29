@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Zero pre-push gate. Blocks the push unless ALL hold:
+#   1. No Claude / AI authorship in any pushed commit (author, committer, or
+#      Co-Authored-By trailer).
+#   2. Tests run and pass.
+#   3. Coverage stays >= 98% (lines/functions/regions) — via scripts/coverage.sh,
+#      which runs the test suite, so (2) and (3) are covered in one shot.
+#
+# Enabled with:  git config core.hooksPath scripts/hooks
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+zero_sha='0000000000000000000000000000000000000000'
+
+# --- 1. authorship check over every commit being pushed -------------------
+bad=0
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [ "$local_sha" = "$zero_sha" ] && continue            # branch deletion
+  if [ "$remote_sha" = "$zero_sha" ]; then
+    range="$local_sha"                                   # new ref: all commits
+  else
+    range="$remote_sha..$local_sha"
+  fi
+  for c in $(git rev-list "$range"); do
+    # Only authorship signals — author/committer identity and Co-Authored-By
+    # trailers. NOT the message body, so prose like "Claude-Code-style" is fine.
+    ids="$(git log -1 --pretty='%an%n%ae%n%cn%n%ce' "$c")"
+    trailers="$(git log -1 --pretty='%(trailers:key=Co-authored-by,valueonly)' "$c")"
+    if printf '%s\n%s' "$ids" "$trailers" \
+        | grep -qiE 'anthropic|claude|psyguard|noreply@anthropic'; then
+      echo "pre-push: BLOCKED — commit $(git log -1 --pretty='%h %s' "$c")" >&2
+      echo "          has AI/psyguard authorship (author, committer, or co-author)." >&2
+      bad=1
+    fi
+  done
+done
+
+[ "$bad" -eq 0 ] || { echo "pre-push: authorship check failed." >&2; exit 1; }
+
+# --- 2 + 3. tests + coverage ---------------------------------------------
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "pre-push: cargo not found." >&2
+  exit 1
+fi
+
+echo "pre-push: running tests + coverage gate (>=98%)…" >&2
+if ! "$root/scripts/coverage.sh" --summary-only >&2; then
+  echo "pre-push: BLOCKED — tests failed or coverage below 98%." >&2
+  exit 1
+fi
+
+echo "pre-push: OK — clean authorship, tests pass, coverage >=98%." >&2
+exit 0

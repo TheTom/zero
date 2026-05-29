@@ -65,6 +65,16 @@ cargo fmt --all -- --check
 run without a real tty) and `main.rs` (process bootstrap); all engine and TUI
 logic is covered. `cargo-llvm-cov` is a dev tool, not a crate dependency.
 
+### Pre-push gate
+
+`scripts/hooks/pre-push` blocks a push unless: (1) no AI / co-author attribution
+in any pushed commit, (2) tests pass, (3) coverage stays ≥98%. Enable it once
+per clone:
+
+```bash
+git config core.hooksPath scripts/hooks
+```
+
 ## North stars
 
 The bets that justify building this — full reasoning in
