@@ -527,7 +527,12 @@ impl<I: Input, W: Write> App<I, W> {
             ('K', "^U  ^K", "kill to start / end of line"),
             ('K', "^L", "clear the screen"),
             ('H', "Multiline & history", ""),
-            ('K', "⇧⏎  ⌥⏎", "insert a newline"),
+            ('K', "^J", "insert a newline (works everywhere)"),
+            (
+                'K',
+                "⇧⏎  ⌥⏎",
+                "insert a newline (on terminals that support it)",
+            ),
             ('K', "⏎", "submit"),
             ('K', "↑  ↓", "move between input lines, else recall history"),
             ('K', "^R", "reverse history search"),

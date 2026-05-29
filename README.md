@@ -56,7 +56,8 @@ Sessions log to `~/.zero/sessions/zero-<unixtime>.jsonl`.
 | `^W` | delete word back |
 | `^U` / `^K` | kill to start / end of line |
 | `^L` | clear screen |
-| `Shift+Enter` / `⌥+Enter` | insert newline (multiline input) |
+| `^J` | insert newline — multiline input (works in every terminal) |
+| `Shift+Enter` / `⌥+Enter` | insert newline (on terminals that send a distinct code) |
 | `Enter` | submit |
 | `↑` / `↓` | move between input lines, else recall history |
 | `^R` | reverse history search (type to match, `^R` for older, `Enter` accept, `Esc` cancel) |
@@ -77,10 +78,11 @@ flagged and require an explicit `y/N` confirmation before they run. The lesson
 from other harnesses is that prompt-level rules don't stop `rm -rf ~`; a gate at
 the execution boundary does.
 
-> **Shift+Enter caveat:** terminals only send a distinct Shift+Enter when they
-> support the modern CSI-u/kitty keyboard protocol (kitty, WezTerm, recent
-> iTerm2). Elsewhere it reads as plain Enter; use `⌥+Enter` (meta+Enter), which
-> more terminals send as `ESC CR`. Word-wise moves (`⌥`/`^` + arrows) likewise
+> **Multiline / Shift+Enter:** terminals only send a distinct Shift+Enter when
+> they support the CSI-u/kitty keyboard protocol (kitty, WezTerm, recent iTerm2).
+> Everywhere else it reads as plain Enter — so **`^J` is the reliable newline
+> key** (Return sends CR = submit, `^J` sends LF = newline). `⌥+Enter` also works
+> on terminals that send `ESC CR`. Word-wise moves (`⌥`/`^` + arrows) likewise
 > depend on the terminal sending the modifier sequence.
 
 ## Test & coverage

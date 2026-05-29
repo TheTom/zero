@@ -65,7 +65,11 @@ fn decode_one(buf: &[u8]) -> Step {
     let b = buf[0];
     match b {
         0x1b => decode_escape(buf),
-        b'\r' | b'\n' => Step::Key(Key::Enter, 1),
+        // Return sends CR in raw mode → submit. Ctrl+J sends LF → insert a
+        // newline (a universal multiline key that works in every terminal,
+        // since Shift+Enter is only distinguishable on some).
+        b'\r' => Step::Key(Key::Enter, 1),
+        b'\n' => Step::Key(Key::ShiftEnter, 1),
         b'\t' => Step::Key(Key::Tab, 1),
         0x7f | 0x08 => Step::Key(Key::Backspace, 1),
         // Other C0 control bytes → Ctrl-letter. 0x01 == ^A, .. 0x1a == ^Z.
@@ -205,11 +209,17 @@ mod tests {
 
     #[test]
     fn decodes_enter_tab_backspace() {
-        assert_eq!(keys(b"\r"), vec![Key::Enter]);
-        assert_eq!(keys(b"\n"), vec![Key::Enter]);
+        assert_eq!(keys(b"\r"), vec![Key::Enter]); // Return = CR = submit
         assert_eq!(keys(b"\t"), vec![Key::Tab]);
         assert_eq!(keys(&[0x7f]), vec![Key::Backspace]);
         assert_eq!(keys(&[0x08]), vec![Key::Backspace]);
+    }
+
+    #[test]
+    fn ctrl_j_lf_inserts_newline() {
+        // Ctrl+J / LF → newline, the universal multiline key.
+        assert_eq!(keys(b"\n"), vec![Key::ShiftEnter]);
+        assert_eq!(keys(&[0x0a]), vec![Key::ShiftEnter]);
     }
 
     #[test]
