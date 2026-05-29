@@ -1,0 +1,20 @@
+[package]
+name = "zero"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Zero — a local-first, dependency-free AI coding terminal."
+default-run = "zero"
+
+[[bin]]
+name = "zero"
+path = "src/main.rs"
+
+[lints.clippy]
+all = "deny"
+
+[dependencies]
+zero-core = { path = "../zero-core" }
+zero-tui = { path = "../zero-tui" }

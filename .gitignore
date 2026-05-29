@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+.DS_Store
+# session transcripts / logs are local, never committed
+/sessions
+*.jsonl

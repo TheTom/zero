@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned for reproducible builds. (The machine's `stable` toolchain currently
+# has a corrupted rust-std component — missing std libs — so we pin to a known
+# good release. Bump this once `rustup` stable is repaired.)
+channel = "1.93.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

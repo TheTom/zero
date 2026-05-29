@@ -1,0 +1,309 @@
+//! A single-line input editor with readline-style editing and history.
+//!
+//! Pure model: it owns a character buffer and a cursor and exposes operations
+//! that mutate them. No rendering, no I/O — the shell renders `buffer()` with
+//! the cursor at `cursor()`. Char-indexed throughout so multi-byte input and
+//! cursor math stay correct.
+
+/// An editable input line plus command history.
+#[derive(Debug, Default)]
+pub struct LineEditor {
+    buf: Vec<char>,
+    /// Cursor position as a char index in `0..=buf.len()`.
+    cursor: usize,
+    history: Vec<String>,
+    /// `None` while editing the live line; `Some(i)` while browsing history.
+    hist_pos: Option<usize>,
+    /// The live draft, stashed when the user steps into history.
+    stash: Vec<char>,
+}
+
+impl LineEditor {
+    pub fn new() -> Self {
+        LineEditor::default()
+    }
+
+    /// Current line contents.
+    pub fn text(&self) -> String {
+        self.buf.iter().collect()
+    }
+
+    /// Cursor position as a char index.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// Insert a character at the cursor.
+    pub fn insert(&mut self, c: char) {
+        self.buf.insert(self.cursor, c);
+        self.cursor += 1;
+    }
+
+    /// Delete the character before the cursor (Backspace).
+    pub fn backspace(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            self.buf.remove(self.cursor);
+        }
+    }
+
+    /// Delete the character at the cursor (Delete / ^D mid-line).
+    pub fn delete(&mut self) {
+        if self.cursor < self.buf.len() {
+            self.buf.remove(self.cursor);
+        }
+    }
+
+    pub fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn right(&mut self) {
+        if self.cursor < self.buf.len() {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn end(&mut self) {
+        self.cursor = self.buf.len();
+    }
+
+    /// Kill from the cursor to end of line (^K).
+    pub fn kill_to_end(&mut self) {
+        self.buf.truncate(self.cursor);
+    }
+
+    /// Kill from start of line to the cursor (^U).
+    pub fn kill_to_start(&mut self) {
+        self.buf.drain(0..self.cursor);
+        self.cursor = 0;
+    }
+
+    /// Kill the word before the cursor (^W): trailing spaces, then the word.
+    pub fn kill_word(&mut self) {
+        let mut start = self.cursor;
+        while start > 0 && self.buf[start - 1] == ' ' {
+            start -= 1;
+        }
+        while start > 0 && self.buf[start - 1] != ' ' {
+            start -= 1;
+        }
+        self.buf.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
+    /// Clear the line entirely.
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.cursor = 0;
+        self.hist_pos = None;
+    }
+
+    /// Commit the current line: returns its text, pushes non-empty distinct
+    /// lines to history, and resets to an empty live line.
+    pub fn submit(&mut self) -> String {
+        let text: String = self.buf.iter().collect();
+        if !text.trim().is_empty() && self.history.last().map(String::as_str) != Some(text.as_str())
+        {
+            self.history.push(text.clone());
+        }
+        self.clear();
+        text
+    }
+
+    /// Step back into older history (Up).
+    pub fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        match self.hist_pos {
+            None => {
+                // Entering history: stash the live draft.
+                self.stash = std::mem::take(&mut self.buf);
+                self.hist_pos = Some(self.history.len() - 1);
+            }
+            Some(0) => return, // already at oldest
+            Some(i) => self.hist_pos = Some(i - 1),
+        }
+        self.load_history_entry();
+    }
+
+    /// Step forward toward the live draft (Down).
+    pub fn history_next(&mut self) {
+        match self.hist_pos {
+            None => {}
+            Some(i) if i + 1 < self.history.len() => {
+                self.hist_pos = Some(i + 1);
+                self.load_history_entry();
+            }
+            Some(_) => {
+                // Past the newest entry → restore the stashed live draft.
+                self.hist_pos = None;
+                self.buf = std::mem::take(&mut self.stash);
+                self.cursor = self.buf.len();
+            }
+        }
+    }
+
+    fn load_history_entry(&mut self) {
+        if let Some(i) = self.hist_pos {
+            self.buf = self.history[i].chars().collect();
+            self.cursor = self.buf.len();
+        }
+    }
+
+    /// Read-only view of history (for tests / persistence later).
+    pub fn history(&self) -> &[String] {
+        &self.history
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn typed(s: &str) -> LineEditor {
+        let mut e = LineEditor::new();
+        for c in s.chars() {
+            e.insert(c);
+        }
+        e
+    }
+
+    #[test]
+    fn inserts_and_reads_text() {
+        let e = typed("hello");
+        assert_eq!(e.text(), "hello");
+        assert_eq!(e.cursor(), 5);
+    }
+
+    #[test]
+    fn backspace_removes_before_cursor() {
+        let mut e = typed("abc");
+        e.backspace();
+        assert_eq!(e.text(), "ab");
+        assert_eq!(e.cursor(), 2);
+    }
+
+    #[test]
+    fn cursor_movement_and_midline_insert() {
+        let mut e = typed("ac");
+        e.left(); // between a and c
+        e.insert('b');
+        assert_eq!(e.text(), "abc");
+        assert_eq!(e.cursor(), 2);
+    }
+
+    #[test]
+    fn home_end_bound_the_line() {
+        let mut e = typed("abc");
+        e.home();
+        assert_eq!(e.cursor(), 0);
+        e.left(); // can't go below 0
+        assert_eq!(e.cursor(), 0);
+        e.end();
+        assert_eq!(e.cursor(), 3);
+        e.right(); // can't exceed len
+        assert_eq!(e.cursor(), 3);
+    }
+
+    #[test]
+    fn delete_removes_at_cursor() {
+        let mut e = typed("abc");
+        e.home();
+        e.delete();
+        assert_eq!(e.text(), "bc");
+        assert_eq!(e.cursor(), 0);
+    }
+
+    #[test]
+    fn kill_to_end_and_start() {
+        let mut e = typed("hello world");
+        e.home();
+        e.right();
+        e.right();
+        e.right();
+        e.right();
+        e.right(); // cursor after "hello"
+        e.kill_to_end();
+        assert_eq!(e.text(), "hello");
+        e.kill_to_start();
+        assert_eq!(e.text(), "");
+    }
+
+    #[test]
+    fn kill_word_eats_trailing_space_and_word() {
+        let mut e = typed("foo bar ");
+        e.kill_word();
+        assert_eq!(e.text(), "foo ");
+        e.kill_word();
+        assert_eq!(e.text(), "");
+    }
+
+    #[test]
+    fn submit_returns_text_and_clears() {
+        let mut e = typed("run tests");
+        let out = e.submit();
+        assert_eq!(out, "run tests");
+        assert!(e.is_empty());
+        assert_eq!(e.history(), &["run tests".to_string()]);
+    }
+
+    #[test]
+    fn submit_skips_blank_and_consecutive_dupes() {
+        let mut e = typed("   ");
+        e.submit();
+        assert!(e.history().is_empty());
+
+        for _ in 0..2 {
+            for c in "same".chars() {
+                e.insert(c);
+            }
+            e.submit();
+        }
+        assert_eq!(e.history().len(), 1);
+    }
+
+    #[test]
+    fn history_prev_next_navigates() {
+        let mut e = LineEditor::new();
+        for line in ["first", "second"] {
+            for c in line.chars() {
+                e.insert(c);
+            }
+            e.submit();
+        }
+        // Type a live draft, then browse history.
+        e.insert('x');
+        e.history_prev();
+        assert_eq!(e.text(), "second");
+        e.history_prev();
+        assert_eq!(e.text(), "first");
+        e.history_prev(); // clamp at oldest
+        assert_eq!(e.text(), "first");
+        e.history_next();
+        assert_eq!(e.text(), "second");
+        e.history_next(); // back to the stashed live draft
+        assert_eq!(e.text(), "x");
+    }
+
+    #[test]
+    fn multibyte_editing_is_char_correct() {
+        let mut e = typed("héllo");
+        assert_eq!(e.cursor(), 5);
+        e.backspace();
+        assert_eq!(e.text(), "héll");
+        e.home();
+        e.right();
+        e.insert('X');
+        assert_eq!(e.text(), "hXéll");
+    }
+}

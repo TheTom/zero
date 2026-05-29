@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zero-core",
+    "crates/zero-tui",
+    "crates/zero",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/TheTom/zero"
+authors = ["Tom <tturney@psyguard.ai>"]
+
+# Zero has zero runtime dependencies. This [workspace.dependencies] table is
+# intentionally empty and stays that way — the whole point is std-only.
+
+[profile.release]
+# Single self-contained binary, no downstream crates → fat LTO is a pure win.
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true
