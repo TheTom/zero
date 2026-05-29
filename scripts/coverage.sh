@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Coverage gate for Zero. Fails if line/function/region coverage drops below 98%.
+#
+# The imperative I/O shell is excluded because it cannot run without a real tty
+# and hardware (libc termios FFI) or is pure process bootstrap:
+#   - crates/zero-tui/src/term.rs   raw-mode terminal via libc symbols
+#   - crates/zero/src/main.rs       process entry / raw-mode bootstrap
+# Everything else — the entire engine and all TUI logic — must stay >= 98%.
+#
+# cargo-llvm-cov is a dev tool (a cargo subcommand binary), not a crate
+# dependency, so this does not violate Zero's zero-runtime-deps rule.
+#
+# Usage:
+#   scripts/coverage.sh                 # summary + enforce thresholds
+#   scripts/coverage.sh --html          # also write an HTML report
+#   scripts/coverage.sh --show-missing-lines
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+exec cargo llvm-cov --workspace \
+  --ignore-filename-regex '(term\.rs|src/main\.rs)' \
+  --fail-under-lines 98 \
+  --fail-under-functions 98 \
+  --fail-under-regions 98 \
+  "$@"

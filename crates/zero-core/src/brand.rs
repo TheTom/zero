@@ -15,14 +15,23 @@ pub const DEFAULT_NAME: &str = "Zero";
 /// assistant prompt label.
 pub const DEFAULT_SLUG: &str = "zero";
 
+/// Resolve a value from an optional override, falling back to `default` when
+/// the override is absent or empty. Pure, so the precedence logic is testable
+/// without mutating process-global env vars.
+fn resolve(override_val: Option<String>, default: &str) -> String {
+    override_val
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// Resolved display name, honoring the `ZERO_NAME` override.
 pub fn name() -> String {
-    std::env::var("ZERO_NAME").unwrap_or_else(|_| DEFAULT_NAME.to_string())
+    resolve(std::env::var("ZERO_NAME").ok(), DEFAULT_NAME)
 }
 
 /// Resolved lowercase slug, honoring the `ZERO_SLUG` override.
 pub fn slug() -> String {
-    std::env::var("ZERO_SLUG").unwrap_or_else(|_| DEFAULT_SLUG.to_string())
+    resolve(std::env::var("ZERO_SLUG").ok(), DEFAULT_SLUG)
 }
 
 /// Name of the per-user config/session directory, e.g. `.zero`.
@@ -45,5 +54,21 @@ mod tests {
         // Can't assume env is unset in CI, so just check the shape.
         assert!(dot_dir().starts_with('.'));
         assert!(dot_dir().ends_with(&slug()));
+    }
+
+    #[test]
+    fn resolve_prefers_override_then_default() {
+        assert_eq!(resolve(Some("Custom".to_string()), "Zero"), "Custom");
+        assert_eq!(resolve(None, "Zero"), "Zero");
+        // Empty override falls back to the default.
+        assert_eq!(resolve(Some(String::new()), "Zero"), "Zero");
+    }
+
+    #[test]
+    fn public_resolvers_return_nonempty() {
+        // Exercises name()/slug()/dot_dir() regardless of env state.
+        assert!(!name().is_empty());
+        assert!(!slug().is_empty());
+        assert!(dot_dir().len() > 1);
     }
 }

@@ -147,6 +147,12 @@ impl RawTerminal {
     }
 }
 
+impl crate::app::Input for RawTerminal {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        RawTerminal::read(self, buf)
+    }
+}
+
 impl Drop for RawTerminal {
     fn drop(&mut self) {
         // Best-effort restore; nothing useful to do if it fails during unwind.

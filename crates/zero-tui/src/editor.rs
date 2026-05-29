@@ -296,6 +296,23 @@ mod tests {
     }
 
     #[test]
+    fn history_navigation_on_empty_history_is_noop() {
+        let mut e = LineEditor::new();
+        e.history_prev(); // nothing to recall
+        e.history_next(); // not browsing history
+        assert!(e.is_empty());
+        assert!(e.history().is_empty());
+    }
+
+    #[test]
+    fn clear_resets_buffer_and_history_browsing() {
+        let mut e = typed("draft");
+        e.clear();
+        assert!(e.is_empty());
+        assert_eq!(e.cursor(), 0);
+    }
+
+    #[test]
     fn multibyte_editing_is_char_correct() {
         let mut e = typed("héllo");
         assert_eq!(e.cursor(), 5);

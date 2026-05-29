@@ -224,6 +224,46 @@ mod tests {
     }
 
     #[test]
+    fn width_zero_returns_text_unwrapped() {
+        assert_eq!(wrap_line("abc", 0), vec!["abc".to_string()]);
+    }
+
+    #[test]
+    fn height_zero_view_is_empty() {
+        let mut sb = Scrollback::new();
+        sb.push_line("x");
+        assert!(sb.view(80, 0).is_empty());
+    }
+
+    #[test]
+    fn empty_scrollback_reports_empty() {
+        let sb = Scrollback::new();
+        assert!(sb.is_empty());
+        assert_eq!(sb.len(), 0);
+        assert_eq!(sb.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn append_to_empty_scrollback_creates_first_line() {
+        let mut sb = Scrollback::new();
+        sb.append("hello");
+        assert_eq!(sb.view(80, 1), vec!["hello"]);
+    }
+
+    #[test]
+    fn scroll_down_reduces_offset_and_floors_at_zero() {
+        let mut sb = Scrollback::new();
+        for i in 0..10 {
+            sb.push_line(format!("line {i}"));
+        }
+        sb.scroll_up(5);
+        sb.scroll_down(2);
+        assert_eq!(sb.scroll_offset(), 3);
+        sb.scroll_down(100); // saturates at 0
+        assert_eq!(sb.scroll_offset(), 0);
+    }
+
+    #[test]
     fn wrapping_counts_toward_scroll_rows() {
         let mut sb = Scrollback::new();
         // One logical line that wraps into 3 rows at width 5.

@@ -195,4 +195,22 @@ mod tests {
     fn backend_name_is_reported() {
         assert!(StubBackend::instant().name().contains("stub"));
     }
+
+    #[test]
+    fn paced_backend_streams_and_names_itself() {
+        // A 1ns delay exercises the non-zero pacing branch without slowing tests.
+        let backend = StubBackend::paced(std::time::Duration::from_nanos(1));
+        assert!(backend.name().contains("paced"));
+        let mut conv = Conversation::new();
+        conv.push(Message::user("hey"));
+        let (tokens, stop) = collect(&conv, &backend);
+        assert!(tokens.concat().contains("hey"));
+        assert_eq!(stop, Some(StopReason::EndTurn));
+    }
+
+    #[test]
+    fn empty_token_does_not_break_tokenizer() {
+        assert!(tokenize_keeping_spaces("").is_empty());
+        assert_eq!(tokenize_keeping_spaces("a").concat(), "a");
+    }
 }

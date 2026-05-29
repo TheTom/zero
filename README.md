@@ -1,146 +1,104 @@
 # Zero
 
-A local-first, **zero-dependency** AI coding harness in Rust — built to feel like
-Claude Code's terminal, designed first for local LLMs, and architected so the
-terminal and a future app share one engine.
+A local-first AI coding terminal in Rust with **zero runtime dependencies**.
+Built to feel like Claude Code's terminal, designed first for local LLMs.
 
-> Status: **MVP slice 1 — the terminal feel.** Inline streaming REPL with
-> readline-style editing, history, honest elapsed timing, and JSONL session
-> logging, running against a stub backend. The OpenAI-compatible HTTP client
-> (for the qwen box) is the next slice — see [Roadmap](#roadmap).
+> The name "Zero" isn't final — it's a one-file swap. See [Renaming](#renaming).
 
-## Why "zero"
+## Repo map
 
-- **Zero runtime dependencies.** No crates. `std` only — hand-rolled JSON, a
-  raw-mode terminal built on the handful of libc `termios`/`ioctl` symbols we
-  declare ourselves, our own input decoder and line editor. The runtime
-  `Cargo.toml`s have empty `[dependencies]`, and they stay that way.
-- **Local-first.** Points at your own model (e.g. qwen on the asus gx10) over an
-  OpenAI-compatible endpoint. No cloud required.
-
-## North stars (the design bets)
-
-These are why Zero exists, not just nice-to-haves:
-
-1. **Claude-Code terminal feel.** Output flows into the terminal's *native*
-   scrollback; only the current input line is taken over and redrawn in place.
-   No rigid full-screen takeover.
-2. **Terminal ≡ app.** Every capability lives in `zero-core`, the dependency-free
-   engine. Frontends (this terminal, a future app) are thin shells. Anything the
-   terminal can do, the app can do, for free.
-3. **Honest timestamps.** Zero **measures, never estimates.** `clock.rs` only
-   reports real monotonic elapsed time. No "this will take a week" — it took an
-   hour, and we'll show the hour.
-4. **Rich, replayable logging.** Every turn is appended to a JSONL transcript
-   with a real wall-clock timestamp. (Modeled on what Claude logs well.)
-5. **Compaction done right.** *Not yet built.* The hard problem we want to spend
-   real time on — most agents compact badly and resurface stale context. Slated
-   as its own slice once the agentic loop exists.
-6. **Instructions that are actually followed.** The `CLAUDE.md`-equivalent must
-   be *reliably obeyed*, not ignored after a few turns. Open research problem —
-   directions sketched in [docs/north-stars.md](docs/north-stars.md#6-instructions-that-are-actually-followed).
-
-The full reasoning behind each is in **[docs/north-stars.md](docs/north-stars.md)**.
-
-## Architecture
-
-Functional-core / imperative-shell. The pure cores are exhaustively unit-tested;
-the only `unsafe` is the thin terminal FFI shell.
+Flat by design — three crates, one file per concern, no deep nesting.
 
 ```
-crates/
-  zero-core/   # the engine — std only, no UI, no I/O assumptions
-    json.rs       hand-rolled JSON value + parser + serializer
-    message.rs    Role / Message / Conversation (OpenAI-compatible shape)
-    backend.rs    Backend trait + StreamEvent + StubBackend
-    clock.rs      Stopwatch + honest duration formatting
-    session.rs    append-only JSONL transcript logging
-  zero-tui/    # the terminal frontend — std only
-    key.rs        bytes → Key decoder (UTF-8 + ANSI escapes)   [pure]
-    editor.rs     readline-style line editor + history          [pure]
-    viewport.rs   scrollback + word wrap                        [pure]
-    term.rs       raw mode + window size via libc symbols       [unsafe shell]
-    app.rs        the inline REPL event loop                     [wiring]
-  zero/        # the binary — arg parsing, backend selection, wiring
+zero/
+├── Cargo.toml              workspace + release profile
+├── rust-toolchain.toml     pinned to 1.93.1
+├── README.md
+├── docs/north-stars.md     why this project exists (the design bets)
+├── scripts/coverage.sh     coverage gate (>=98%, enforced)
+└── crates/
+    ├── zero-core/          the engine — std only, no UI, no I/O assumptions
+    │   ├── brand.rs          product name (one-file rename)
+    │   ├── json.rs           hand-rolled JSON: parse + serialize
+    │   ├── message.rs        Role / Message / Conversation
+    │   ├── backend.rs        Backend trait + StubBackend
+    │   ├── clock.rs          honest elapsed timing (measure, never estimate)
+    │   └── session.rs        append-only JSONL transcript log
+    ├── zero-tui/           the terminal frontend — std only
+    │   ├── key.rs            bytes → keys (UTF-8 + ANSI)      [pure]
+    │   ├── editor.rs         line editor + history           [pure]
+    │   ├── viewport.rs       scrollback + word wrap           [pure]
+    │   ├── term.rs           raw mode via libc FFI            [unsafe shell]
+    │   └── app.rs            the inline REPL loop
+    └── zero/               the binary — args, wiring
+        └── main.rs
 ```
 
-The seam that makes north star #2 work is `zero_core::Backend`: the terminal
-talks only to that trait, so swapping `StubBackend` for the real HTTP client
-changes nothing in the UI.
+**Pure cores carry the logic and the tests; the only `unsafe` is `term.rs`.**
+The seam that keeps the UI swappable is `zero_core::Backend` — the terminal
+talks only to that trait, so the real model drops in without UI changes.
 
-## Build & run
+## Run
 
 ```bash
 cargo build --release
 ./target/release/zero            # interactive (needs a real terminal)
-./target/release/zero --instant  # no streaming pacing delay
-./target/release/zero --no-log   # don't write a session transcript
-./target/release/zero --help
+./target/release/zero --instant  # no streaming delay
+./target/release/zero --no-log   # no session transcript
 ```
 
-Sessions are logged to `~/.zero/sessions/zero-<unixtime>.jsonl`.
+Sessions log to `~/.zero/sessions/zero-<unixtime>.jsonl`.
+Keys: `^A`/`^E` home/end · `^U`/`^K` kill · `^W` kill word · `↑`/`↓` history ·
+`^L` clear · `^C` / `/quit` exit.
 
-### Keys
-
-`^A`/`^E` home/end · `^U`/`^K` kill to start/end · `^W` kill word ·
-`↑`/`↓` history · `^L` clear screen · `^C` / `/quit` exit.
-
-## Tests & quality gate
+## Test & coverage
 
 ```bash
-cargo test --workspace      # 73 tests, all pure-core logic covered
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+./scripts/coverage.sh                  # enforces >=98% (fails the build below)
 ```
 
-Every crate sets `clippy::all = "deny"`. The pure cores (JSON, key decode, line
-editor, wrapping, clock, session log) carry the coverage; the FFI shell is kept
-minimal precisely because it's the hard-to-test part.
+**Coverage is held at ≥98%** (lines, functions, regions) and enforced by
+`scripts/coverage.sh`. The only excluded files are `term.rs` (libc FFI — can't
+run without a real tty) and `main.rs` (process bootstrap); all engine and TUI
+logic is covered. `cargo-llvm-cov` is a dev tool, not a crate dependency.
 
-> **Coverage tooling** (llvm source-based via `cargo`'s `-C instrument-coverage`)
-> is a follow-up — it needs `llvm-tools`, which is a *toolchain* component, not a
-> crate dependency, so it doesn't violate the zero-deps rule. Tracked below.
+## North stars
 
-### Toolchain note
+The bets that justify building this — full reasoning in
+[docs/north-stars.md](docs/north-stars.md):
 
-Pinned to Rust **1.93.1** via `rust-toolchain.toml`. The machine's `stable`
-toolchain currently has a **corrupted `rust-std` component** (the std libs are
-missing from `~/.rustup/toolchains/stable-*/lib/rustlib/`), which breaks every
-build under `stable`. Repair with a full reinstall when convenient:
+1. **Claude-Code terminal feel** — inline render, native scrollback.
+2. **Terminal ≡ app** — every capability lives in `zero-core`; UIs are shells.
+3. **Honest timestamps** — measure real elapsed time, never estimate.
+4. **Rich logging** — JSONL transcript, real wall-clock stamps.
+5. **Compaction done right** — the hard problem; its own slice later.
+6. **Instructions actually followed** — the `CLAUDE.md` problem, made reliable.
 
-```bash
-rustup toolchain uninstall stable && rustup toolchain install stable
-```
+## Renaming
 
-Then bump the pin (or remove `rust-toolchain.toml`).
+- **Display name / config dir / prompt label** come from
+  `crates/zero-core/src/brand.rs` — edit `DEFAULT_NAME` / `DEFAULT_SLUG`, or set
+  `ZERO_NAME` / `ZERO_SLUG` env vars (no recompile).
+- **Crate names** rename mechanically: dirs + `name =` in each `Cargo.toml` +
+  workspace `members` + `path` deps.
 
-## Renaming the project
+## Toolchain note
 
-The name "Zero" is **not final** and is cheap to change:
-
-- **Display name / config dir / prompt label** all derive from
-  `crates/zero-core/src/brand.rs`. Edit `DEFAULT_NAME` and `DEFAULT_SLUG` (or set
-  the `ZERO_NAME` / `ZERO_SLUG` env vars at runtime — no recompile). The session
-  dir `~/.zero/` follows the slug automatically.
-- **Crate names** (`zero-core`, `zero-tui`, `zero`) are mechanical to rename:
-  rename the dirs, update `name =` in each `Cargo.toml`, the workspace `members`,
-  and the inter-crate `path` deps. A sed pass over `zero-core`/`zero-tui` plus the
-  binary handles it.
-
-Nothing else hardcodes the name.
+Pinned to Rust **1.93.1** because the machine's `stable` toolchain has a
+corrupted `rust-std` (missing std libs → "can't find crate for std"). Repair:
+`rustup toolchain uninstall stable && rustup toolchain install stable`, then
+bump the pin.
 
 ## Roadmap
 
-- [x] **Slice 1 — terminal feel.** Inline REPL, editing, history, streaming,
-      honest timing, JSONL logging. *(this MVP)*
-- [ ] **Slice 2 — real brain.** OpenAI-compatible HTTP client (std `TcpStream`,
-      SSE streaming, JSON we already have) → point at the qwen box. Backend trait
-      already in place.
-- [ ] **Slice 3 — agentic loop.** Tool-calling (read/write/edit/bash/ls), the
-      tool trait, and the model↔tools turn loop.
-- [ ] **Slice 4 — compaction.** The north-star research problem.
-- [ ] **Slice 5 — app parity.** A second frontend over the same `zero-core`.
-- [ ] Coverage reporting in CI; full-screen mode using `viewport.rs`.
+- [x] Slice 1 — terminal feel (this MVP)
+- [ ] Slice 2 — OpenAI-compatible HTTP client → point at the qwen box
+- [ ] Slice 3 — agentic loop (tools: read/write/edit/bash/ls)
+- [ ] Slice 4 — compaction
+- [ ] Slice 5 — app frontend over the same `zero-core`
 
 ## License
 

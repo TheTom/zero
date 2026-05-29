@@ -273,6 +273,46 @@ mod tests {
     }
 
     #[test]
+    fn invalid_lead_byte_is_consumed_without_a_key() {
+        // 0x80 is a stray UTF-8 continuation byte — not a valid lead.
+        let (k, consumed) = decode_keys(&[0x80]);
+        assert!(k.is_empty());
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn malformed_multibyte_resyncs_by_one_byte() {
+        // 0xE0 claims a 3-byte sequence but the continuations are invalid lead
+        // bytes too, so every byte is dropped without producing a key.
+        let (k, consumed) = decode_keys(&[0xE0, 0x80, 0x80]);
+        assert!(k.is_empty());
+        assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn unmapped_low_controls_are_dropped() {
+        // NUL and FS are consumed silently (no Key).
+        assert!(keys(&[0x00]).is_empty());
+        assert!(keys(&[0x1c]).is_empty());
+    }
+
+    #[test]
+    fn unknown_csi_final_byte_is_consumed() {
+        // ESC [ Z (back-tab) — not modeled; consumed, no key.
+        let (k, consumed) = decode_keys(b"\x1b[Z");
+        assert!(k.is_empty());
+        assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn unterminated_csi_numeric_waits_for_more() {
+        // "ESC [ 1" with no terminator yet → incomplete.
+        let (k, consumed) = decode_keys(b"\x1b[1");
+        assert!(k.is_empty());
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
     fn unknown_csi_modifier_is_skipped() {
         // "ESC [ 1 ; 2 A" (shift-up) — we don't model modifiers; drop it.
         let ks = keys(b"\x1b[1;2A");

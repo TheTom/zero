@@ -302,17 +302,14 @@ impl Parser<'_> {
                         _ => return Err(self.err("invalid escape")),
                     }
                 }
-                // A raw byte < 0x20 is invalid in JSON strings, but be lenient.
+                // Any other byte: the start of a (possibly multi-byte) char.
+                // Parser input is `&str`, so `self.pos - 1` is always a char
+                // boundary and the remaining bytes are valid UTF-8.
                 _ => {
-                    // Reconstruct UTF-8: back up and take the full char.
                     self.pos -= 1;
-                    let rest = &self.bytes[self.pos..];
-                    match std::str::from_utf8(rest) {
-                        Ok(_) => {}
-                        Err(e) if e.valid_up_to() > 0 => {}
-                        Err(_) => return Err(self.err("invalid utf-8 in string")),
-                    }
-                    let ch = decode_utf8_char(rest).ok_or_else(|| self.err("invalid utf-8"))?;
+                    let rest = std::str::from_utf8(&self.bytes[self.pos..])
+                        .expect("parser input is valid utf-8");
+                    let ch = rest.chars().next().expect("at least one char remains");
                     self.pos += ch.len_utf8();
                     s.push(ch);
                 }
@@ -395,16 +392,6 @@ impl Parser<'_> {
             msg: "malformed number".to_string(),
         })
     }
-}
-
-/// Decode the first UTF-8 scalar from a byte slice, or `None` if malformed.
-fn decode_utf8_char(bytes: &[u8]) -> Option<char> {
-    let s = std::str::from_utf8(bytes).ok().or_else(|| {
-        // Take the longest valid prefix so a single char still decodes.
-        let err = std::str::from_utf8(bytes).err()?;
-        std::str::from_utf8(&bytes[..err.valid_up_to().max(1).min(bytes.len())]).ok()
-    })?;
-    s.chars().next()
 }
 
 #[cfg(test)]
@@ -490,5 +477,128 @@ mod tests {
     fn parses_unicode_content_directly() {
         let v = Value::parse("\"héllo 世界\"").unwrap();
         assert_eq!(v.as_str(), Some("héllo 世界"));
+    }
+
+    #[test]
+    fn accessors_return_none_on_type_mismatch() {
+        let v = Value::Bool(true);
+        assert_eq!(v.as_str(), None);
+        assert_eq!(v.as_f64(), None);
+        assert_eq!(v.as_array(), None);
+        assert!(!v.is_null());
+        assert!(Value::Null.is_null());
+        assert_eq!(Value::Num(1.0).as_bool(), None);
+        // get() on a non-object is None.
+        assert!(Value::Num(1.0).get("x").is_none());
+        // get() miss on an object is None.
+        assert!(Value::parse("{}").unwrap().get("absent").is_none());
+    }
+
+    #[test]
+    fn empty_containers_parse() {
+        assert_eq!(Value::parse("[]").unwrap(), Value::Array(vec![]));
+        assert_eq!(Value::parse("{}").unwrap(), Value::Object(vec![]));
+        assert_eq!(Value::parse("  null  ").unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn object_errors_on_missing_colon_and_comma() {
+        assert!(Value::parse(r#"{"a" 1}"#).is_err()); // missing ':'
+        assert!(Value::parse(r#"{"a":1 "b":2}"#).is_err()); // missing ','
+        assert!(Value::parse(r#"{"a":1"#).is_err()); // unterminated object
+    }
+
+    #[test]
+    fn array_errors_on_bad_separator() {
+        assert!(Value::parse("[1 2]").is_err());
+        assert!(Value::parse("[1,2").is_err());
+    }
+
+    #[test]
+    fn string_escape_errors() {
+        assert!(Value::parse(r#""bad\xescape""#).is_err()); // invalid escape
+        assert!(Value::parse("\"dangling\\").is_err()); // dangling backslash
+    }
+
+    #[test]
+    fn unicode_escape_errors() {
+        assert!(Value::parse(r#""\u12""#).is_err()); // short \u
+        assert!(Value::parse(r#""\u12zz""#).is_err()); // non-hex
+        assert!(Value::parse(r#""\uD800""#).is_err()); // unpaired high surrogate
+        assert!(Value::parse(r#""\uD800A""#).is_err()); // bad low surrogate
+    }
+
+    #[test]
+    fn literal_and_number_errors() {
+        assert!(Value::parse("truu").is_err());
+        assert!(Value::parse("nul").is_err());
+        assert!(Value::parse("-").is_err()); // malformed number
+        assert!(Value::parse("@").is_err()); // unexpected char
+        assert!(Value::parse("").is_err()); // unexpected eof
+    }
+
+    #[test]
+    fn large_integers_use_float_formatting() {
+        // Above the 1e15 integer-print threshold → falls through to {n}.
+        let s = Value::Num(1e18).to_json();
+        assert_eq!(Value::parse(&s).unwrap().as_f64(), Some(1e18));
+    }
+
+    #[test]
+    fn parse_error_displays_offset_and_message() {
+        let err = Value::parse("[1,").unwrap_err();
+        let shown = err.to_string();
+        assert!(shown.contains("json parse error"));
+        assert!(shown.contains("byte"));
+    }
+
+    #[test]
+    fn serializes_all_value_kinds_and_separators() {
+        let v = Value::Object(vec![
+            ("n".to_string(), Value::Null),
+            ("f".to_string(), Value::Bool(false)),
+            ("t".to_string(), Value::Bool(true)),
+            (
+                "arr".to_string(),
+                Value::Array(vec![Value::Num(1.0), Value::Num(2.0)]),
+            ),
+        ]);
+        let s = v.to_json();
+        assert_eq!(s, r#"{"n":null,"f":false,"t":true,"arr":[1,2]}"#);
+    }
+
+    #[test]
+    fn serializes_every_escape_kind() {
+        let s = Value::Str("\"\\/\n\r\t\u{08}\u{0c}".to_string()).to_json();
+        // Note: forward slash is allowed unescaped on output.
+        assert_eq!(s, r#""\"\\/\n\r\t\b\f""#);
+    }
+
+    #[test]
+    fn parses_every_escape_kind() {
+        let v = Value::parse(r#""\"\\\/\n\r\t\b\f""#).unwrap();
+        assert_eq!(v.as_str(), Some("\"\\/\n\r\t\u{08}\u{0c}"));
+    }
+
+    #[test]
+    fn parses_surrogate_pair_escape() {
+        // Explicit 😀 surrogate-pair form for U+1F600 (😀).
+        let v = Value::parse(r#""\uD83D\uDE00""#).unwrap();
+        assert_eq!(v.as_str(), Some("😀"));
+    }
+
+    #[test]
+    fn high_surrogate_followed_by_non_low_is_error() {
+        // \uD800 then a valid-but-non-low \u0041 → unpaired high surrogate.
+        assert!(Value::parse(r#""\uD800\u0041""#).is_err());
+    }
+
+    #[test]
+    fn nested_arrays_and_negative_numbers() {
+        let v = Value::parse("[[-1,-2.5],[]]").unwrap();
+        let outer = v.as_array().unwrap();
+        assert_eq!(outer.len(), 2);
+        assert_eq!(outer[0].as_array().unwrap()[0].as_f64(), Some(-1.0));
+        assert!(outer[1].as_array().unwrap().is_empty());
     }
 }

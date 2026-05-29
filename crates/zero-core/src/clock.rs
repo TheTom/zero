@@ -113,6 +113,14 @@ mod tests {
     }
 
     #[test]
+    fn stopwatch_elapsed_human_is_formatted() {
+        let sw = Stopwatch::start();
+        let s = sw.elapsed_human();
+        // Freshly started → sub-second, so it ends in "ms".
+        assert!(s.ends_with("ms"), "got {s}");
+    }
+
+    #[test]
     fn wall_clock_is_after_2020() {
         // 2020-01-01 in unix seconds — sanity that the clock isn't zeroed.
         assert!(unix_seconds() > 1_577_836_800);

@@ -66,7 +66,7 @@ fn run(args: &Args) -> std::io::Result<()> {
             ),
         )
     })?;
-    let mut app = App::new(term, backend, log);
+    let mut app = App::new(term, std::io::stdout(), backend, log);
     app.run()
 }
 

@@ -123,6 +123,25 @@ mod tests {
     }
 
     #[test]
+    fn create_in_writes_a_real_jsonl_file() {
+        let dir = std::env::temp_dir().join(format!("zero-test-{}", crate::clock::unix_millis()));
+        let (mut log, path) = SessionLog::create_in(&dir).unwrap();
+        assert!(path.starts_with(&dir));
+        assert!(path.to_string_lossy().ends_with(".jsonl"));
+        log.record_meta("backend", "stub").unwrap();
+        log.record_message(Role::User, "hi").unwrap();
+        drop(log);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.lines().count(), 2);
+        let first = Value::parse(contents.lines().next().unwrap()).unwrap();
+        assert_eq!(first.get("kind").and_then(Value::as_str), Some("meta"));
+
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn text_with_newlines_stays_on_one_jsonl_line() {
         let mut log = SessionLog::from_writer(Vec::new());
         log.record_message(Role::Assistant, "line1\nline2").unwrap();
