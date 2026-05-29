@@ -64,6 +64,19 @@ Sessions log to `~/.zero/sessions/zero-<unixtime>.jsonl`.
 | `^C` | clear the line; on an empty line, `^C` again to exit |
 | `^D` | exit on an empty line |
 
+### Shell mode & the safety guard
+
+Prefix a line with `!` to run it as a shell command inline (`!cargo test`,
+`!git status`). Output, exit code, and measured time print in place.
+
+Every command — `!` shell now, agent tool calls later — passes through a
+**destructive-command guard** (`zero-core::safety`) first. It's a hard, in-code
+classifier, not a soft prompt rule: catastrophic commands (`rm -rf` on a
+critical path, `git reset --hard`, `dd of=/dev/…`, `sudo`, fork bombs, …) are
+flagged and require an explicit `y/N` confirmation before they run. The lesson
+from other harnesses is that prompt-level rules don't stop `rm -rf ~`; a gate at
+the execution boundary does.
+
 > **Shift+Enter caveat:** terminals only send a distinct Shift+Enter when they
 > support the modern CSI-u/kitty keyboard protocol (kitty, WezTerm, recent
 > iTerm2). Elsewhere it reads as plain Enter; use `⌥+Enter` (meta+Enter), which

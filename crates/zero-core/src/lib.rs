@@ -17,6 +17,7 @@ pub mod brand;
 pub mod clock;
 pub mod json;
 pub mod message;
+pub mod safety;
 pub mod session;
 
 pub use backend::{Backend, BackendError, StopReason, StreamEvent, StubBackend};

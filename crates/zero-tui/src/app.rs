@@ -61,6 +61,8 @@ pub struct App<I: Input, W: Write> {
     esc_pending: bool,
     /// `Some` while in `^R` reverse-search mode.
     search: Option<Search>,
+    /// A dangerous shell command awaiting `y/N` confirmation.
+    pending_shell: Option<String>,
 }
 
 impl<I: Input, W: Write> App<I, W> {
@@ -83,6 +85,7 @@ impl<I: Input, W: Write> App<I, W> {
             ctrl_c_armed: false,
             esc_pending: false,
             search: None,
+            pending_shell: None,
         }
     }
 
@@ -123,8 +126,11 @@ impl<I: Input, W: Write> App<I, W> {
         Ok(())
     }
 
-    /// Route a key, honoring the reverse-search submode and double-press combos.
+    /// Route a key, honoring submodes (confirm, search) and double-press combos.
     fn dispatch(&mut self, key: Key) -> io::Result<Flow> {
+        if self.pending_shell.is_some() {
+            return self.handle_confirm_key(key);
+        }
         if self.search.is_some() {
             return self.handle_search_key(key);
         }
@@ -219,6 +225,26 @@ impl<I: Input, W: Write> App<I, W> {
         if matches!(trimmed, "/quit" | "/exit") {
             return Ok(Flow::Quit);
         }
+        // `!cmd` — run a shell command inline (gated by the safety classifier).
+        if let Some(rest) = trimmed.strip_prefix('!') {
+            let cmd = rest.trim().to_string();
+            self.echo_committed(&text)?;
+            if cmd.is_empty() {
+                return Ok(Flow::Continue);
+            }
+            let verdict = zero_core::safety::classify(&cmd);
+            if verdict.is_dangerous() {
+                let reason = verdict.reason.unwrap_or("destructive command");
+                self.write_text(&format!(
+                    "\x1b[33m⚠ {reason}\x1b[0m — run anyway? \x1b[2m[y/N]\x1b[0m "
+                ))?;
+                self.pending_shell = Some(cmd);
+                self.cursor_row = 0;
+                return Ok(Flow::Continue);
+            }
+            self.run_shell(&cmd)?;
+            return Ok(Flow::Continue);
+        }
         if trimmed == "/help" {
             self.echo_committed(&text)?;
             self.print_help()?;
@@ -243,6 +269,58 @@ impl<I: Input, W: Write> App<I, W> {
         // Honest, measured elapsed — dimmed, never an estimate.
         self.write_text(&format!("\n\x1b[2m  {}\x1b[0m\n", format_duration(elapsed)))?;
         Ok(Flow::Continue)
+    }
+
+    // --- shell mode (!) ---------------------------------------------------
+
+    /// Confirm-mode key handler for a pending dangerous shell command.
+    fn handle_confirm_key(&mut self, key: Key) -> io::Result<Flow> {
+        let cmd = self.pending_shell.take().expect("a command is pending");
+        match key {
+            Key::Char('y') | Key::Char('Y') => {
+                self.write_text("\n")?;
+                self.run_shell(&cmd)?;
+            }
+            _ => {
+                self.write_text("\x1b[2mcancelled\x1b[0m\n")?;
+                self.cursor_row = 0;
+            }
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Run `cmd` via `sh -c`, print its output, exit code, and measured time.
+    fn run_shell(&mut self, cmd: &str) -> io::Result<()> {
+        let sw = Stopwatch::start();
+        match std::process::Command::new("sh").arg("-c").arg(cmd).output() {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if !stdout.is_empty() {
+                    self.write_text(&stdout)?;
+                    if !stdout.ends_with('\n') {
+                        self.write_text("\n")?;
+                    }
+                }
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !stderr.is_empty() {
+                    self.write_text(&format!("\x1b[31m{stderr}\x1b[0m"))?;
+                    if !stderr.ends_with('\n') {
+                        self.write_text("\n")?;
+                    }
+                }
+                let code = out.status.code().unwrap_or(-1);
+                if let Some(log) = self.log.as_mut() {
+                    let _ = log.record_meta("shell", cmd);
+                }
+                self.write_text(&format!(
+                    "\x1b[2m[exit {code} · {}]\x1b[0m\n",
+                    sw.elapsed_human()
+                ))?;
+            }
+            Err(e) => self.write_text(&format!("\x1b[31m[shell error: {e}]\x1b[0m\n"))?,
+        }
+        self.cursor_row = 0;
+        Ok(())
     }
 
     // --- reverse history search (^R) -------------------------------------
@@ -396,7 +474,7 @@ impl<I: Input, W: Write> App<I, W> {
     fn print_banner(&mut self) -> io::Result<()> {
         let banner = format!(
             "\x1b[1m{}\x1b[0m — local-first AI terminal  \x1b[2m({})\x1b[0m\n\
-             \x1b[2m/help for commands · ^C twice to quit\x1b[0m\n\n",
+             \x1b[2m/help for commands · ! for shell · ^C twice to quit\x1b[0m\n\n",
             zero_core::brand::name(),
             self.backend.name()
         );
@@ -408,6 +486,7 @@ impl<I: Input, W: Write> App<I, W> {
 \x1b[1mcommands\x1b[0m\n\
   /help        show this\n\
   /quit /exit  leave\n\
+  !<cmd>       run a shell command (dangerous ones ask first)\n\
 \x1b[1mediting\x1b[0m\n\
   ^A/^E or Home/End   start/end of line     ^B/^F  back/forward char\n\
   ⌥/^←  ⌥/^→          back/forward word     ^W     delete word back\n\
@@ -627,6 +706,21 @@ mod tests {
         let (reply, _) = stream_reply(&FailBackend, &mut out, &conv).unwrap();
         assert!(reply.is_empty());
         assert!(String::from_utf8(out).unwrap().contains("boom"));
+    }
+
+    #[test]
+    fn stream_reply_surfaces_label_write_error() {
+        let conv = Conversation::new();
+        let mut out = FlakyWriter { ok: 0 }; // even the label write fails
+        assert!(stream_reply(&StubBackend::instant(), &mut out, &conv).is_err());
+    }
+
+    #[test]
+    fn shell_mode_stderr_without_trailing_newline() {
+        let mut a = app(b"");
+        type_str(&mut a, "!printf oops >&2");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("oops"));
     }
 
     #[test]
@@ -945,6 +1039,119 @@ mod tests {
             None,
         );
         a.run().unwrap();
+        assert_eq!(a.conv.len(), 0);
+    }
+
+    fn type_str(a: &mut App<ScriptedInput, Vec<u8>>, s: &str) {
+        for c in s.chars() {
+            a.dispatch(Key::Char(c)).unwrap();
+        }
+    }
+
+    #[test]
+    fn shell_mode_runs_a_safe_command() {
+        let mut a = app(b"");
+        type_str(&mut a, "!echo zero-shell-ok");
+        a.dispatch(Key::Enter).unwrap();
+        let out = rendered(&a);
+        assert!(out.contains("zero-shell-ok"));
+        assert!(out.contains("[exit 0"));
+        assert!(a.pending_shell.is_none());
+        assert_eq!(a.conv.len(), 0); // shell is not a model turn
+    }
+
+    #[test]
+    fn shell_mode_dangerous_command_requires_confirmation() {
+        let mut a = app(b"");
+        type_str(&mut a, "!rm -rf /tmp/zero-does-not-exist-xyz");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(a.pending_shell.is_some());
+        assert!(rendered(&a).contains("run anyway?"));
+    }
+
+    #[test]
+    fn shell_mode_cancel_does_not_run() {
+        // Create a real temp dir; cancelling must leave it intact.
+        let dir = std::env::temp_dir().join(format!(
+            "zero-shell-cancel-{}",
+            zero_core::clock::unix_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app(b"");
+        type_str(&mut a, &format!("!rm -rf {}", dir.display()));
+        a.dispatch(Key::Enter).unwrap();
+        a.dispatch(Key::Char('n')).unwrap(); // decline
+        assert!(a.pending_shell.is_none());
+        assert!(dir.exists(), "cancelled command must not have run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_mode_confirm_runs_the_command() {
+        // Confirming deletes our own throwaway temp dir — real, but harmless.
+        let dir = std::env::temp_dir().join(format!(
+            "zero-shell-accept-{}",
+            zero_core::clock::unix_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(dir.exists());
+        let mut a = app(b"");
+        type_str(&mut a, &format!("!rm -rf {}", dir.display()));
+        a.dispatch(Key::Enter).unwrap();
+        a.dispatch(Key::Char('y')).unwrap(); // confirm
+        assert!(a.pending_shell.is_none());
+        assert!(!dir.exists(), "confirmed command should have run");
+        assert!(rendered(&a).contains("[exit"));
+    }
+
+    #[test]
+    fn shell_mode_prints_stdout_without_trailing_newline() {
+        let mut a = app(b"");
+        type_str(&mut a, "!printf zero-noeol");
+        a.dispatch(Key::Enter).unwrap();
+        let out = rendered(&a);
+        assert!(out.contains("zero-noeol"));
+        assert!(out.contains("[exit 0"));
+    }
+
+    #[test]
+    fn shell_mode_shows_stderr_and_nonzero_exit() {
+        let mut a = app(b"");
+        type_str(&mut a, "!ls /zero-definitely-missing-zzz");
+        a.dispatch(Key::Enter).unwrap();
+        let out = rendered(&a);
+        // Non-zero exit recorded; some stderr text was emitted.
+        assert!(out.contains("[exit"));
+        assert!(!out.contains("[exit 0"));
+    }
+
+    #[test]
+    fn shell_mode_logs_the_command() {
+        let dir = std::env::temp_dir().join(format!(
+            "zero-shell-log-{}",
+            zero_core::clock::unix_millis()
+        ));
+        let (log, path) = SessionLog::create_in(&dir).unwrap();
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Box::new(StubBackend::instant()),
+            Some(log),
+        );
+        type_str(&mut a, "!echo logged");
+        a.dispatch(Key::Enter).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("shell"));
+        assert!(contents.contains("echo logged"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_mode_empty_command_is_noop() {
+        let mut a = app(b"");
+        type_str(&mut a, "!");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(a.pending_shell.is_none());
         assert_eq!(a.conv.len(), 0);
     }
 
