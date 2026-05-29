@@ -3,8 +3,6 @@
 A local-first AI coding terminal in Rust with **zero runtime dependencies**.
 Built to feel like Claude Code's terminal, designed first for local LLMs.
 
-> The name "Zero" isn't final — it's a one-file swap. See [Renaming](#renaming).
-
 ## Repo map
 
 Flat by design — three crates, one file per concern, no deep nesting.
@@ -73,14 +71,6 @@ per clone:
 ```bash
 git config core.hooksPath scripts/hooks
 ```
-
-## Renaming
-
-- **Display name / config dir / prompt label** come from
-  `crates/zero-core/src/brand.rs` — edit `DEFAULT_NAME` / `DEFAULT_SLUG`, or set
-  `ZERO_NAME` / `ZERO_SLUG` env vars (no recompile).
-- **Crate names** rename mechanically: dirs + `name =` in each `Cargo.toml` +
-  workspace `members` + `path` deps.
 
 ## Toolchain note
 
