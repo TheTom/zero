@@ -146,10 +146,20 @@ fn decode_csi(buf: &[u8]) -> Step {
         b'H' => Key::Home,
         b'F' => Key::End,
         b'u' => {
-            // CSI-u (kitty keyboard protocol): param0 = codepoint, param1 = mods.
-            // With the protocol enabled, Shift+Enter arrives here as `13;2u`.
-            return match params[0] {
-                // Enter: plain → submit; with any modifier (Shift) → newline.
+            // CSI-u (kitty keyboard protocol): param0 = codepoint, param1 = mods
+            // (1 + bitmask where shift=1, alt=2, ctrl=4). With the protocol on,
+            // EVERY ctrl-chord reports here, not just the legacy control bytes.
+            let cp = params[0];
+            let ctrl = modifier > 0 && (modifier - 1) & 0b100 != 0;
+            if ctrl {
+                if let Some(c) = char::from_u32(cp) {
+                    if c.is_ascii_alphabetic() {
+                        return Step::Key(Key::Ctrl(c.to_ascii_lowercase()), total);
+                    }
+                }
+            }
+            return match cp {
+                // Enter: plain → submit; Shift/Ctrl+Enter → newline.
                 13 => Step::Key(
                     if modifier >= 2 {
                         Key::ShiftEnter
@@ -160,7 +170,10 @@ fn decode_csi(buf: &[u8]) -> Step {
                 ),
                 27 => Step::Key(Key::Esc, total),
                 9 => Step::Key(Key::Tab, total),
-                127 => Step::Key(Key::Backspace, total),
+                127 | 8 => Step::Key(Key::Backspace, total),
+                // Plain printable reported as CSI-u by some terminals.
+                cp if (0x20..0x7f).contains(&cp) && modifier <= 1 => char::from_u32(cp)
+                    .map_or(Step::Consume(total), |c| Step::Key(Key::Char(c), total)),
                 _ => Step::Consume(total),
             };
         }
@@ -388,6 +401,21 @@ mod tests {
         assert_eq!(keys(b"\x1b[27u"), vec![Key::Esc]);
         assert_eq!(keys(b"\x1b[9u"), vec![Key::Tab]);
         assert_eq!(keys(b"\x1b[127u"), vec![Key::Backspace]);
+    }
+
+    #[test]
+    fn csi_u_ctrl_chords_when_kitty_protocol_enabled() {
+        // Under the kitty protocol, ^R / ^C / ^A arrive as `<codepoint>;5u`.
+        assert_eq!(keys(b"\x1b[114;5u"), vec![Key::Ctrl('r')]); // ^R reverse search
+        assert_eq!(keys(b"\x1b[99;5u"), vec![Key::Ctrl('c')]); // ^C quit
+        assert_eq!(keys(b"\x1b[97;5u"), vec![Key::Ctrl('a')]); // ^A home
+                                                               // Uppercase codepoint still normalizes to lowercase chord.
+        assert_eq!(keys(b"\x1b[87;5u"), vec![Key::Ctrl('w')]); // ^W (87 = 'W')
+    }
+
+    #[test]
+    fn csi_u_plain_letter_is_a_char() {
+        assert_eq!(keys(b"\x1b[97u"), vec![Key::Char('a')]);
     }
 
     #[test]

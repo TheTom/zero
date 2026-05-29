@@ -145,6 +145,13 @@ the execution boundary does.
 > newline key** (Return sends CR = submit, `^J` sends LF = newline). Word-wise
 > moves (`⌥`/`^` + arrows) likewise depend on the terminal sending the sequence.
 
+### Output rendering & clipboard
+
+Assistant output is rendered as inline Markdown on the fly — `**bold**`,
+`*italic*`, `` `code` ``, and `#` headings become real terminal styling (the raw
+text is kept for the model and for copying). `/clip` copies the last response to
+the system clipboard (`pbcopy` / `wl-copy` / `xclip`).
+
 ## Test & coverage
 
 ```bash

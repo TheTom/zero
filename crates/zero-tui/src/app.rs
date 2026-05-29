@@ -33,6 +33,10 @@ pub trait Input {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
 }
 
+/// How `/clip` copies text out. The real one shells to the system clipboard;
+/// tests inject a fake.
+pub type ClipboardFn = Box<dyn FnMut(&str) -> io::Result<()>>;
+
 /// Result of handling one key: keep looping or tear down.
 #[derive(Debug, PartialEq, Eq)]
 enum Flow {
@@ -76,6 +80,10 @@ pub struct App<I: Input, W: Write> {
     servers_path: Option<PathBuf>,
     /// Servers found by the last `/scan`, for `/connect <n>`.
     scan_results: Vec<Discovered>,
+    /// The last assistant response (raw markdown), for `/clip`.
+    last_reply: String,
+    /// How `/clip` copies — the system clipboard by default; swappable in tests.
+    clipboard: ClipboardFn,
 }
 
 impl<I: Input, W: Write> App<I, W> {
@@ -104,7 +112,15 @@ impl<I: Input, W: Write> App<I, W> {
             config_path: None,
             servers_path: None,
             scan_results: Vec::new(),
+            last_reply: String::new(),
+            clipboard: Box::new(clipboard_copy),
         }
+    }
+
+    /// Override how `/clip` copies (tests inject a fake to avoid the real
+    /// system clipboard).
+    pub fn set_clipboard(&mut self, f: ClipboardFn) {
+        self.clipboard = f;
     }
 
     /// Set the summary shown by `/config` (backend, model, config path).
@@ -342,6 +358,11 @@ impl<I: Input, W: Write> App<I, W> {
             self.set_model(rest.trim())?;
             return Ok(Flow::Continue);
         }
+        if trimmed == "/clip" {
+            self.echo_committed(&text)?;
+            self.clip_last()?;
+            return Ok(Flow::Continue);
+        }
 
         self.echo_committed(&text)?;
         self.conv.push(Message::user(&text));
@@ -357,10 +378,24 @@ impl<I: Input, W: Write> App<I, W> {
             let _ = log.record_message(Role::Assistant, &reply);
             let _ = log.record_turn_done(elapsed.as_millis());
         }
+        self.last_reply = reply; // remembered for /clip
 
         // Honest, measured elapsed — dimmed, never an estimate.
         self.write_text(&format!("\n\x1b[2m  {}\x1b[0m\n", format_duration(elapsed)))?;
         Ok(Flow::Continue)
+    }
+
+    /// Copy the last assistant response to the system clipboard (`/clip`).
+    fn clip_last(&mut self) -> io::Result<()> {
+        if self.last_reply.trim().is_empty() {
+            return self.write_text("\x1b[2mnothing to copy yet\x1b[0m\n");
+        }
+        let reply = self.last_reply.clone();
+        let n = reply.chars().count();
+        match (self.clipboard)(&reply) {
+            Ok(()) => self.write_text(&format!("\x1b[2mcopied {n} chars to clipboard\x1b[0m\n")),
+            Err(e) => self.write_text(&format!("\x1b[31mclip failed: {e}\x1b[0m\n")),
+        }
     }
 
     // --- shell mode (!) ---------------------------------------------------
@@ -707,6 +742,7 @@ impl<I: Input, W: Write> App<I, W> {
             ('K', "/connect <n>", "attach to a discovered model"),
             ('K', "/model <name>", "switch model on the current endpoint"),
             ('K', "/servers", "list saved servers"),
+            ('K', "/clip", "copy the last response to the clipboard"),
             (
                 'K',
                 "!<cmd>",
@@ -756,6 +792,44 @@ impl<I: Input, W: Write> App<I, W> {
     }
 }
 
+/// Copy `text` to the system clipboard via the first available tool
+/// (`pbcopy` on macOS, `wl-copy`/`xclip` on Linux). Errors if none are found.
+fn clipboard_copy(text: &str) -> io::Result<()> {
+    const CANDIDATES: &[(&str, &[&str])] = &[
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+    ];
+    copy_with(CANDIDATES, text)
+}
+
+/// Pipe `text` to the first `candidates` command that spawns. Factored out so
+/// tests can pass a harmless command instead of the real system clipboard.
+fn copy_with(candidates: &[(&str, &[&str])], text: &str) -> io::Result<()> {
+    use std::process::{Command, Stdio};
+    for (cmd, args) in candidates {
+        match Command::new(cmd)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin.write_all(text.as_bytes())?;
+                }
+                let _ = child.wait();
+                return Ok(());
+            }
+            Err(_) => continue, // tool not installed; try the next
+        }
+    }
+    Err(io::Error::other(
+        "no clipboard tool found (install pbcopy, wl-copy, or xclip)",
+    ))
+}
+
 /// Translate `\n` → `\r\n` (raw mode needs the carriage return) and write.
 fn write_raw<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
     if s.contains('\n') {
@@ -776,6 +850,9 @@ fn stream_reply<W: Write>(
 ) -> io::Result<(String, Duration)> {
     let mut reply = String::new();
     let mut io_err: Option<io::Error> = None;
+    // `reply` keeps the raw markdown (for the model + /clip); `md` renders it to
+    // ANSI for live display so `**bold**`, `*italic*`, `` `code` `` look right.
+    let mut md = crate::markdown::MarkdownStream::new();
 
     write_raw(
         out,
@@ -790,7 +867,8 @@ fn stream_reply<W: Write>(
         }
         if let StreamEvent::Token(t) = ev {
             reply.push_str(&t);
-            if let Err(e) = write_raw(out, &t).and_then(|()| out.flush()) {
+            let rendered = md.feed(&t);
+            if let Err(e) = write_raw(out, &rendered).and_then(|()| out.flush()) {
                 io_err = Some(e);
             }
         }
@@ -800,6 +878,8 @@ fn stream_reply<W: Write>(
     if let Some(e) = io_err {
         return Err(e);
     }
+    // Close any styling left open at the end of the response.
+    write_raw(out, &md.finish())?;
     if let Err(e) = stream_res {
         write_raw(out, &format!("\n\x1b[31m[{e}]\x1b[0m"))?;
     }
@@ -1043,6 +1123,85 @@ mod tests {
         assert!(out.contains("Commands"));
         assert!(out.contains("reverse history search"));
         assert_eq!(a.conv.len(), 0);
+    }
+
+    #[test]
+    fn clip_copies_last_reply_via_injected_clipboard() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let captured = Rc::new(RefCell::new(String::new()));
+        let sink = captured.clone();
+        let mut a = app(b"");
+        a.set_clipboard(Box::new(move |s| {
+            *sink.borrow_mut() = s.to_string();
+            Ok(())
+        }));
+        // A turn produces a reply, then /clip copies it.
+        type_str(&mut a, "ping");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(a.last_reply.contains("ping"));
+        type_str(&mut a, "/clip");
+        a.dispatch(Key::Enter).unwrap();
+        assert_eq!(*captured.borrow(), a.last_reply);
+        assert!(rendered(&a).contains("copied"));
+    }
+
+    #[test]
+    fn copy_with_pipes_to_a_command() {
+        // `cat` consumes stdin and exits 0 — a harmless stand-in for a clipboard.
+        assert!(copy_with(&[("cat", &[])], "hello").is_ok());
+    }
+
+    #[test]
+    fn copy_with_errors_when_no_tool_exists() {
+        assert!(copy_with(&[("zero-no-such-binary-xyz", &[])], "x").is_err());
+    }
+
+    #[test]
+    fn clip_with_nothing_says_so() {
+        let mut a = app(b"");
+        type_str(&mut a, "/clip");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("nothing to copy"));
+    }
+
+    #[test]
+    fn clip_reports_clipboard_failure() {
+        let mut a = app(b"");
+        a.set_clipboard(Box::new(|_| Err(io::Error::other("no tool"))));
+        type_str(&mut a, "hey");
+        a.dispatch(Key::Enter).unwrap();
+        type_str(&mut a, "/clip");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("clip failed"));
+    }
+
+    #[test]
+    fn assistant_reply_is_markdown_rendered() {
+        // A backend that emits a bold span.
+        struct BoldBackend;
+        impl Backend for BoldBackend {
+            fn name(&self) -> &str {
+                "bold"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), BackendError> {
+                sink(StreamEvent::Token("**hi**".to_string()));
+                sink(StreamEvent::Done(zero_core::backend::StopReason::EndTurn));
+                Ok(())
+            }
+        }
+        let mut conv = Conversation::new();
+        conv.push(Message::user("x"));
+        let mut out = Vec::new();
+        let (reply, _) = stream_reply(&BoldBackend, &mut out, &conv).unwrap();
+        assert_eq!(reply, "**hi**"); // raw markdown preserved for model/clip
+        let painted = String::from_utf8(out).unwrap();
+        assert!(painted.contains("\x1b[1mhi")); // displayed bold
+        assert!(!painted.contains("**")); // asterisks not shown
     }
 
     #[test]

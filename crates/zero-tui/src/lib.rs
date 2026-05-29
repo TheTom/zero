@@ -10,6 +10,7 @@
 pub mod app;
 pub mod editor;
 pub mod key;
+pub mod markdown;
 pub mod term;
 pub mod viewport;
 
