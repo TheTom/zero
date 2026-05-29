@@ -458,12 +458,21 @@ impl<I: Input, W: Write> App<I, W> {
         let backend = Arc::clone(&self.backend);
         let conv = self.conv.clone();
         let run = move || {
-            // Surface a backend error as a visible token, then a Done so the
+            // Catch panics so a misbehaving backend can't take down the whole
+            // process; surface errors/panics as a visible token + Done so the
             // turn finalizes cleanly.
-            if let Err(e) = backend.stream(&conv, &mut |ev| {
-                let _ = tx.send(ev);
-            }) {
-                let _ = tx.send(StreamEvent::Token(format!("\n\x1b[31m[{e}]\x1b[0m")));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                backend.stream(&conv, &mut |ev| {
+                    let _ = tx.send(ev);
+                })
+            }));
+            let note = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(format!("\n\x1b[31m[{e}]\x1b[0m")),
+                Err(_) => Some("\n\x1b[31m[internal error: stream panicked]\x1b[0m".to_string()),
+            };
+            if let Some(note) = note {
+                let _ = tx.send(StreamEvent::Token(note));
                 let _ = tx.send(StreamEvent::Done(StopReason::EndTurn));
             }
         };
@@ -1368,6 +1377,38 @@ mod tests {
         assert!(contents.contains("\"role\":\"assistant\""));
         assert!(contents.contains("turn_done"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn panicking_backend_does_not_crash_the_turn() {
+        // A backend that panics mid-stream must not bring down the process; the
+        // turn surfaces an error and the app keeps going.
+        struct PanicBackend;
+        impl Backend for PanicBackend {
+            fn name(&self) -> &str {
+                "panic"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                _s: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), BackendError> {
+                panic!("backend went boom");
+            }
+        }
+        // Silence the default panic hook for this test's expected panic.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let mut a = App::new(
+            MultiInput::new(&[b"hi\r", b"/quit\r"]),
+            Vec::new(),
+            Arc::new(PanicBackend),
+            None,
+        );
+        a.synchronous = true;
+        a.run().unwrap();
+        std::panic::set_hook(prev);
+        assert!(rendered(&a).contains("internal error"));
     }
 
     #[test]

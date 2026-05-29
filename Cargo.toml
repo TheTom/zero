@@ -20,7 +20,9 @@ authors = ["Tom <tturney@psyguard.ai>"]
 # Single self-contained binary, no downstream crates → fat LTO is a pure win.
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# Unwind (not abort): a panic on the streaming thread must NOT kill the whole
+# process, and unwinding lets RawTerminal's Drop restore the tty on a crash.
+panic = "unwind"
 strip = true
 
 [profile.bench]
