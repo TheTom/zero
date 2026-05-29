@@ -1509,6 +1509,26 @@ mod tests {
     }
 
     #[test]
+    fn input_box_grows_with_lines_and_shrinks_after_send() {
+        // cursor_row is the cursor's row within the box (1 = first input line,
+        // just below the top rule). It tracks the box height as lines are added.
+        let mut a = app(b"");
+        a.dispatch(Key::Char('a')).unwrap();
+        a.redraw_input().unwrap();
+        assert_eq!(a.cursor_row, 1); // single input line
+
+        a.dispatch(Key::ShiftEnter).unwrap(); // add a line
+        a.dispatch(Key::Char('b')).unwrap();
+        a.redraw_input().unwrap();
+        assert_eq!(a.cursor_row, 2); // grew: cursor on the 2nd input line
+
+        a.dispatch(Key::Enter).unwrap(); // send (synchronous turn completes)
+        assert!(a.editor.is_empty());
+        a.redraw_input().unwrap();
+        assert_eq!(a.cursor_row, 1); // shrank back to a one-line box
+    }
+
+    #[test]
     fn esc_twice_interrupts_a_streaming_turn() {
         let mut a = app(b"");
         a.start_turn("go").unwrap();
