@@ -158,9 +158,9 @@ impl MarkdownStream {
         let lang = self.lang_buf.trim();
         let n = self.block_count;
         let label = if lang.is_empty() {
-            format!("── ⧉ click to copy · /clip {n} ──")
+            format!("── ⧉ /clip {n} ──")
         } else {
-            format!("── {lang} · ⧉ click to copy · /clip {n} ──")
+            format!("── {lang} · ⧉ /clip {n} ──")
         };
         out.push_str(&format!("{DIM_ON}{label}{DIM_OFF}\n"));
         self.collecting_lang = false;

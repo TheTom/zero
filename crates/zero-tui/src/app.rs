@@ -159,9 +159,10 @@ impl<I: Input, W: Write> App<I, W> {
         // protocol). On terminals that support it, Shift+Enter then arrives as
         // `ESC [ 13 ; 2 u`; on others this is silently ignored. Popped in finish.
         self.out.write_all(b"\x1b[>1u")?;
-        // Enable SGR mouse reporting so clicks (e.g. on a code block) are
-        // delivered as input; disabled again in finish().
-        self.out.write_all(b"\x1b[?1000h\x1b[?1006h")?;
+        // NOTE: we deliberately do NOT enable SGR mouse reporting. It would catch
+        // clicks for click-to-copy, but it also steals the scroll wheel from the
+        // terminal, killing native scrollback — a core feature. Mouse capture
+        // belongs in a future full-screen mode. Copy with `/clip <n>`.
         self.print_banner()?;
         self.redraw_input()?;
 
@@ -200,8 +201,7 @@ impl<I: Input, W: Write> App<I, W> {
     }
 
     fn finish(&mut self) -> io::Result<()> {
-        // Disable mouse reporting and pop the kitty keyboard-protocol flags.
-        self.out.write_all(b"\x1b[?1000l\x1b[?1006l")?;
+        // Pop the kitty keyboard-protocol flags we pushed in run().
         self.out.write_all(b"\x1b[<u")?;
         self.write_text("\n")?;
         Ok(())
