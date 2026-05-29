@@ -82,6 +82,8 @@ pub struct App<I: Input, W: Write> {
     scan_results: Vec<Discovered>,
     /// The last assistant response (raw markdown), for `/clip`.
     last_reply: String,
+    /// Fenced code blocks from the last response, for `/clip <n>`.
+    last_blocks: Vec<crate::markdown::CodeBlock>,
     /// How `/clip` copies — the system clipboard by default; swappable in tests.
     clipboard: ClipboardFn,
 }
@@ -113,6 +115,7 @@ impl<I: Input, W: Write> App<I, W> {
             servers_path: None,
             scan_results: Vec::new(),
             last_reply: String::new(),
+            last_blocks: Vec::new(),
             clipboard: Box::new(clipboard_copy),
         }
     }
@@ -358,9 +361,9 @@ impl<I: Input, W: Write> App<I, W> {
             self.set_model(rest.trim())?;
             return Ok(Flow::Continue);
         }
-        if trimmed == "/clip" {
+        if let Some(rest) = trimmed.strip_prefix("/clip") {
             self.echo_committed(&text)?;
-            self.clip_last()?;
+            self.do_clip(rest.trim())?;
             return Ok(Flow::Continue);
         }
 
@@ -379,20 +382,49 @@ impl<I: Input, W: Write> App<I, W> {
             let _ = log.record_turn_done(elapsed.as_millis());
         }
         self.last_reply = reply; // remembered for /clip
+        self.last_blocks = crate::markdown::code_blocks(&self.last_reply);
 
         // Honest, measured elapsed — dimmed, never an estimate.
         self.write_text(&format!("\n\x1b[2m  {}\x1b[0m\n", format_duration(elapsed)))?;
+        // Per-block copy affordance: /clip <n> grabs just that code block.
+        if !self.last_blocks.is_empty() {
+            let mut hint = String::from("\x1b[2m  ⧉ copy:");
+            for (i, b) in self.last_blocks.iter().enumerate() {
+                let tag = if b.lang.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", b.lang)
+                };
+                hint.push_str(&format!("  /clip {}{tag}", i + 1));
+            }
+            hint.push_str("  (or /clip for all)\x1b[0m\n");
+            self.write_text(&hint)?;
+        }
         Ok(Flow::Continue)
     }
 
-    /// Copy the last assistant response to the system clipboard (`/clip`).
-    fn clip_last(&mut self) -> io::Result<()> {
-        if self.last_reply.trim().is_empty() {
-            return self.write_text("\x1b[2mnothing to copy yet\x1b[0m\n");
+    /// `/clip` copies the whole last response; `/clip <n>` copies code block n.
+    fn do_clip(&mut self, arg: &str) -> io::Result<()> {
+        if arg.is_empty() {
+            if self.last_reply.trim().is_empty() {
+                return self.write_text("\x1b[2mnothing to copy yet\x1b[0m\n");
+            }
+            let text = self.last_reply.clone();
+            return self.copy_text(&text);
         }
-        let reply = self.last_reply.clone();
-        let n = reply.chars().count();
-        match (self.clipboard)(&reply) {
+        match arg.parse::<usize>() {
+            Ok(n) if (1..=self.last_blocks.len()).contains(&n) => {
+                let body = self.last_blocks[n - 1].body.clone();
+                self.copy_text(&body)
+            }
+            _ => self.write_text("\x1b[31mno such code block — see the /clip hints\x1b[0m\n"),
+        }
+    }
+
+    /// Copy `text` via the configured clipboard and report the result.
+    fn copy_text(&mut self, text: &str) -> io::Result<()> {
+        let n = text.chars().count();
+        match (self.clipboard)(text) {
             Ok(()) => self.write_text(&format!("\x1b[2mcopied {n} chars to clipboard\x1b[0m\n")),
             Err(e) => self.write_text(&format!("\x1b[31mclip failed: {e}\x1b[0m\n")),
         }
@@ -742,7 +774,11 @@ impl<I: Input, W: Write> App<I, W> {
             ('K', "/connect <n>", "attach to a discovered model"),
             ('K', "/model <name>", "switch model on the current endpoint"),
             ('K', "/servers", "list saved servers"),
-            ('K', "/clip", "copy the last response to the clipboard"),
+            (
+                'K',
+                "/clip [n]",
+                "copy the last response, or just code block n",
+            ),
             (
                 'K',
                 "!<cmd>",
@@ -1155,6 +1191,60 @@ mod tests {
     #[test]
     fn copy_with_errors_when_no_tool_exists() {
         assert!(copy_with(&[("zero-no-such-binary-xyz", &[])], "x").is_err());
+    }
+
+    /// A backend that streams a canned reply containing a code block.
+    struct CodeBackend;
+    impl Backend for CodeBackend {
+        fn name(&self) -> &str {
+            "code"
+        }
+        fn stream(
+            &self,
+            _c: &Conversation,
+            sink: &mut dyn FnMut(StreamEvent),
+        ) -> Result<(), BackendError> {
+            sink(StreamEvent::Token(
+                "here:\n```rust\nfn main() {}\n```\ndone".to_string(),
+            ));
+            sink(StreamEvent::Done(zero_core::backend::StopReason::EndTurn));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn response_with_code_block_offers_per_block_clip() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let captured = Rc::new(RefCell::new(String::new()));
+        let sink = captured.clone();
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Box::new(CodeBackend),
+            None,
+        );
+        a.set_clipboard(Box::new(move |s| {
+            *sink.borrow_mut() = s.to_string();
+            Ok(())
+        }));
+        type_str(&mut a, "go");
+        a.dispatch(Key::Enter).unwrap();
+        // The footer advertises a per-block copy.
+        assert!(rendered(&a).contains("⧉ copy:"));
+        assert_eq!(a.last_blocks.len(), 1);
+        // /clip 1 copies just the block body, not the whole response.
+        type_str(&mut a, "/clip 1");
+        a.dispatch(Key::Enter).unwrap();
+        assert_eq!(*captured.borrow(), "fn main() {}");
+    }
+
+    #[test]
+    fn clip_index_out_of_range_is_reported() {
+        let mut a = app(b"");
+        type_str(&mut a, "/clip 9");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("no such code block"));
     }
 
     #[test]

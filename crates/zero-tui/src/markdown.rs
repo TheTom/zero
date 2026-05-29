@@ -1,18 +1,22 @@
-//! A tiny streaming Markdown → ANSI renderer for assistant output.
+//! A tiny streaming Markdown → ANSI renderer for assistant output, plus a
+//! fenced-code-block extractor for per-section copy (`/clip <n>`).
 //!
-//! Tokens arrive a few characters at a time, so `**bold**` is frequently split
-//! across chunks. [`MarkdownStream`] is a stateful filter: feed it each chunk,
-//! write what it returns, and call [`MarkdownStream::finish`] at the end. It
-//! handles the inline subset that matters for chat: `**bold**`, `*italic*`,
-//! `` `code` ``, and `#` headings. It is pure (no I/O), so it is fully tested.
+//! Tokens arrive a few characters at a time, so markup like `**bold**` or a
+//! ```` ``` ```` fence is frequently split across chunks. [`MarkdownStream`] is a
+//! stateful filter: feed it each chunk, write what it returns, and call
+//! [`MarkdownStream::finish`] at the end. It handles the inline subset that
+//! matters for chat — `**bold**`, `*italic*`, `` `code` ``, `#` headings — and
+//! fenced code blocks (rendered dim, markers hidden). Pure, so it is fully
+//! tested.
 
-/// SGR codes.
 const BOLD_ON: &str = "\x1b[1m";
 const BOLD_OFF: &str = "\x1b[22m";
 const ITALIC_ON: &str = "\x1b[3m";
 const ITALIC_OFF: &str = "\x1b[23m";
-const CODE_ON: &str = "\x1b[36m"; // cyan reads as inline code
+const CODE_ON: &str = "\x1b[36m"; // cyan inline code
 const CODE_OFF: &str = "\x1b[39m";
+const DIM_ON: &str = "\x1b[2m"; // fenced code block
+const DIM_OFF: &str = "\x1b[22m";
 const RESET: &str = "\x1b[0m";
 
 /// Incremental Markdown renderer. One per assistant response.
@@ -21,13 +25,18 @@ pub struct MarkdownStream {
     bold: bool,
     italic: bool,
     code: bool,
-    /// We've seen one `*` and are waiting to see if a second makes it `**`.
+    in_fence: bool,
+    /// Saw one `*`, waiting to see if a second makes it `**`.
     pending_star: bool,
-    /// Cursor is at the start of a line (for heading detection).
+    /// Count of consecutive backticks since line start (fence detection).
+    pending_backticks: u8,
+    /// True until a non-backtick char appears on the current line.
+    line_only_backticks: bool,
+    /// Cursor is at the start of a line.
     at_line_start: bool,
-    /// Currently bolding a `#` heading line.
+    /// Swallow the rest of the line (a fence's language tag).
+    suppress_eol: bool,
     heading: bool,
-    /// Still consuming the leading `#`/space run of a heading.
     heading_marker: bool,
 }
 
@@ -35,6 +44,7 @@ impl MarkdownStream {
     pub fn new() -> Self {
         MarkdownStream {
             at_line_start: true,
+            line_only_backticks: true,
             ..Default::default()
         }
     }
@@ -43,70 +53,125 @@ impl MarkdownStream {
     pub fn feed(&mut self, chunk: &str) -> String {
         let mut out = String::with_capacity(chunk.len() + 8);
         for ch in chunk.chars() {
-            // A lone `*` followed by a non-`*` was italic, not the start of `**`.
-            if self.pending_star && ch != '*' {
-                self.toggle_italic(&mut out);
-                self.pending_star = false;
+            if self.suppress_eol {
+                if ch == '\n' {
+                    self.newline(&mut out);
+                }
+                continue;
             }
-            match ch {
-                '\n' => {
-                    if self.heading {
-                        out.push_str(BOLD_OFF);
-                        self.heading = false;
-                    }
-                    out.push('\n');
-                    self.at_line_start = true;
-                    self.heading_marker = false;
-                }
-                '#' if self.at_line_start => {
-                    if !self.heading {
-                        out.push_str(BOLD_ON);
-                        self.heading = true;
-                    }
-                    self.heading_marker = true; // suppress the marker glyph
-                }
-                ' ' if self.heading_marker => {
-                    self.heading_marker = false; // swallow one space after `#`
-                    self.at_line_start = false;
-                }
-                '*' => {
-                    if self.pending_star {
-                        self.toggle_bold(&mut out);
-                        self.pending_star = false;
-                    } else {
-                        self.pending_star = true;
-                    }
-                    self.at_line_start = false;
-                    self.heading_marker = false;
-                }
-                '`' => {
-                    self.toggle_code(&mut out);
-                    self.at_line_start = false;
-                    self.heading_marker = false;
-                }
-                other => {
-                    out.push(other);
-                    self.at_line_start = false;
-                    self.heading_marker = false;
-                }
+            if ch == '\n' {
+                self.resolve_pending_backticks(&mut out);
+                self.newline(&mut out);
+                continue;
             }
+            // Fence delimiter: three backticks starting a line.
+            if ch == '`' && self.at_line_start && self.line_only_backticks {
+                self.pending_backticks += 1;
+                if self.pending_backticks == 3 {
+                    self.pending_backticks = 0;
+                    self.line_only_backticks = false;
+                    self.suppress_eol = true; // ignore the language tag
+                    self.in_fence = !self.in_fence;
+                    out.push_str(if self.in_fence { DIM_ON } else { DIM_OFF });
+                }
+                continue;
+            }
+            // Fewer than three leading backticks → not a fence; resolve them.
+            if self.pending_backticks > 0 {
+                self.resolve_pending_backticks(&mut out);
+            }
+            self.line_only_backticks = false;
+
+            if self.in_fence {
+                out.push(ch); // raw inside a code block (no inline parsing)
+                self.at_line_start = false;
+                continue;
+            }
+            self.inline(ch, &mut out);
         }
         out
     }
 
-    /// Flush trailing state at end of the response and clear any active styling.
-    pub fn finish(&mut self) -> String {
-        let mut out = String::new();
-        if self.pending_star {
-            out.push('*'); // a trailing lone `*` was literal
+    /// Inline (non-fenced) character handling.
+    fn inline(&mut self, ch: char, out: &mut String) {
+        if self.pending_star && ch != '*' {
+            self.toggle_italic(out);
             self.pending_star = false;
         }
-        if self.bold || self.italic || self.code || self.heading {
+        match ch {
+            '#' if self.at_line_start => {
+                if !self.heading {
+                    out.push_str(BOLD_ON);
+                    self.heading = true;
+                }
+                self.heading_marker = true;
+            }
+            ' ' if self.heading_marker => {
+                self.heading_marker = false;
+                self.at_line_start = false;
+            }
+            '*' => {
+                if self.pending_star {
+                    self.toggle_bold(out);
+                    self.pending_star = false;
+                } else {
+                    self.pending_star = true;
+                }
+                self.at_line_start = false;
+                self.heading_marker = false;
+            }
+            '`' => {
+                self.toggle_code(out);
+                self.at_line_start = false;
+                self.heading_marker = false;
+            }
+            other => {
+                out.push(other);
+                self.at_line_start = false;
+                self.heading_marker = false;
+            }
+        }
+    }
+
+    fn newline(&mut self, out: &mut String) {
+        if self.heading {
+            out.push_str(BOLD_OFF);
+            self.heading = false;
+        }
+        out.push('\n');
+        self.at_line_start = true;
+        self.line_only_backticks = true;
+        self.heading_marker = false;
+        self.suppress_eol = false;
+    }
+
+    /// Emit 1–2 leading backticks that turned out not to be a fence.
+    fn resolve_pending_backticks(&mut self, out: &mut String) {
+        let n = std::mem::take(&mut self.pending_backticks);
+        for _ in 0..n {
+            if self.in_fence {
+                out.push('`');
+            } else {
+                self.toggle_code(out);
+            }
+        }
+    }
+
+    /// Flush trailing state at end of the response and clear active styling.
+    pub fn finish(&mut self) -> String {
+        let mut out = String::new();
+        self.resolve_pending_backticks(&mut out);
+        if self.pending_star {
+            out.push('*');
+            self.pending_star = false;
+        }
+        if self.bold || self.italic || self.code || self.heading || self.in_fence {
             out.push_str(RESET);
             self.bold = false;
             self.italic = false;
             self.code = false;
             self.heading = false;
+            self.in_fence = false;
         }
         out
     }
@@ -125,6 +190,46 @@ impl MarkdownStream {
         self.code = !self.code;
         out.push_str(if self.code { CODE_ON } else { CODE_OFF });
     }
+}
+
+/// A fenced code block extracted from a response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeBlock {
+    pub lang: String,
+    pub body: String,
+}
+
+/// Extract fenced (```` ``` ````) code blocks from raw markdown. An unterminated
+/// final fence still yields its accumulated body.
+pub fn code_blocks(text: &str) -> Vec<CodeBlock> {
+    let mut blocks = Vec::new();
+    let mut in_fence = false;
+    let mut lang = String::new();
+    let mut body: Vec<&str> = Vec::new();
+    for line in text.split('\n') {
+        if line.trim_start().starts_with("```") {
+            if in_fence {
+                blocks.push(CodeBlock {
+                    lang: std::mem::take(&mut lang),
+                    body: body.join("\n"),
+                });
+                body.clear();
+                in_fence = false;
+            } else {
+                in_fence = true;
+                lang = line.trim_start().trim_start_matches('`').trim().to_string();
+            }
+        } else if in_fence {
+            body.push(line);
+        }
+    }
+    if in_fence && !body.is_empty() {
+        blocks.push(CodeBlock {
+            lang,
+            body: body.join("\n"),
+        });
+    }
+    blocks
 }
 
 /// Convenience: render a whole string in one shot.
@@ -156,13 +261,18 @@ mod tests {
 
     #[test]
     fn italic_then_text() {
-        // Closing `*` is followed by a space, so italic closes cleanly.
         assert_eq!(render("*hi* x"), format!("{ITALIC_ON}hi{ITALIC_OFF} x"));
     }
 
     #[test]
     fn inline_code() {
         assert_eq!(render("`x`"), format!("{CODE_ON}x{CODE_OFF}"));
+    }
+
+    #[test]
+    fn inline_code_at_line_start() {
+        // A single leading backtick is inline code, not a fence.
+        assert_eq!(render("`y`"), format!("{CODE_ON}y{CODE_OFF}"));
     }
 
     #[test]
@@ -174,24 +284,29 @@ mod tests {
     }
 
     #[test]
-    fn multi_hash_heading_marker_hidden() {
-        assert_eq!(render("### Big\n"), format!("{BOLD_ON}Big{BOLD_OFF}\n"));
+    fn plain_text_and_dashes_unchanged() {
+        assert_eq!(render("s-t-a-w, plain"), "s-t-a-w, plain");
     }
 
     #[test]
-    fn plain_text_is_unchanged() {
-        assert_eq!(render("just words, no markup"), "just words, no markup");
+    fn fenced_block_renders_dim_and_hides_markers() {
+        let out = render("```rust\nlet x = 1;\n```\n");
+        // Fence lines and language tag are not shown; body is dimmed.
+        assert!(!out.contains("```"));
+        assert!(!out.contains("rust"));
+        assert!(out.contains("let x = 1;"));
+        assert!(out.contains(DIM_ON));
     }
 
     #[test]
-    fn dashes_are_left_alone() {
-        // The strawberry breakdown: dashes must not be treated as markup.
-        assert_eq!(render("s-t-a-w"), "s-t-a-w");
+    fn fence_disables_inline_parsing_inside() {
+        // `*` and `_` inside a code fence stay literal.
+        let out = render("```\na * b ** c\n```\n");
+        assert!(out.contains("a * b ** c"));
     }
 
     #[test]
     fn trailing_lone_star_is_literal() {
-        // No style was open, so no reset is appended.
         assert_eq!(render("5 *"), "5 *");
     }
 
@@ -203,9 +318,25 @@ mod tests {
     }
 
     #[test]
-    fn finish_is_empty_when_nothing_open() {
-        let mut md = MarkdownStream::new();
-        md.feed("plain");
-        assert_eq!(md.finish(), "");
+    fn code_blocks_extracts_fences_with_lang() {
+        let text = "intro\n```rust\nfn main() {}\n```\nmid\n```\nplain\n```\n";
+        let blocks = code_blocks(text);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].lang, "rust");
+        assert_eq!(blocks[0].body, "fn main() {}");
+        assert_eq!(blocks[1].lang, "");
+        assert_eq!(blocks[1].body, "plain");
+    }
+
+    #[test]
+    fn code_blocks_handles_unterminated_fence() {
+        let blocks = code_blocks("```py\nx = 1\nstill going");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].body, "x = 1\nstill going");
+    }
+
+    #[test]
+    fn code_blocks_none_when_no_fences() {
+        assert!(code_blocks("just prose, `inline` only").is_empty());
     }
 }

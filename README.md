@@ -148,9 +148,14 @@ the execution boundary does.
 ### Output rendering & clipboard
 
 Assistant output is rendered as inline Markdown on the fly — `**bold**`,
-`*italic*`, `` `code` ``, and `#` headings become real terminal styling (the raw
-text is kept for the model and for copying). `/clip` copies the last response to
-the system clipboard (`pbcopy` / `wl-copy` / `xclip`).
+`*italic*`, `` `code` ``, `#` headings, and fenced code blocks become real
+terminal styling (the raw text is kept for the model and for copying).
+
+Copy to the system clipboard (`pbcopy` / `wl-copy` / `xclip`):
+
+- `/clip` — copy the whole last response.
+- `/clip <n>` — copy just code block *n*. When a response contains code blocks,
+  a dim footer shows the per-block copy hints (`⧉ copy:  /clip 1 rust  …`).
 
 ## Test & coverage
 
