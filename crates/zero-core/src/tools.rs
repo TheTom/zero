@@ -208,11 +208,17 @@ pub enum LoopVerdict {
 /// detection logic. (A repeat of the same stuck pattern always escalates to Stop.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {
-    /// Stop immediately on first detection. Simplest; abandons the task.
+    /// Stop immediately on first detection. Simplest; abandons the task. Cheapest,
+    /// near-best quality in the 0i ablation (when you can't rescue, stop fast).
     StopOnly,
-    /// Inject a corrective message, give one more round (the current default).
+    /// Inject a corrective message, give one more round. THE DEFAULT — best quality
+    /// in the 0i ablation at moderate cost.
     Nudge,
-    /// Discard history and restart from task + progress summary. Caller rebuilds.
+    /// Discard history and restart from task + progress summary. ABLATION-REFUTED
+    /// (0i): worst arm — 2× tokens, 3× calls, no quality gain, because the fresh
+    /// context just wanders again. Kept opt-in (`ZERO_RECOVERY=reset`); do NOT make
+    /// it the default. The real fix for wander is a testable definition-of-done
+    /// upstream + a verification loop, not mid-loop recovery.
     Reset,
 }
 
