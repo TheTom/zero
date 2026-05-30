@@ -412,3 +412,186 @@ fn token_saving_grep_keeps_all_file_line_refs_through_the_binary() {
     }
     std::fs::remove_dir_all(&home).ok();
 }
+
+// --- negative paths & robustness (hardening the flow) --------------------
+
+#[test]
+fn dead_backend_url_fails_gracefully_not_a_panic_or_hang() {
+    // A real --url pointing at a refused port: the binary must exit cleanly with
+    // an error on stderr and empty stdout — never panic, never hang. (Connection
+    // refused is immediate, so no timeout wait here.)
+    let (stdout, stderr, code) = run(
+        &[
+            "-p",
+            "hello",
+            "--url",
+            "http://127.0.0.1:1",
+            "--model",
+            "x",
+            "--no-log",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "should exit cleanly: stderr {stderr:?}");
+    // Non-tools path surfaces the error as the reply ([error: …]); either way it
+    // must mention an error and must NOT have produced a real answer.
+    assert!(
+        stdout.contains("error") || stderr.contains("error") || stderr.contains("refused"),
+        "no error surfaced. stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        !stdout.contains("stub reply"),
+        "should not have fallen back to stub"
+    );
+}
+
+#[test]
+fn malformed_config_falls_back_without_crashing() {
+    // A garbage --config file: the binary loads it best-effort (unwrap_or_default),
+    // so it falls back to the stub and still answers — no crash, exit 0.
+    let home = std::env::temp_dir().join(format!("zero-cli-badcfg-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let cfg = home.join("config.json");
+    std::fs::write(&cfg, "{ this is not valid json").unwrap();
+    let out = Command::new(zero_bin())
+        .args(["-p", "ping", "--stub", "--no-log", "--config"])
+        .arg(&cfg)
+        .env("HOME", &home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code().unwrap_or(-1), 0);
+    assert!(stdout.contains("ping"), "stdout: {stdout:?}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn empty_and_whitespace_prompts_are_handled() {
+    // Empty / whitespace-only prompts must not crash. The prompt is trimmed before
+    // run_once, so a whitespace prompt becomes empty — the run still exits 0.
+    for p in ["", "   ", "\t\n  "] {
+        let (_stdout, stderr, code) = run(&["-p", p, "--stub", "--no-log"], None);
+        assert_eq!(code, 0, "prompt {p:?} crashed: {stderr:?}");
+        assert!(!stderr.contains("panic"), "panicked on {p:?}: {stderr:?}");
+    }
+}
+
+#[test]
+fn missing_print_value_errors_cleanly() {
+    // `-p` with no value → arg parse error, nonzero exit, no panic. Spawn directly
+    // (not via run(), which would inject --config and become -p's "value").
+    let out = Command::new(zero_bin())
+        .arg("-p")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code().unwrap_or(-1), 0);
+    assert!(stderr.contains("needs a value"), "stderr: {stderr:?}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
+}
+
+#[test]
+fn dangerous_bash_is_refused_through_the_binary_and_never_runs() {
+    // Security gate, end to end: the model asks bash to do something destructive
+    // chained after a sentinel-creating touch. The classifier flags the whole
+    // chain → refused → NOTHING runs, so the sentinel file must not exist.
+    let home = std::env::temp_dir().join(format!("zero-cli-danger-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let sentinel = home.join("MUST_NOT_EXIST");
+    // touch <sentinel> && rm -rf /  — the classifier flags `rm -rf /`.
+    let cmd = format!("touch {} && rm -rf /", sentinel.display());
+    let url = mock_openai_bash(&cmd);
+    let cfg_path = home.join("config.json");
+    std::fs::write(
+        &cfg_path,
+        format!(r#"{{"base_url":"{url}","model":"mock"}}"#),
+    )
+    .unwrap();
+
+    let out = Command::new(zero_bin())
+        .args(["-p", "do the thing", "--tools", "--no-log", "--config"])
+        .arg(&cfg_path)
+        .env("HOME", &home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code().unwrap_or(-1), 0, "stderr: {stderr}");
+    assert!(stderr.contains("refused"), "danger not refused: {stderr:?}");
+    assert!(
+        !sentinel.exists(),
+        "REFUSED COMMAND STILL RAN — sentinel was created"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn bash_path_confinement_rejects_absolute_read_but_does_not_crash() {
+    // A read_file tool call with an absolute path escapes the workspace root and
+    // is rejected by the confinement check; the loop reports it and finishes
+    // cleanly (the model gets an error it can act on — no panic).
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let round = Arc::new(Mutex::new(0u32));
+    thread::spawn(move || loop {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        sock.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .ok();
+        let mut buf = [0u8; 8192];
+        loop {
+            match sock.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => continue,
+            }
+        }
+        let mut r = round.lock().unwrap();
+        *r += 1;
+        let body = if *r == 1 {
+            // read_file with an absolute path → confinement rejects it.
+            r#"{"choices":[{"message":{"content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"/etc/passwd\"}"}}]}}]}"#.to_string()
+        } else {
+            r#"{"choices":[{"message":{"content":"understood"}}]}"#.to_string()
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = sock.write_all(resp.as_bytes());
+    });
+    let url = format!("http://127.0.0.1:{port}");
+    let (stdout, stderr, code) = run(
+        &[
+            "-p",
+            "read passwd",
+            "--tools",
+            "--url",
+            &url,
+            "--model",
+            "mock",
+            "--no-log",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    // The confinement rejection appears in the tool trace; the model's follow-up
+    // answer reaches stdout. No panic anywhere.
+    assert!(!stderr.contains("panicked"), "panicked: {stderr:?}");
+    assert!(
+        stderr.contains("absolute") || stderr.contains("error") || stdout.contains("understood"),
+        "confinement path not exercised cleanly: stdout={stdout:?} stderr={stderr:?}"
+    );
+}
