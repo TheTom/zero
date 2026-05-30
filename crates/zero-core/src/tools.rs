@@ -195,17 +195,37 @@ pub enum LoopVerdict {
     /// guidance as a message and give it ONE more round to converge.
     Nudge(String),
     /// Stuck — discard the polluted history and RESTART the loop from a clean
-    /// context (the original task + a concrete progress summary the caller builds).
-    /// Mechanistically the strongest fix: a fresh context doesn't contain the
-    /// repetition attractor the way a nudged one does. The caller rebuilds `conv`.
-    Reset,
+    /// context. Carries the [`ResetStyle`] so the caller knows how rich a summary to
+    /// rebuild `conv` with. A fresh context doesn't carry the repetition attractor.
+    Reset(ResetStyle),
     /// Still stuck after recovery (or a catastrophe backstop tripped). End the turn.
     Stop(String),
 }
 
+/// How much context a reset preserves when rebuilding the conversation. Drives the
+/// reset-summary ablation. Research (docs §0j) says the THIN style fails because it
+/// drops the two high-value fields — what FAILED and the recent raw tail — that a
+/// fresh model needs to avoid re-wandering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetStyle {
+    /// Original tested arm: task + a structural note (files touched, tools used).
+    /// Carries the cheap-to-reconstruct fields, drops the expensive ones. The 0i
+    /// loser.
+    Thin,
+    /// Deterministic-but-rich: task + files/state + VERBATIM-QUOTED failed results
+    /// (negative constraints) + the last few raw turns as a tail. No model call, no
+    /// faithfulness risk — quoting can't hallucinate. The research's recommended
+    /// build.
+    Rich,
+    /// Like Rich, but the model also fills bounded "what failed / next action"
+    /// fields (the caller makes the extra call). Closer to the research ideal but
+    /// costs a round-trip and risks weak-model faithfulness.
+    Hybrid,
+}
+
 /// What the guard does the FIRST time it detects a stuck pattern. Lets the
-/// escalation policy be A/B-ablated (stop vs nudge vs reset) without touching the
-/// detection logic. (A repeat of the same stuck pattern always escalates to Stop.)
+/// escalation policy be A/B-ablated without touching the detection logic. (A repeat
+/// of the same stuck pattern always escalates to Stop.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {
     /// Stop immediately on first detection. Simplest; abandons the task. Cheapest,
@@ -214,12 +234,10 @@ pub enum Recovery {
     /// Inject a corrective message, give one more round. THE DEFAULT — best quality
     /// in the 0i ablation at moderate cost.
     Nudge,
-    /// Discard history and restart from task + progress summary. ABLATION-REFUTED
-    /// (0i): worst arm — 2× tokens, 3× calls, no quality gain, because the fresh
-    /// context just wanders again. Kept opt-in (`ZERO_RECOVERY=reset`); do NOT make
-    /// it the default. The real fix for wander is a testable definition-of-done
-    /// upstream + a verification loop, not mid-loop recovery.
-    Reset,
+    /// Discard history and restart with a summary of the given style. The THIN style
+    /// was ablation-refuted (0i); Rich/Hybrid are under test (docs §0j) to see if a
+    /// better summary (failed-constraints + raw tail) makes reset converge.
+    Reset(ResetStyle),
 }
 
 /// A guard against runaway tool loops driven by **lack of progress, not step
@@ -479,7 +497,7 @@ impl LoopGuard {
         let same_way = self.nudged_sig.as_deref() == Some(stuck_key.as_str());
         match self.recovery {
             Recovery::StopOnly => LoopVerdict::Stop("stuck — no progress".into()),
-            Recovery::Reset => {
+            Recovery::Reset(style) => {
                 if same_way || self.reset_count >= self.max_resets {
                     return LoopVerdict::Stop(
                         "still stuck after a fresh-context reset — not converging".into(),
@@ -487,7 +505,7 @@ impl LoopGuard {
                 }
                 self.nudged_sig = Some(stuck_key);
                 self.reset_count += 1;
-                LoopVerdict::Reset
+                LoopVerdict::Reset(style)
             }
             Recovery::Nudge => {
                 // Stop if same-way-again, or we've spent the nudge budget.
@@ -717,8 +735,8 @@ mod tests {
     // DIFFERENT stuck pattern resets again up to max_resets, then Stops.
     #[test]
     fn loop_guard_reset_policy_resets_then_stops() {
-        let mut g = LoopGuard::new(100).with_recovery(Recovery::Reset); // max_resets=2
-                                                                        // identical action 3× → action_repeats hits repeat_limit(3) → reset #1.
+        let mut g = LoopGuard::new(100).with_recovery(Recovery::Reset(ResetStyle::Rich)); // max_resets=2
+                                                                                          // identical action 3× → action_repeats hits repeat_limit(3) → reset #1.
         let a = vec![ToolCall::new(
             "c",
             "write_file",
@@ -726,13 +744,18 @@ mod tests {
         )];
         assert_eq!(g.record_round(&a, &["w1".into()]), LoopVerdict::Continue);
         assert_eq!(g.record_round(&a, &["w2".into()]), LoopVerdict::Continue);
-        assert_eq!(g.record_round(&a, &["w3".into()]), LoopVerdict::Reset);
+        assert!(matches!(
+            g.record_round(&a, &["w3".into()]),
+            LoopVerdict::Reset(_)
+        ));
         g.reset_window(); // caller clears after acting on Reset
                           // a DIFFERENT churn after reset → reset #2
         let b = vec![ToolCall::new("c", "bash", "{\"command\":\"x\"}")];
         for i in 0..4 {
-            let v = g.record_round(&b, &[format!("r{i}")]);
-            if v == LoopVerdict::Reset {
+            if matches!(
+                g.record_round(&b, &[format!("r{i}")]),
+                LoopVerdict::Reset(_)
+            ) {
                 g.reset_window();
                 break;
             }

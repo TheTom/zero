@@ -165,19 +165,40 @@ pub fn run_turn(
                 on_text(&format!("\n[guard: {msg}]\n"));
                 conv.push(Message::user(&msg));
             }
-            crate::tools::LoopVerdict::Reset => {
+            crate::tools::LoopVerdict::Reset(style) => {
                 // Stuck → discard the polluted history and RESTART from a clean
-                // context: the original task + a concrete, deterministically-built
-                // progress summary (files touched, last result). A fresh context
-                // doesn't carry the repetition attractor, so the model can finish.
-                // We build the summary from the transcript (no extra model call, no
-                // self-reflection — research: 35B self-critique is unreliable).
-                let summary = progress_summary(conv);
-                let task = first_user_task(conv);
+                // context. The summary RICHNESS is the variable under test (docs
+                // §0j): a fresh context escapes the repetition attractor, but only
+                // converges if the seed carries what FAILED (so it doesn't re-wander)
+                // and a raw tail (grounding to verify-not-restart).
                 on_text("\n[guard: resetting context — too much churn; restarting from a clean slate]\n");
+                let task = first_user_task(conv);
+                let tail = recent_tail(conv, 4); // last raw turns, before we clear
+                let summary = match style {
+                    crate::tools::ResetStyle::Thin => progress_summary(conv),
+                    crate::tools::ResetStyle::Rich | crate::tools::ResetStyle::Hybrid => {
+                        rich_summary(conv)
+                    }
+                };
+                // Hybrid: one bounded model call to add "what failed / next action".
+                let extra = if style == crate::tools::ResetStyle::Hybrid {
+                    hybrid_addendum(conv, completer).unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 conv.messages.clear();
-                conv.push(Message::user(&task));
+                conv.push(Message::user(&task)); // GOAL at head (position bias)
                 conv.push(Message::user(&summary));
+                if !extra.is_empty() {
+                    conv.push(Message::user(&extra));
+                }
+                // Raw tail at the end (salience) for Rich/Hybrid — grounding to
+                // verify rather than re-derive. Thin keeps no tail (the 0i baseline).
+                if !matches!(style, crate::tools::ResetStyle::Thin) {
+                    for m in tail {
+                        conv.messages.push(m);
+                    }
+                }
                 guard.reset_window();
             }
             crate::tools::LoopVerdict::Stop(why) => {
@@ -245,6 +266,105 @@ fn progress_summary(conv: &Conversation) -> String {
          the task, fix only what is actually broken, then give your final answer.",
     );
     s
+}
+
+/// The last `n` raw messages (verbatim) — kept across a reset to ground the fresh
+/// model in concrete recent state (verify-not-restart) instead of forcing it to
+/// re-derive everything. Research: a raw tail beats a pure summary for convergence.
+fn recent_tail(conv: &Conversation, n: usize) -> Vec<Message> {
+    let len = conv.messages.len();
+    conv.messages[len.saturating_sub(n)..].to_vec()
+}
+
+/// A RICH, still-deterministic reset summary. Beyond the thin version it adds the
+/// two highest-value fields the research flagged — both by QUOTING (no model call,
+/// no hallucination risk):
+///
+/// * WHAT FAILED: the verbatim error/refusal tool-results, as negative constraints
+///   ("do not repeat"), so the fresh model doesn't re-walk dead ends;
+/// * a checkable framing (verify against the task, fix only what's broken).
+///
+/// Ordered goal-style: state first, failed-constraints next, instruction last.
+fn rich_summary(conv: &Conversation) -> String {
+    use std::collections::BTreeSet;
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    let mut tools: BTreeSet<&str> = BTreeSet::new();
+    // Collect verbatim failure results (error:/refused:) as negative constraints,
+    // de-duped, newest-biased, capped so the summary stays lean.
+    let mut failures: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for m in &conv.messages {
+        for tc in &m.tool_calls {
+            tools.insert(tc.name.as_str());
+            if matches!(tc.name.as_str(), "write_file" | "edit_file") {
+                if let Ok(args) = crate::tools::parse_arguments(tc) {
+                    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                        files.insert(p.to_string());
+                    }
+                }
+            }
+        }
+        if matches!(m.role, crate::message::Role::Tool) {
+            let c = m.content.trim();
+            if (c.starts_with("error:") || c.starts_with("refused:") || c.contains("Error"))
+                && seen.insert(c.to_string())
+            {
+                let quote: String = c.chars().take(200).collect();
+                failures.push(quote);
+            }
+        }
+    }
+    let mut s = String::from(
+        "CONTEXT RESET — continue, do NOT restart from scratch. Your earlier exploration was \
+         discarded to escape a loop; here is the concrete state.\n\n",
+    );
+    s.push_str("STATE: ");
+    if files.is_empty() {
+        s.push_str("no files written yet. ");
+    } else {
+        s.push_str(&format!(
+            "files already on disk: {}. ",
+            files.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !tools.is_empty() {
+        s.push_str(&format!(
+            "tools used: {}.\n",
+            tools.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !failures.is_empty() {
+        s.push_str("\nWHAT ALREADY FAILED — do NOT repeat these:\n");
+        for f in failures.iter().rev().take(5) {
+            s.push_str(&format!("  - {f}\n"));
+        }
+    }
+    s.push_str(
+        "\nNEXT: read the existing file(s) once if needed, verify the work satisfies the task, \
+         fix ONLY what is actually broken, then give your final answer. Do not re-explore.",
+    );
+    s
+}
+
+/// HYBRID extra: one bounded model call to add a "what failed / next action" line.
+/// Costs a round-trip and risks weak-model faithfulness — the research's caveat —
+/// so we ask only for a SHORT, concrete next step and tolerate failure (returns
+/// `None`, leaving the deterministic Rich summary to stand alone).
+fn hybrid_addendum(conv: &Conversation, completer: &mut dyn Completer) -> Option<String> {
+    let mut ask = conv.clone();
+    ask.push(Message::user(
+        "In ONE sentence, state the single most concrete next action to finish the task. \
+         No preamble, no tool calls — just the next step.",
+    ));
+    let c = completer.complete(&ask, &[]).ok()?;
+    let line = c.content.trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "NEXT ACTION (your own assessment): {}",
+        line.chars().take(300).collect::<String>()
+    ))
 }
 
 #[cfg(test)]
@@ -535,6 +655,39 @@ mod tests {
     }
 
     #[test]
+    fn rich_summary_quotes_failures_as_constraints_and_keeps_state() {
+        // The research's key fix: the rich summary must carry WHAT FAILED (verbatim,
+        // as "do not repeat") + the file state — not just which tools ran.
+        let mut conv = Conversation::new();
+        conv.push(Message::user("build it"));
+        conv.push(Message::assistant_tool_calls(
+            "",
+            vec![ToolCall::new(
+                "w1",
+                "write_file",
+                "{\"path\":\"a.py\",\"content\":\"x\"}",
+            )],
+        ));
+        conv.push(Message::tool_result("w1", "wrote a.py"));
+        conv.push(Message::assistant_tool_calls(
+            "",
+            vec![ToolCall::new("b1", "bash", "{\"command\":\"python a.py\"}")],
+        ));
+        conv.push(Message::tool_result("b1", "error: SyntaxError on line 3"));
+        let s = rich_summary(&conv);
+        assert!(s.contains("a.py"), "should name the file state");
+        assert!(
+            s.contains("WHAT ALREADY FAILED"),
+            "should have a failed-constraints section"
+        );
+        assert!(
+            s.contains("SyntaxError on line 3"),
+            "should QUOTE the verbatim error"
+        );
+        assert!(s.contains("CONTEXT RESET"));
+    }
+
+    #[test]
     fn reset_policy_rebuilds_a_clean_context_then_finishes() {
         // With Recovery::Reset: the model churns (writes the same file repeatedly),
         // the guard signals Reset, run_turn discards history and restarts from
@@ -562,7 +715,9 @@ mod tests {
             })
         };
         let mut exec = |_: &ToolCall| "{\"bytes_written\":100}".to_string();
-        let mut guard = LoopGuard::new(100).with_recovery(crate::tools::Recovery::Reset);
+        let mut guard = LoopGuard::new(100).with_recovery(crate::tools::Recovery::Reset(
+            crate::tools::ResetStyle::Rich,
+        ));
         let mut conv = Conversation::new();
         conv.push(Message::user("build game.py"));
         let out = run_turn(
@@ -585,8 +740,8 @@ mod tests {
         assert!(
             conv.messages
                 .iter()
-                .any(|m| m.content.contains("game.py") && m.content.contains("Do NOT start over")),
-            "expected a concrete progress-summary message after reset"
+                .any(|m| m.content.contains("game.py") && m.content.contains("CONTEXT RESET")),
+            "expected a rich reset-summary message naming the file after reset"
         );
     }
 

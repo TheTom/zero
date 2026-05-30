@@ -878,11 +878,13 @@ impl<I: Input, W: Write> App<I, W> {
             guard = guard.with_nudge(&t);
         }
         if let Ok(r) = std::env::var("ZERO_RECOVERY") {
-            use zero_core::tools::Recovery;
+            use zero_core::tools::{Recovery, ResetStyle};
             let pol = match r.as_str() {
                 "stop" => Some(Recovery::StopOnly),
                 "nudge" => Some(Recovery::Nudge),
-                "reset" => Some(Recovery::Reset),
+                "reset" | "reset-rich" => Some(Recovery::Reset(ResetStyle::Rich)),
+                "reset-thin" => Some(Recovery::Reset(ResetStyle::Thin)),
+                "reset-hybrid" => Some(Recovery::Reset(ResetStyle::Hybrid)),
                 _ => None,
             };
             if let Some(p) = pol {

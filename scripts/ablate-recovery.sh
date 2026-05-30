@@ -31,7 +31,7 @@ echo "$TASK" > "$W/prompt.txt"
 results="$W/results.tsv"
 printf 'policy\trep\ttotal\tcalls\tcompleted\tquality\n' > "$results"
 
-for policy in stop nudge reset; do
+for policy in stop nudge reset-thin reset-rich reset-hybrid; do
   for rep in $(seq 1 "$REPS"); do
     run="$W/$policy-$rep"; mkdir -p "$run"
     : > "$W/tok.log"
@@ -68,13 +68,14 @@ for r in rows:
     if r['quality']!="NA": d["q"].append(float(r['quality']))
 def avg(x): return sum(x)//len(x) if x else 0
 def favg(x): return round(sum(x)/len(x),1) if x else float('nan')
-print(f"{'policy':6} {'n':>2} {'%completed':>10} {'avg_tok':>8} {'avg_calls':>9} {'avg_quality':>11}")
-for pol in ("stop","nudge","reset"):
+print(f"{'policy':13} {'n':>2} {'%completed':>10} {'avg_tok':>8} {'avg_calls':>9} {'avg_quality':>11}")
+for pol in ("stop","nudge","reset-thin","reset-rich","reset-hybrid"):
     d=p.get(pol)
     if not d or d["n"]==0: continue
-    print(f"{pol:6} {d['n']:>2} {100*d['done']//d['n']:>9}% {avg(d['tot']):>8} {avg(d['calls']):>9} {favg(d['q']):>11}")
-print("\nBest = highest %completed AND quality at lowest tokens. Reset should lift")
-print("%completed (rescues hard-stops) without a quality drop.")
+    print(f"{pol:13} {d['n']:>2} {100*d['done']//d['n']:>9}% {avg(d['tot']):>8} {avg(d['calls']):>9} {favg(d['q']):>11}")
+print("\nBest = highest %completed AND quality at lowest tokens. The reset arms test")
+print("whether a RICHER summary (failed-constraints + raw tail) beats the thin one")
+print("that lost in 0i — and whether the model-filled hybrid is worth its extra call.")
 print(f"raw: {sys.argv[1]}")
 PY
 echo "artifacts: $W"
