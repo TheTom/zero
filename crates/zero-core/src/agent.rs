@@ -13,9 +13,8 @@
 //!  * bounded by [`crate::tools::LoopGuard`] (step cap + doom-loop), so a
 //!    misbehaving local model can't run forever.
 
-use crate::backend::BackendError;
+use crate::backend::{BackendError, Completion};
 use crate::message::{Conversation, Message, ToolCall};
-use crate::openai::Completion;
 use crate::tools::{LoopGuard, ToolDef};
 
 /// What one finished turn produced.

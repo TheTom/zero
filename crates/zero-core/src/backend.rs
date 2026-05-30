@@ -77,6 +77,42 @@ pub trait Backend: Send + Sync {
         conv: &Conversation,
         sink: &mut dyn FnMut(StreamEvent),
     ) -> Result<(), BackendError>;
+
+    /// One NON-streaming completion turn for the agentic tool loop. The default
+    /// runs [`Backend::stream`], collects the text, and recovers any tool call
+    /// the model emitted *in the text* — so even a stream-only or stub backend
+    /// can drive the loop via the text fallback. A real OpenAI-compatible backend
+    /// overrides this to send the structured `tools` array and read the
+    /// structured `tool_calls` field. `tools`/`timeout` are unused by the default.
+    fn complete(
+        &self,
+        conv: &Conversation,
+        _tools: &[crate::tools::ToolDef],
+        _timeout: std::time::Duration,
+    ) -> Result<Completion, BackendError> {
+        let mut content = String::new();
+        self.stream(conv, &mut |ev| {
+            if let StreamEvent::Token(t) = ev {
+                content.push_str(&t);
+            }
+        })?;
+        let msg = crate::json::Value::Object(vec![(
+            "content".to_string(),
+            crate::json::Value::Str(content.clone()),
+        )]);
+        let tool_calls = crate::tools::parse_tool_calls(&msg);
+        Ok(Completion {
+            content,
+            tool_calls,
+        })
+    }
+}
+
+/// The result of a non-streaming completion: assistant text + requested calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub content: String,
+    pub tool_calls: Vec<crate::message::ToolCall>,
 }
 
 /// A dependency-free fake backend for the TUI-first slice. It echoes a canned

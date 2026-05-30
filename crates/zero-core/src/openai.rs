@@ -6,7 +6,7 @@
 //! Request building and SSE-line parsing are pure and unit-tested; the network
 //! round-trip rides on the localhost-mock-tested `http` module.
 
-use crate::backend::{Backend, BackendError, StopReason, StreamEvent, Usage};
+use crate::backend::{Backend, BackendError, Completion, StopReason, StreamEvent, Usage};
 use crate::config::Config;
 use crate::http;
 use crate::json::Value;
@@ -89,9 +89,10 @@ impl OpenAiBackend {
         Value::Object(obj).to_json()
     }
 
-    /// One non-streaming completion turn with tools. Returns the assistant's
-    /// text plus any tool calls it requested (structured or text-fallback).
-    pub fn complete(
+    /// The non-streaming tool-loop turn, shared by the [`Backend::complete`]
+    /// override below. Sends the structured `tools` array, reads back text +
+    /// structured (or text-fallback) tool calls.
+    fn complete_with_tools(
         &self,
         conv: &Conversation,
         tools: &[ToolDef],
@@ -109,13 +110,6 @@ impl OpenAiBackend {
         }
         parse_completion(&text)
     }
-}
-
-/// The result of a non-streaming completion: assistant text + requested calls.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Completion {
-    pub content: String,
-    pub tool_calls: Vec<crate::message::ToolCall>,
 }
 
 /// Parse a non-streaming `/v1/chat/completions` response into a [`Completion`].
@@ -142,6 +136,15 @@ fn parse_completion(body: &str) -> Result<Completion, BackendError> {
 impl Backend for OpenAiBackend {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn complete(
+        &self,
+        conv: &Conversation,
+        tools: &[ToolDef],
+        timeout: Duration,
+    ) -> Result<Completion, BackendError> {
+        self.complete_with_tools(conv, tools, timeout)
     }
 
     fn stream(
