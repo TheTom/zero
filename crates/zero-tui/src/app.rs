@@ -2160,6 +2160,13 @@ fn cap_tool_result(
     // set) so the compressed view can point the model back at the complete bytes.
     let artifact =
         artifact_dir.and_then(|d| compress::spill(d, &sanitize_id(&call.id), result.as_bytes()));
+    // read_file is special: the model asked to SEE this file, so never apply a lossy
+    // content-shape compressor (a code file mentioning "error:" would be log-filtered;
+    // a donut drops middle functions while looking complete). Faithful prefix + a
+    // ranged-read nudge instead. Everything else goes through shape detection.
+    if call.name == "read_file" {
+        return compress::compress_file_read(&result, max, artifact.as_deref());
+    }
     compress::compress(&shape_cmd(call), &result, max, artifact.as_deref()).text
 }
 
@@ -3139,7 +3146,10 @@ mod tests {
         // compressed view points back at it.
         let dir = std::env::temp_dir().join(format!("zero-art-{}-{}", std::process::id(), line!()));
         std::fs::create_dir_all(&dir).unwrap();
-        let big = "y".repeat(20_000);
+        // A real (multi-line) file read. read_file gets a faithful prefix + nudge.
+        let big: String = (0..1000)
+            .map(|i| format!("line {i} of the source file\n"))
+            .collect();
         let out = cap_tool_result(
             &ToolCall::new("call-7f", "read_file", "{}"),
             big.clone(),
@@ -3147,7 +3157,8 @@ mod tests {
             Some(dir.as_path()),
         );
         assert!(out.len() < big.len());
-        assert!(out.contains("elided"));
+        assert!(out.starts_with("line 0 of the source file\n")); // faithful prefix
+        assert!(out.contains("read_file with offset/limit")); // actionable nudge
         assert!(out.contains("full output:"));
         // Byte-identical artifact at the call-id-named path.
         let art = dir.join("out-call-7f.txt");
@@ -3159,13 +3170,11 @@ mod tests {
     fn cap_tool_result_without_artifact_dir_still_compresses() {
         // No session dir (tests / --no-log): compression still runs, just no
         // re-fetch path in the marker.
-        let out = cap_tool_result(
-            &ToolCall::new("c", "read_file", "{}"),
-            "y".repeat(20_000),
-            4096,
-            None,
-        );
-        assert!(out.contains("elided"));
+        let big: String = (0..1000)
+            .map(|i| format!("line {i} of the source file\n"))
+            .collect();
+        let out = cap_tool_result(&ToolCall::new("c", "read_file", "{}"), big, 4096, None);
+        assert!(out.contains("read_file with offset/limit"));
         assert!(!out.contains("full output:"));
     }
 

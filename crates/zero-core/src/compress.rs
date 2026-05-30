@@ -411,6 +411,50 @@ fn trim_grep_body(line: &str, cap: usize) -> String {
     }
 }
 
+/// A `read_file` result that's over budget. Unlike command output, a file read is
+/// something the model deliberately asked to *see in full* — so we must NOT apply
+/// the lossy content-shape compressors here. A source file that merely mentions
+/// `error:` would be misdetected as a log and severity-filtered; a head+tail donut
+/// of code drops the middle functions while *looking* complete — a real edit-time
+/// hazard. Instead:
+///   - if it's valid JSON, minify (lossless, full file, still valid), else
+///   - keep a faithful line-aligned PREFIX + a loud marker that nudges a ranged
+///     re-read (`offset`/`limit`) and names the artifact.
+pub fn compress_file_read(raw: &str, budget: usize, artifact: Option<&Path>) -> String {
+    // Lossless path: a JSON document comes back whole and valid, just minified.
+    if !is_jsonl(raw) && matches!(detect("", raw.as_bytes()), OutputShape::Json) {
+        if let Some(min) = json_minify(raw) {
+            if min.len() <= budget {
+                return min;
+            }
+        }
+    }
+    let total_lines = raw.lines().count();
+    let hint = artifact_hint(artifact);
+    let marker_room = 110 + hint.len();
+    if budget <= marker_room {
+        return format!(
+            "[file is {total_lines} lines — too large to inline. \
+             read_file with offset/limit to view a range.{hint}]\n"
+        );
+    }
+    let body = budget - marker_room;
+    let mut kept = String::new();
+    let mut kept_lines = 0usize;
+    for line in raw.lines() {
+        if kept.len() + line.len() + 1 > body {
+            break;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+        kept_lines += 1;
+    }
+    format!(
+        "{kept}[file truncated: showing lines 1-{kept_lines} of {total_lines}. \
+         read_file with offset/limit to see more.{hint}]\n"
+    )
+}
+
 /// JSON: minify losslessly (strip insignificant whitespace — ~20-40% free and,
 /// unlike a byte-donut, keeps the JSON *valid* for the model to parse). A donut on
 /// JSON would splice head+tail into syntactic garbage, so we never donut raw JSON:
@@ -959,6 +1003,52 @@ mod tests {
         assert!(c.text.contains("json minified"));
         assert!(c.text.contains("elided"));
         assert!(c.kept_bytes < c.raw_bytes);
+    }
+
+    #[test]
+    fn file_read_keeps_a_faithful_prefix_not_a_lossy_shape_view() {
+        // A source file that mentions "error:" must NOT be log-filtered into a view
+        // that drops middle functions; read_file gets a clean prefix + ranged nudge.
+        let mut src = String::from("use std::io;\nfn top() {}\n");
+        for i in 0..400 {
+            src.push_str(&format!("fn middle_{i}() {{ /* error: not really */ }}\n"));
+        }
+        src.push_str("fn bottom_unique_marker() {}\n");
+        let out = compress_file_read(&src, 512, art());
+        // faithful prefix: the first lines are present verbatim, in order.
+        assert!(
+            out.starts_with("use std::io;\nfn top() {}\n"),
+            "prefix not faithful: {out}"
+        );
+        // it's a prefix, so the bottom is NOT shown (but recoverable + nudged).
+        assert!(!out.contains("fn bottom_unique_marker"));
+        assert!(
+            out.contains("read_file with offset/limit"),
+            "no ranged-read nudge"
+        );
+        assert!(
+            out.contains("of 403"),
+            "should name total line count: {}",
+            &out[out.len().saturating_sub(120)..]
+        );
+        assert!(out.contains("/tmp/zero/out-ab.txt"), "no artifact pointer");
+    }
+
+    #[test]
+    fn file_read_of_json_comes_back_whole_and_minified() {
+        // A JSON file read is losslessly minified (full content, still valid) rather
+        // than prefixed — the model gets the entire document, fewer bytes.
+        let json = "{\n  \"a\": 1,\n  \"b\": [1, 2, 3],\n  \"c\": \"keep\"\n}";
+        let out = compress_file_read(json, 60, art());
+        assert_eq!(out, "{\"a\":1,\"b\":[1,2,3],\"c\":\"keep\"}");
+    }
+
+    #[test]
+    fn file_read_tiny_budget_names_the_file_size() {
+        let big = "x\n".repeat(5000);
+        let out = compress_file_read(&big, 20, art());
+        assert!(out.contains("5000 lines"));
+        assert!(out.contains("offset/limit"));
     }
 
     #[test]
