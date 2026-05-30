@@ -22,7 +22,7 @@ use zero_core::backend::{Backend, StopReason, StreamEvent, Usage};
 use zero_core::clock::{format_duration, Stopwatch};
 use zero_core::config::Config;
 use zero_core::discovery::Discovered;
-use zero_core::mcp::{self, McpConfig};
+use zero_core::mcp;
 use zero_core::message::{Conversation, Message, Role, ToolCall};
 use zero_core::openai::OpenAiBackend;
 use zero_core::servers::ServerStore;
@@ -40,7 +40,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/config", "show the active backend and model"),
     ("/scan", "find model servers on your network"),
     ("/servers", "list saved servers"),
-    ("/mcp", "connect MCP servers ( /mcp tools to list )"),
+    (
+        "/mcp",
+        "import + connect MCP servers ( /mcp tools to list )",
+    ),
     ("/connect", "attach to a discovered model"),
     ("/model", "switch model on the current endpoint"),
     (
@@ -242,10 +245,16 @@ pub struct App<I: Input, W: Write> {
     queue_edit: Option<QueueEdit>,
     /// Current input mode (Shift+Tab cycles it).
     mode: Mode,
-    /// Connected MCP servers (kept alive for the upcoming tool-call loop).
+    /// Connected MCP servers (kept alive for the tool-call loop).
     mcp: Vec<mcp::Connection>,
-    /// Path to the MCP server config (`~/.zero/mcp.json`).
+    /// Path to Zero's own MCP server config (`~/.zero/mcp.json`).
     mcp_path: Option<PathBuf>,
+    /// `$HOME`, for importing MCP servers from Claude Desktop / Claude Code.
+    /// `None` in tests so discovery reads only the explicit `mcp_path`.
+    mcp_home: Option<PathBuf>,
+    /// Working directory, for project `.mcp.json` + Claude Code's per-project
+    /// servers. `None` in tests.
+    mcp_cwd: Option<PathBuf>,
     /// A dangerous shell command awaiting `y/N` confirmation.
     pending_shell: Option<String>,
     /// Human-readable backend/config summary, shown by `/config`.
@@ -308,6 +317,8 @@ impl<I: Input, W: Write> App<I, W> {
             mode: Mode::default(),
             mcp: Vec::new(),
             mcp_path: None,
+            mcp_home: None,
+            mcp_cwd: None,
             pending_shell: None,
             info: String::new(),
             config: Config::default(),
@@ -351,9 +362,16 @@ impl<I: Input, W: Write> App<I, W> {
         self.servers_path = servers_path;
     }
 
-    /// Where to read MCP server definitions (`~/.zero/mcp.json`).
+    /// Where to read Zero's own MCP server definitions (`~/.zero/mcp.json`).
     pub fn set_mcp_path(&mut self, path: Option<PathBuf>) {
         self.mcp_path = path;
+    }
+
+    /// Enable importing MCP servers from other tools (Claude Desktop, Claude
+    /// Code) and the project's `.mcp.json`, by giving `$HOME` and the working dir.
+    pub fn set_mcp_discovery(&mut self, home: Option<PathBuf>, cwd: Option<PathBuf>) {
+        self.mcp_home = home;
+        self.mcp_cwd = cwd;
     }
 
     /// Ask the configured server for its context window (`n_ctx`) so the status
@@ -418,6 +436,9 @@ impl<I: Input, W: Write> App<I, W> {
         // Best-effort: learn the server's context window so the status line can
         // show usage from the first turn.
         self.refresh_context_window();
+        // Auto-connect any MCP servers configured here or in Claude Desktop /
+        // Claude Code — quiet when there are none (no startup noise).
+        self.autoconnect_mcp()?;
         self.redraw_input()?;
 
         let mut inbuf: Vec<u8> = Vec::new();
@@ -1201,39 +1222,83 @@ impl<I: Input, W: Write> App<I, W> {
         self.connect_mcp()
     }
 
-    /// Connect every configured-but-not-yet-connected MCP server (blocking,
-    /// best-effort) and report the outcome per server.
-    fn connect_mcp(&mut self) -> io::Result<()> {
-        let Some(path) = self.mcp_path.clone() else {
-            return self.write_text("\x1b[2mno MCP config path\x1b[0m\n");
-        };
-        let cfg = match McpConfig::load(&path) {
-            Ok(c) => c,
-            Err(e) => return self.write_text(&format!("\x1b[31mmcp config: {e}\x1b[0m\n")),
-        };
-        if cfg.is_empty() {
-            return self.write_text(&format!(
-                "\x1b[2mno MCP servers configured — add some to {}\x1b[0m\n",
-                path.display()
-            ));
+    /// The config locations to scan, highest precedence first: project
+    /// `.mcp.json`, Zero's own file, then imports from Claude Desktop / Claude
+    /// Code. Tests set only `mcp_path`, so they read just that file.
+    fn mcp_candidates(&self) -> Vec<(mcp::Source, PathBuf)> {
+        let mut c = Vec::new();
+        if let Some(cwd) = &self.mcp_cwd {
+            c.push((mcp::Source::Project, cwd.join(".mcp.json")));
         }
+        if let Some(p) = &self.mcp_path {
+            c.push((mcp::Source::Zero, p.clone()));
+        }
+        if let Some(home) = &self.mcp_home {
+            c.push((
+                mcp::Source::ClaudeDesktop,
+                home.join("Library/Application Support/Claude/claude_desktop_config.json"),
+            ));
+            c.push((mcp::Source::ClaudeCode, home.join(".claude.json")));
+        }
+        c
+    }
+
+    /// Startup auto-connect: like `/mcp`, but silent when no servers are
+    /// configured anywhere (a fresh install prints nothing at launch).
+    fn autoconnect_mcp(&mut self) -> io::Result<()> {
+        let cwd = self.mcp_cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+        if mcp::discover(&self.mcp_candidates(), &cwd)
+            .servers
+            .is_empty()
+        {
+            return Ok(());
+        }
+        self.connect_mcp()
+    }
+
+    /// Discover MCP servers across all sources and connect any not yet connected
+    /// (blocking, best-effort), reporting the outcome and origin per server.
+    fn connect_mcp(&mut self) -> io::Result<()> {
+        let cwd = self.mcp_cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+        let found = mcp::discover(&self.mcp_candidates(), &cwd);
+
+        // Surface (but don't fail on) a config that exists yet won't parse.
+        for (source, path, msg) in &found.errors {
+            self.write_text(&format!(
+                "\x1b[31mmcp config ({}): {msg}\x1b[0m \x1b[2m{path}\x1b[0m\n",
+                source.label()
+            ))?;
+        }
+
+        if found.servers.is_empty() {
+            if found.errors.is_empty() {
+                self.write_text(
+                    "\x1b[2mno MCP servers found — add some to ~/.zero/mcp.json, or configure \
+                     them in Claude Desktop / Claude Code and they'll be imported\x1b[0m\n",
+                )?;
+            }
+            return Ok(());
+        }
+
         self.write_text("\x1b[2mconnecting MCP servers…\x1b[0m\n")?;
         self.out.flush()?;
-        for (name, spec) in &cfg.servers {
-            if self.mcp.iter().any(|c| &c.name == name) {
-                self.write_text(&format!("  \x1b[2m• {name} already connected\x1b[0m\n"))?;
+        for d in &found.servers {
+            if self.mcp.iter().any(|c| c.name == d.name) {
+                self.write_text(&format!("  \x1b[2m• {} already connected\x1b[0m\n", d.name))?;
                 continue;
             }
-            match mcp::Connection::connect(name, spec) {
+            match mcp::Connection::connect(&d.name, &d.spec) {
                 Ok(conn) => {
                     let n = conn.tools.len();
                     self.mcp.push(conn);
                     self.write_text(&format!(
-                        "  \x1b[32m✓\x1b[0m {name} \x1b[2m— {n} tools\x1b[0m\n"
+                        "  \x1b[32m✓\x1b[0m {} \x1b[2m— {n} tools (from {})\x1b[0m\n",
+                        d.name,
+                        d.source.label()
                     ))?;
                 }
                 Err(e) => {
-                    self.write_text(&format!("  \x1b[31m✗ {name} — {e}\x1b[0m\n"))?;
+                    self.write_text(&format!("  \x1b[31m✗ {} — {e}\x1b[0m\n", d.name))?;
                 }
             }
         }
@@ -1682,7 +1747,11 @@ impl<I: Input, W: Write> App<I, W> {
             ('K', "/connect <n>", "attach to a discovered model"),
             ('K', "/model <name>", "switch model on the current endpoint"),
             ('K', "/servers", "list saved servers"),
-            ('K', "/mcp", "connect MCP servers (/mcp tools lists tools)"),
+            (
+                'K',
+                "/mcp",
+                "import MCP servers (Claude Desktop/Code + .mcp.json) & connect",
+            ),
             (
                 'K',
                 "/clip [n]",
@@ -2084,11 +2153,11 @@ mod tests {
     }
 
     #[test]
-    fn mcp_without_config_path_reports_it() {
-        let mut a = app(b"");
+    fn mcp_with_no_sources_reports_nothing_found() {
+        let mut a = app(b""); // no mcp_path, no discovery dirs
         type_str(&mut a, "/mcp");
         a.dispatch(Key::Enter).unwrap();
-        assert!(rendered(&a).contains("no MCP config path"));
+        assert!(rendered(&a).contains("no MCP servers found"));
     }
 
     #[test]
@@ -2100,6 +2169,64 @@ mod tests {
     }
 
     #[test]
+    fn mcp_imports_servers_from_claude_desktop_config() {
+        // The real-world UX: a Claude Desktop config exists under $HOME and Zero
+        // imports its servers without any ~/.zero/mcp.json. Uses a fake HOME and
+        // an `sh` stdio mock server so the connect path runs end to end.
+        let home =
+            std::env::temp_dir().join(format!("zero-home-{}-{}", std::process::id(), line!()));
+        let claude_dir = home.join("Library/Application Support/Claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let script = "read a; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}'; read b; read c; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"ping\",\"description\":\"p\"}]}}'";
+        let cfg = format!(
+            r#"{{"mcpServers":{{"imported":{{"command":"sh","args":["-c",{}]}}}}}}"#,
+            zero_core::json::Value::Str(script.to_string()).to_json()
+        );
+        std::fs::write(claude_dir.join("claude_desktop_config.json"), cfg).unwrap();
+
+        let mut a = app(b"");
+        a.set_mcp_discovery(Some(home.clone()), Some(home.join("proj")));
+        type_str(&mut a, "/mcp");
+        a.dispatch(Key::Enter).unwrap();
+        let out = rendered(&a);
+        assert!(out.contains("imported"), "server name shown: {out}");
+        assert!(out.contains("Claude Desktop"), "source shown: {out}");
+        assert!(out.contains('✓'));
+        assert_eq!(a.mcp.len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn autoconnect_is_silent_with_no_servers_but_connects_when_present() {
+        // No sources at all → autoconnect prints nothing.
+        let mut a = app(b"");
+        a.autoconnect_mcp().unwrap();
+        assert!(
+            rendered(&a).is_empty(),
+            "should be silent: {:?}",
+            rendered(&a)
+        );
+
+        // With a configured server, autoconnect spawns + reports it at startup.
+        let home =
+            std::env::temp_dir().join(format!("zero-auto-{}-{}", std::process::id(), line!()));
+        let claude_dir = home.join("Library/Application Support/Claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let script = "read a; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}'; read b; read c; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}'";
+        let cfg = format!(
+            r#"{{"mcpServers":{{"auto":{{"command":"sh","args":["-c",{}]}}}}}}"#,
+            zero_core::json::Value::Str(script.to_string()).to_json()
+        );
+        std::fs::write(claude_dir.join("claude_desktop_config.json"), cfg).unwrap();
+        let mut b = app(b"");
+        b.set_mcp_discovery(Some(home.clone()), Some(home.join("p")));
+        b.autoconnect_mcp().unwrap();
+        assert!(rendered(&b).contains("auto"));
+        assert_eq!(b.mcp.len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn mcp_empty_config_is_reported() {
         let path = std::env::temp_dir().join(format!("zero-mcp-empty-{}.json", std::process::id()));
         std::fs::write(&path, "{}").unwrap();
@@ -2107,7 +2234,7 @@ mod tests {
         a.set_mcp_path(Some(path.clone()));
         type_str(&mut a, "/mcp");
         a.dispatch(Key::Enter).unwrap();
-        assert!(rendered(&a).contains("no MCP servers configured"));
+        assert!(rendered(&a).contains("no MCP servers found"));
         std::fs::remove_file(&path).ok();
     }
 
@@ -2188,7 +2315,7 @@ mod tests {
         a.set_mcp_path(Some(path.clone()));
         type_str(&mut a, "/mcp");
         a.dispatch(Key::Enter).unwrap();
-        assert!(rendered(&a).contains("mcp config:"));
+        assert!(rendered(&a).contains("mcp config ("));
         std::fs::remove_file(&path).ok();
     }
 

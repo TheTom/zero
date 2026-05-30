@@ -203,7 +203,19 @@ model can't run away.
 
 Zero speaks the [Model Context Protocol](https://modelcontextprotocol.io) over
 the stdio transport (zero-dep: a subprocess + JSON-RPC over its pipes, one
-message per line). Define servers in `~/.zero/mcp.json`, Claude-compatible shape:
+message per line).
+
+**You don't have to redeclare servers you already use, or even run a command.**
+Zero auto-connects configured MCP servers at startup, importing them from the
+tools where they already live, in this precedence order (`/mcp` re-runs it):
+
+1. `./.mcp.json` — the project's own servers (highest precedence)
+2. `~/.zero/mcp.json` — Zero's own file
+3. **Claude Desktop** — `~/Library/Application Support/Claude/claude_desktop_config.json`
+4. **Claude Code** — `~/.claude.json` (global + the current project's servers)
+
+Same name in two sources → the higher-precedence one wins. To add a server just
+for Zero, drop it in `~/.zero/mcp.json` (Claude-compatible shape):
 
 ```json
 {
@@ -217,10 +229,16 @@ message per line). Define servers in `~/.zero/mcp.json`, Claude-compatible shape
 }
 ```
 
+Servers connect automatically on launch (silent if none are configured). The
+commands re-run or inspect that:
+
 ```
-/mcp          connect configured servers and show what each advertises
+/mcp          re-discover from all sources + connect them (shows origin)
 /mcp tools    list every discovered tool (name · server · description)
 ```
+
+HTTP/SSE servers (a `url` instead of a `command`) are skipped — Zero is
+stdio-only for now.
 
 > **Discovery only for now.** `/mcp` connects and lists the tools a server
 > exposes, but the model can't *call* them yet — that needs the agentic

@@ -38,18 +38,13 @@ impl McpConfig {
     }
 
     /// Parse the JSON config text. Unknown/extra keys are ignored; a server
-    /// entry missing `command` is skipped.
+    /// entry missing `command` (e.g. an HTTP/SSE server) is skipped — Zero only
+    /// speaks the stdio transport.
     pub fn parse(text: &str) -> Result<McpConfig, String> {
         let v = Value::parse(text).map_err(|e| e.to_string())?;
-        let mut servers = Vec::new();
-        if let Some(Value::Object(entries)) = v.get("mcpServers") {
-            for (name, spec) in entries {
-                if let Some(s) = parse_spec(spec) {
-                    servers.push((name.clone(), s));
-                }
-            }
-        }
-        Ok(McpConfig { servers })
+        Ok(McpConfig {
+            servers: servers_from_value(&v),
+        })
     }
 
     /// Load from a path, returning an empty config if the file does not exist.
@@ -62,6 +57,135 @@ impl McpConfig {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Extract `(name, spec)` pairs from a value's `mcpServers` object. Stdio-only:
+/// entries without a `command` are skipped. Shared by every config source —
+/// Claude Desktop, Claude Code, Zero, and project `.mcp.json` all use this shape.
+fn servers_from_value(v: &Value) -> Vec<(String, ServerSpec)> {
+    let mut out = Vec::new();
+    if let Some(Value::Object(entries)) = v.get("mcpServers") {
+        for (name, spec) in entries {
+            if let Some(s) = parse_spec(spec) {
+                out.push((name.clone(), s));
+            }
+        }
+    }
+    out
+}
+
+/// Where a discovered server's config came from — for display and precedence.
+/// Zero imports MCP servers you've already configured in other tools rather than
+/// demanding its own file, the way Claude Code / pi / hermes do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// `./.mcp.json` in the working directory (highest precedence).
+    Project,
+    /// `~/.zero/mcp.json` — Zero's own file.
+    Zero,
+    /// Claude Desktop's `claude_desktop_config.json`.
+    ClaudeDesktop,
+    /// Claude Code's `~/.claude.json` (global + the current project's entry).
+    ClaudeCode,
+}
+
+impl Source {
+    /// Short human label for the `/mcp` summary.
+    pub fn label(self) -> &'static str {
+        match self {
+            Source::Project => "project .mcp.json",
+            Source::Zero => "~/.zero/mcp.json",
+            Source::ClaudeDesktop => "Claude Desktop",
+            Source::ClaudeCode => "Claude Code",
+        }
+    }
+}
+
+/// A server found during discovery, tagged with which config it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discovered {
+    pub name: String,
+    pub spec: ServerSpec,
+    pub source: Source,
+}
+
+/// The result of scanning all config sources: the merged server list plus any
+/// per-source parse errors (a broken config from one tool never blocks the rest).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Discovery {
+    pub servers: Vec<Discovered>,
+    /// `(source, path-as-string, message)` for files that existed but failed to
+    /// parse — surfaced as warnings, not hard failures.
+    pub errors: Vec<(Source, String, String)>,
+}
+
+/// The standard config locations, highest precedence first. `home` is `$HOME`,
+/// `cwd` the working directory, `zero_dir` Zero's dot-dir name (e.g. `.zero`).
+pub fn default_sources(
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    zero_dir: &str,
+) -> Vec<(Source, std::path::PathBuf)> {
+    vec![
+        (Source::Project, cwd.join(".mcp.json")),
+        (Source::Zero, home.join(zero_dir).join("mcp.json")),
+        (
+            Source::ClaudeDesktop,
+            home.join("Library/Application Support/Claude/claude_desktop_config.json"),
+        ),
+        (Source::ClaudeCode, home.join(".claude.json")),
+    ]
+}
+
+/// Read one config file. A missing file yields no servers and no error (it's just
+/// absent); a present-but-malformed file yields no servers and a surfaced error.
+/// For `ClaudeCode`, also pulls the per-project `projects.<cwd>.mcpServers` entry.
+fn read_source(
+    source: Source,
+    path: &std::path::Path,
+    cwd: &std::path::Path,
+) -> (Vec<(String, ServerSpec)>, Option<String>) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return (Vec::new(), None), // absent — silently skip
+    };
+    let v = match Value::parse(&text) {
+        Ok(v) => v,
+        Err(e) => return (Vec::new(), Some(e.to_string())),
+    };
+    let mut servers = servers_from_value(&v);
+    if source == Source::ClaudeCode {
+        // ~/.claude.json nests per-project config under projects.<abs-path>.
+        let key = cwd.to_string_lossy();
+        if let Some(proj) = v.get("projects").and_then(|p| p.get(&key)) {
+            servers.extend(servers_from_value(proj));
+        }
+    }
+    (servers, None)
+}
+
+/// Scan `candidates` (in precedence order) and merge into one server list,
+/// first-seen-name wins. Stdio-only servers; collects per-source parse errors.
+pub fn discover(candidates: &[(Source, std::path::PathBuf)], cwd: &std::path::Path) -> Discovery {
+    let mut seen = std::collections::HashSet::new();
+    let mut servers = Vec::new();
+    let mut errors = Vec::new();
+    for (source, path) in candidates {
+        let (found, err) = read_source(*source, path, cwd);
+        if let Some(msg) = err {
+            errors.push((*source, path.to_string_lossy().into_owned(), msg));
+        }
+        for (name, spec) in found {
+            if seen.insert(name.clone()) {
+                servers.push(Discovered {
+                    name,
+                    spec,
+                    source: *source,
+                });
+            }
+        }
+    }
+    Discovery { servers, errors }
 }
 
 fn parse_spec(v: &Value) -> Option<ServerSpec> {
@@ -499,5 +623,128 @@ mod tests {
                 .collect();
             let _ = McpConfig::parse(&text); // Ok or Err, never panic
         }
+    }
+
+    // --- discovery / multi-source import ---------------------------------
+
+    fn write(dir: &std::path::Path, rel: &str, text: &str) -> std::path::PathBuf {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    fn srv(name: &str, cmd: &str) -> String {
+        format!(r#""{name}":{{"command":"{cmd}","args":[]}}"#)
+    }
+
+    #[test]
+    fn default_sources_lists_known_locations_in_precedence_order() {
+        let home = std::path::Path::new("/home/u");
+        let cwd = std::path::Path::new("/work/proj");
+        let s = default_sources(home, cwd, ".zero");
+        let kinds: Vec<Source> = s.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                Source::Project,
+                Source::Zero,
+                Source::ClaudeDesktop,
+                Source::ClaudeCode
+            ]
+        );
+        assert_eq!(s[0].1, cwd.join(".mcp.json"));
+        assert_eq!(s[1].1, home.join(".zero/mcp.json"));
+    }
+
+    #[test]
+    fn discover_merges_sources_with_first_seen_name_winning() {
+        let dir =
+            std::env::temp_dir().join(format!("zero-disc-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Project and Zero both define `shared`; project (higher precedence) wins.
+        let proj = write(
+            &dir,
+            "proj/.mcp.json",
+            &format!(
+                r#"{{"mcpServers":{{{},{}}}}}"#,
+                srv("shared", "from_proj"),
+                srv("only_proj", "p")
+            ),
+        );
+        let zero = write(
+            &dir,
+            "zero/mcp.json",
+            &format!(
+                r#"{{"mcpServers":{{{},{}}}}}"#,
+                srv("shared", "from_zero"),
+                srv("only_zero", "z")
+            ),
+        );
+        let cands = vec![(Source::Project, proj), (Source::Zero, zero)];
+        let d = discover(&cands, &dir);
+        let names: Vec<&str> = d.servers.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"shared")
+                && names.contains(&"only_proj")
+                && names.contains(&"only_zero")
+        );
+        let shared = d.servers.iter().find(|s| s.name == "shared").unwrap();
+        assert_eq!(shared.spec.command, "from_proj"); // project won
+        assert_eq!(shared.source, Source::Project);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discover_reads_claude_code_global_and_per_project() {
+        let dir = std::env::temp_dir().join(format!("zero-cc-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.join("myproj");
+        // ~/.claude.json: a global server + a per-project server keyed by cwd.
+        let claude = write(
+            &dir,
+            ".claude.json",
+            &format!(
+                r#"{{"mcpServers":{{{}}},"projects":{{"{}":{{"mcpServers":{{{}}}}}}}}}"#,
+                srv("global_srv", "g"),
+                cwd.display(),
+                srv("proj_srv", "p"),
+            ),
+        );
+        let d = discover(&[(Source::ClaudeCode, claude)], &cwd);
+        let names: Vec<&str> = d.servers.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"global_srv"), "global: {names:?}");
+        assert!(names.contains(&"proj_srv"), "per-project: {names:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discover_skips_missing_files_and_surfaces_parse_errors() {
+        let dir = std::env::temp_dir().join(format!("zero-err-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = write(&dir, "bad.json", "{not json");
+        let missing = dir.join("nope.json");
+        let d = discover(&[(Source::Zero, bad), (Source::Project, missing)], &dir);
+        assert!(d.servers.is_empty());
+        assert_eq!(d.errors.len(), 1); // only the present-but-broken file
+        assert_eq!(d.errors[0].0, Source::Zero);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discover_skips_non_stdio_http_servers() {
+        let dir =
+            std::env::temp_dir().join(format!("zero-http-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // An HTTP server has a `url`, no `command` — Zero is stdio-only, skip it.
+        let cfg = write(
+            &dir,
+            "mcp.json",
+            r#"{"mcpServers":{"remote":{"type":"http","url":"https://x"},"local":{"command":"sh","args":[]}}}"#,
+        );
+        let d = discover(&[(Source::Zero, cfg)], &dir);
+        let names: Vec<&str> = d.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["local"]); // remote (no command) dropped
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

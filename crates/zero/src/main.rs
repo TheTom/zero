@@ -79,8 +79,10 @@ fn run(args: &Args) -> std::io::Result<()> {
     let mut app = App::new(term, std::io::stdout(), backend, log);
     app.set_config(cfg.clone(), Some(cfg_path.clone()), servers_path());
     app.set_info(format!("{}\nconfig: {}", cfg.summary(), cfg_path.display()));
-    // MCP server definitions live next to the config (~/.zero/mcp.json).
+    // MCP server definitions live next to the config (~/.zero/mcp.json), and are
+    // also imported from Claude Desktop / Claude Code + the project's .mcp.json.
     app.set_mcp_path(cfg_path.parent().map(|d| d.join("mcp.json")));
+    app.set_mcp_discovery(home(), std::env::current_dir().ok());
     app.run()
 }
 
