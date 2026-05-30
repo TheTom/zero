@@ -85,6 +85,19 @@ pub fn definitions() -> Vec<ToolDef> {
                 ("new_string", "string", "Replacement text.", true),
             ]),
         ),
+        ToolDef::new(
+            "bash",
+            // The steering lives in the description (belt; the harness output cap
+            // is the actual guarantee): nudge toward scoped, low-output commands so
+            // a local model's small window isn't blown by an unbounded dump.
+            "Run a shell command via `sh -c` and return its combined output + exit \
+             code. Prefer scoped, low-output commands: pass paths to grep/ls rather \
+             than searching the whole tree, use `head`/`grep -c`/`-l` and `--json` \
+             where available, and read a file with read_file (offset/limit) instead \
+             of `cat`. Huge output is capped (with the full result saved to a file \
+             you can re-read), so narrow the command rather than relying on that.",
+            schema(&[("command", "string", "The shell command to run.", true)]),
+        ),
     ]
 }
 
@@ -388,6 +401,14 @@ mod tests {
             assert!(is_builtin(n));
         }
         assert!(!is_builtin("run_shell"));
+        // bash is ADVERTISED (the model can call it) but is NOT a builtins::execute
+        // tool — it's gated + run in the frontend (needs the safety/mode gate).
+        assert!(names.contains(&"bash".to_string()), "bash not advertised");
+        assert!(!is_builtin("bash"));
+        // calling it through execute() is therefore an explicit error.
+        assert!(execute("bash", r#"{"command":"echo hi"}"#, None)
+            .unwrap_err()
+            .contains("unknown tool"));
     }
 
     #[test]

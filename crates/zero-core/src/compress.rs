@@ -654,6 +654,51 @@ mod tests {
     }
 
     #[test]
+    fn generic_donut_keeps_both_head_and_tail_when_budget_allows() {
+        // ASCII (clean boundaries), budget large enough that head and tail don't
+        // overlap → exercises the both-kept branch (not the head-only fallback).
+        let s = "a".repeat(5000);
+        let c = compress("./x", &s, 2000, art());
+        assert_eq!(c.shape, OutputShape::Generic);
+        assert!(c.text.starts_with("aaaa"));
+        assert!(c.text.ends_with("aaaa\n") || c.text.ends_with("aaaa"));
+        assert!(c.text.contains("elided"));
+        // Both ends present means the elision marker sits in the middle.
+        let mid = c.text.find("elided").unwrap();
+        assert!(mid > 100 && mid < c.text.len() - 100);
+    }
+
+    #[test]
+    fn grep_few_matches_short_bodies_are_not_ellipsized() {
+        // ≤40 matches with short bodies → kept verbatim (no trailing …).
+        let mut s = String::new();
+        for i in 0..5 {
+            s.push_str(&format!("src/a.rs:{}: short body\n", i + 1));
+        }
+        // Force the compressor (over budget) without crossing MAX_REFS.
+        let c = compress("grep x .", &s, 10, art());
+        assert_eq!(c.shape, OutputShape::Grep);
+        assert!(c.text.contains("src/a.rs:1: short body"));
+        assert!(!c.text.contains('…')); // short bodies kept whole
+    }
+
+    #[test]
+    fn grep_counts_no_overflow_marker_when_six_or_fewer_per_file() {
+        // >40 total (count branch) but a file with ≤6 matches shows its lines
+        // with no ",…+N" overflow suffix.
+        let mut s = String::new();
+        for i in 0..41 {
+            s.push_str(&format!("big.rs:{}: body\n", i + 1));
+        }
+        for i in 0..3 {
+            s.push_str(&format!("small.rs:{}: body\n", i + 1));
+        }
+        let c = compress("grep x .", &s, 200, art());
+        assert!(c.text.contains("small.rs: 3 matches (lines 1,2,3)"));
+        assert!(!c.text.contains("small.rs: 3 matches (lines 1,2,3,…"));
+    }
+
+    #[test]
     fn grep_counts_show_overflow_marker_past_six_lines() {
         // A file with >6 matches exercises the ",…+N" overflow in the count form.
         let mut s = String::new();

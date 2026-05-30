@@ -191,15 +191,23 @@ bottom, so the prompt is live the whole time:
 
 `/tools` toggles the agentic tool loop. With it on, a submitted message runs a
 non-streaming loop: the model can call built-in tools — `read_file`, `list_dir`,
-`grep`, `write_file`, `edit_file` — and Zero feeds each result back until the
-model answers in plain text. Tool calls and results show inline (`⚙ name(args)`
-/ `↳ result`).
+`grep`, `write_file`, `edit_file`, `bash` — and Zero feeds each result back until
+the model answers in plain text. Tool calls and results show inline
+(`⚙ name(args)` / `↳ result`).
 
 Gating follows the mode (Shift+Tab): read-only tools always run; **file-modifying
 tools (`write_file`/`edit_file`) run only in auto-accept mode** — in normal mode
 they're refused with a message the model can act on. Paths are confined to the
 working directory. The loop is bounded (step cap + doom-loop guard) so a local
 model can't run away.
+
+**`bash`** runs a shell command via the same destructive-command guard as `!`
+shell mode: dangerous commands (`rm -rf`, `dd`, fork bombs, …) are **hard-refused
+in every mode** (the loop can't pause for a y/N, and Zero never auto-runs them);
+**plan mode refuses all shell** (planning isn't executing). Its output — the
+biggest context sink for CLI-style work — flows through the recoverable
+compression below, so a `grep -rn` or `gh pr diff` dump is shape-compressed and
+spilled to a re-readable file rather than flooding the window.
 
 > Non-streaming on purpose: local servers' *streaming* tool-call parsers are
 > buggy (calls split/lost across chunks), so the loop reads each turn whole. Zero

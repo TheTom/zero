@@ -1991,6 +1991,12 @@ fn copy_with(candidates: &[(&str, &[&str])], text: &str) -> io::Result<()> {
 /// to the model (an error string is fine — it self-corrects).
 fn gate_and_execute(mode: Mode, call: &ToolCall, root: Option<&std::path::Path>) -> String {
     use zero_core::builtins;
+    // bash is advertised by builtins::definitions() but executed here, because
+    // shell exec needs the mode + safety gate (like the `!` shell mode) — it is
+    // intentionally NOT a builtins::execute() tool.
+    if call.name == "bash" {
+        return gate_and_run_bash(mode, call);
+    }
     if !builtins::is_builtin(&call.name) {
         return format!("error: unknown tool {}", call.name);
     }
@@ -2003,6 +2009,60 @@ fn gate_and_execute(mode: Mode, call: &ToolCall, root: Option<&std::path::Path>)
     match builtins::execute(&call.name, &call.arguments, root) {
         Ok(out) => out,
         Err(e) => format!("error: {e}"),
+    }
+}
+
+/// Gate + run a `bash` tool call. Plan mode refuses all shell (planning ≠ acting);
+/// the destructive-command classifier hard-refuses dangerous commands in every
+/// mode (the synchronous loop can't pause for an interactive y/N, and we never
+/// auto-run `rm -rf`); otherwise the command runs and its combined output + exit
+/// code come back (capping happens upstream in cap_tool_result).
+fn gate_and_run_bash(mode: Mode, call: &ToolCall) -> String {
+    let Some(cmd) = zero_core::tools::parse_arguments(call)
+        .ok()
+        .and_then(|a| a.get("command").and_then(|v| v.as_str().map(String::from)))
+    else {
+        return "error: bash requires a 'command' string argument".to_string();
+    };
+    if mode == Mode::Plan {
+        return "refused: shell commands don't run in plan mode — outline the \
+                approach instead, or switch mode (Shift+Tab) to execute"
+            .to_string();
+    }
+    let verdict = zero_core::safety::classify(&cmd);
+    if verdict.is_dangerous() {
+        return format!(
+            "refused: this command looks destructive ({}) and is blocked. If it's \
+             intended, run it yourself in a shell.",
+            verdict.reason.unwrap_or("flagged by the safety guard")
+        );
+    }
+    run_bash_capture(&cmd)
+}
+
+/// Run `cmd` via `sh -c`, returning combined stdout + stderr + an exit-code line.
+/// Pure-ish (only spawns a process); the model-facing capping is applied by the
+/// caller so it goes through the same spill+compress path as every tool result.
+fn run_bash_capture(cmd: &str) -> String {
+    match std::process::Command::new("sh").arg("-c").arg(cmd).output() {
+        Ok(out) => {
+            let mut s = String::new();
+            s.push_str(&String::from_utf8_lossy(&out.stdout));
+            let err = String::from_utf8_lossy(&out.stderr);
+            if !err.is_empty() {
+                if !s.is_empty() && !s.ends_with('\n') {
+                    s.push('\n');
+                }
+                s.push_str(&err);
+            }
+            if !s.is_empty() && !s.ends_with('\n') {
+                s.push('\n');
+            }
+            let code = out.status.code().unwrap_or(-1);
+            s.push_str(&format!("[exit {code}]"));
+            s
+        }
+        Err(e) => format!("error: failed to run command: {e}"),
     }
 }
 
@@ -2661,6 +2721,47 @@ mod tests {
     }
 
     #[test]
+    fn bash_runs_a_safe_command_and_returns_output_and_exit() {
+        let call = ToolCall::new("c", "bash", r#"{"command":"echo hello-bash"}"#);
+        let out = gate_and_execute(Mode::Normal, &call, None);
+        assert!(out.contains("hello-bash"));
+        assert!(out.contains("[exit 0]"));
+    }
+
+    #[test]
+    fn bash_reports_nonzero_exit_and_stderr() {
+        let call = ToolCall::new("c", "bash", r#"{"command":"echo oops >&2; exit 3"}"#);
+        let out = gate_and_execute(Mode::AutoAccept, &call, None);
+        assert!(out.contains("oops")); // stderr captured
+        assert!(out.contains("[exit 3]"));
+    }
+
+    #[test]
+    fn bash_refuses_dangerous_commands_in_every_mode() {
+        let call = ToolCall::new("c", "bash", r#"{"command":"rm -rf /"}"#);
+        for mode in [Mode::Normal, Mode::AutoAccept] {
+            let out = gate_and_execute(mode, &call, None);
+            assert!(out.contains("refused"), "danger not blocked in {mode:?}");
+            assert!(out.contains("destructive"));
+        }
+    }
+
+    #[test]
+    fn bash_refuses_in_plan_mode() {
+        let call = ToolCall::new("c", "bash", r#"{"command":"echo hi"}"#);
+        let out = gate_and_execute(Mode::Plan, &call, None);
+        assert!(out.contains("refused"));
+        assert!(out.contains("plan mode"));
+    }
+
+    #[test]
+    fn bash_without_command_arg_errors() {
+        let call = ToolCall::new("c", "bash", r#"{"wrong":"x"}"#);
+        let out = gate_and_execute(Mode::Normal, &call, None);
+        assert!(out.contains("requires a 'command'"));
+    }
+
+    #[test]
     fn tool_desc_snippet_collapses_and_caps() {
         // Multi-line / multi-space descriptions collapse to one capped line.
         assert_eq!(tool_desc_snippet("short desc"), "short desc");
@@ -2809,6 +2910,88 @@ mod tests {
         let out = rendered(&a);
         assert!(out.contains("context savings"));
         assert!(out.contains("smaller window"));
+    }
+
+    #[test]
+    fn tool_turn_runs_bash_and_caps_its_output() {
+        // End-to-end: the model calls bash, the executor runs it, and the big
+        // output is spilled+compressed (the Log-B sink, now bounded). Proves bash
+        // output flows through the same recoverable cap path as every tool.
+        use std::sync::Mutex;
+        struct BashBackend {
+            step: Arc<Mutex<u32>>,
+        }
+        impl Backend for BashBackend {
+            fn name(&self) -> &str {
+                "bash"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                sink(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+            fn complete(
+                &self,
+                _c: &Conversation,
+                _t: &[ToolDef],
+                _to: Duration,
+            ) -> Result<zero_core::backend::Completion, zero_core::backend::BackendError>
+            {
+                let mut step = self.step.lock().unwrap();
+                *step += 1;
+                if *step == 1 {
+                    Ok(zero_core::backend::Completion {
+                        content: String::new(),
+                        // Emit ~5000 lines → well over the tiny cap below.
+                        tool_calls: vec![ToolCall::new(
+                            "b1",
+                            "bash",
+                            r#"{"command":"seq 1 5000"}"#,
+                        )],
+                    })
+                } else {
+                    Ok(zero_core::backend::Completion {
+                        content: "done".to_string(),
+                        tool_calls: vec![],
+                    })
+                }
+            }
+        }
+        let dir =
+            std::env::temp_dir().join(format!("zero-bash-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(BashBackend {
+                step: Arc::new(Mutex::new(0)),
+            }),
+            None,
+        );
+        a.tools_enabled = true;
+        a.max_tool_output = 256;
+        a.set_artifact_dir(Some(dir.clone()));
+        a.run_tool_turn("count to 5000").unwrap();
+
+        // The bash result in history is capped (much smaller than 5000 lines).
+        let tool_msg = a
+            .conv
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool result");
+        assert!(tool_msg.content.len() < 2000, "bash output not capped");
+        assert!(tool_msg.content.contains("elided"));
+        // Recoverable: the full output spilled byte-identical and is referenced.
+        assert!(tool_msg.content.contains("full output:"));
+        let art = dir.join("out-b1.txt");
+        let full = std::fs::read_to_string(&art).unwrap();
+        assert!(full.contains("\n5000\n") || full.ends_with("5000\n[exit 0]"));
+        assert!(a.context_stats.capped_saved > 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
