@@ -116,7 +116,7 @@ pub fn detect(cmd: &str, raw: &[u8]) -> OutputShape {
         return s;
     }
     // First-bytes sniff for unknown commands.
-    let head: String = String::from_utf8_lossy(&raw[..raw.len().min(2048)]).into_owned();
+    let head: String = String::from_utf8_lossy(&raw[..raw.len().min(SNIFF)]).into_owned();
     let first = head.trim_start().chars().next();
     if head.starts_with("diff --git") {
         return OutputShape::Diff;
@@ -132,12 +132,29 @@ pub fn detect(cmd: &str, raw: &[u8]) -> OutputShape {
             return OutputShape::Grep;
         }
     }
-    // log shape: severity keyword in head or tail.
+    // log shape: severity keyword in the head sniff.
     if has_severity(&head) {
         return OutputShape::Log;
     }
+    // Tier 2 — deep-needle escalation. The head sniff only saw the first ~2 KB;
+    // a log-shaped output from an unrecognized verb (`./build.sh`, a custom
+    // runner) can carry its first error far past that. Only worth scanning the
+    // remainder when the output is big enough that the donut would actually drop
+    // the middle. Overlap the boundary by the longest token so a severity word
+    // split across the 2 KB cut isn't missed by both passes.
+    if raw.len() > SNIFF {
+        let from = SNIFF.saturating_sub(MAX_SEVERITY_LEN);
+        if contains_severity_bytes(&raw[from..]) {
+            return OutputShape::Log;
+        }
+    }
     OutputShape::Generic
 }
+
+/// Bytes of the head sniff window used by [`detect`].
+const SNIFF: usize = 2048;
+/// Longest [`SEVERITY`] token ("assertion failed") — the boundary overlap.
+const MAX_SEVERITY_LEN: usize = 16;
 
 fn starts_any(s: &str, prefixes: &[&str]) -> bool {
     prefixes.iter().any(|p| s.starts_with(p))
@@ -168,6 +185,25 @@ const SEVERITY: &[&str] = &[
 
 fn has_severity(s: &str) -> bool {
     SEVERITY.iter().any(|k| s.contains(k))
+}
+
+/// True if any severity token occurs anywhere in `raw`. Byte-level, no alloc,
+/// single pass with a first-byte gate so the common no-match case stays ~O(n).
+/// Backs the deep-needle escalation in [`detect`]: a log-shaped output from an
+/// unrecognized verb can carry its first `error:` far past the 2 KB head sniff,
+/// and the generic donut would drop exactly that line. Worst case O(n·k) for k
+/// short needles, sub-ms even on a multi-MB log.
+fn contains_severity_bytes(raw: &[u8]) -> bool {
+    for i in 0..raw.len() {
+        let b = raw[i];
+        for k in SEVERITY {
+            let needle = k.as_bytes();
+            if needle[0] == b && raw[i..].starts_with(needle) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn is_severity_line(l: &str) -> bool {
@@ -472,6 +508,47 @@ mod tests {
         assert_eq!(
             detect("./mytool", b"just some prose here"),
             OutputShape::Generic
+        );
+    }
+
+    #[test]
+    fn detect_finds_severity_deep_past_the_head_sniff() {
+        // GAP 1: a log-shaped output from an UNRECOGNIZED verb whose first error
+        // lands far past the 2 KB head sniff must still classify as Log — else
+        // the generic donut drops the one line that matters. Regression test for
+        // the live `./build.sh`-style miss.
+        let mut raw = vec![b'x'; 5000];
+        raw.extend_from_slice(b"\nerror: deep failure at the end\n");
+        assert_eq!(detect("./build.sh", &raw), OutputShape::Log);
+    }
+
+    #[test]
+    fn deep_severity_scan_skipped_when_output_is_small() {
+        // No escalation for sub-sniff output: a short shapeless blob with no
+        // head needle stays Generic (the donut keeps it whole anyway).
+        assert_eq!(
+            detect("./build.sh", b"all good, nothing here"),
+            OutputShape::Generic
+        );
+    }
+
+    #[test]
+    fn severity_token_straddling_the_sniff_boundary_is_still_found() {
+        // The escalation overlaps the boundary by MAX_SEVERITY_LEN, so a token
+        // cut in half at byte 2048 is caught. Place "error:" to span the cut.
+        let mut raw = vec![b'x'; SNIFF - 3];
+        raw.extend_from_slice(b"error: split across the 2KB boundary\n");
+        raw.extend_from_slice(&vec![b'y'; 1000]);
+        assert_eq!(detect("./build.sh", &raw), OutputShape::Log);
+    }
+
+    #[test]
+    fn max_severity_len_covers_the_longest_token() {
+        // Invariant the boundary-overlap relies on.
+        let longest = SEVERITY.iter().map(|s| s.len()).max().unwrap();
+        assert!(
+            MAX_SEVERITY_LEN >= longest,
+            "overlap {MAX_SEVERITY_LEN} < longest token {longest}"
         );
     }
 
