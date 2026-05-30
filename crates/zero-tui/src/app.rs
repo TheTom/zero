@@ -405,6 +405,51 @@ impl<I: Input, W: Write> App<I, W> {
         self.artifact_dir = dir;
     }
 
+    /// Turn the agentic tool loop on/off (the `/tools` toggle, exposed for
+    /// headless runs and integration tests).
+    pub fn set_tools_enabled(&mut self, on: bool) {
+        self.tools_enabled = on;
+    }
+
+    /// Read-only view of the live conversation (for headless callers and
+    /// integration tests that assert on what was fed back to the model).
+    pub fn conversation(&self) -> &Conversation {
+        &self.conv
+    }
+
+    /// Measured context-savings stats for this session (`/context`).
+    pub fn context_stats(&self) -> &zero_core::context::ContextStats {
+        &self.context_stats
+    }
+
+    /// Run a single turn headlessly and return the assistant's final reply.
+    /// Uses the agentic tool loop when tools are enabled (so `bash`/builtins run
+    /// and their output flows through the spill+compress path), otherwise a bare
+    /// non-streaming completion. The turn's trace (tool calls, inline text) is
+    /// written to the output sink as usual; the binary points that at stderr so
+    /// `zero -p` keeps stdout to just the returned reply.
+    pub fn run_once(&mut self, prompt: &str) -> io::Result<String> {
+        if self.tools_enabled {
+            self.run_tool_turn(prompt)?;
+        } else {
+            self.conv.push(Message::user(prompt));
+            let timeout = Duration::from_secs(120);
+            match self.backend.complete(&self.conv, &[], timeout) {
+                Ok(c) => {
+                    self.write_text(&c.content)?;
+                    self.conv.push(Message::assistant(&c.content));
+                    self.last_reply = c.content;
+                }
+                Err(e) => {
+                    self.last_reply = format!("[error: {e}]");
+                    let line = self.last_reply.clone();
+                    self.write_text(&line)?;
+                }
+            }
+        }
+        Ok(self.last_reply.clone())
+    }
+
     /// Ask the configured server for its context window (`n_ctx`) so the status
     /// line can show context usage. Best-effort and skipped in synchronous (test)
     /// mode so the unit tests never touch the network.
@@ -2283,6 +2328,11 @@ mod tests {
         a
     }
 
+    /// Serializes tests that mutate the process-global cwd (the read-cache /
+    /// path-confinement tests). cwd is per-process, so these can't run in
+    /// parallel. Poison-tolerant.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Build a synchronous app driven by chunked reads (so a streamed turn
     /// finalizes between reads before the next chunk arrives).
     fn multi_app(chunks: &[&[u8]]) -> App<MultiInput, Vec<u8>> {
@@ -3014,6 +3064,48 @@ mod tests {
         assert_eq!(sanitize_id("a/b c:d"), "abcd"); // strips path/space/colon
         assert_eq!(sanitize_id(""), "x"); // never empty
         assert_eq!(sanitize_id("///"), "x");
+    }
+
+    #[test]
+    fn run_once_without_tools_returns_reply_and_exposes_accessors() {
+        // Bare-completion headless path via the stub backend (no new uncovered
+        // code): covers run_once's non-tools arm + conversation()/context_stats().
+        // The tools-on path is covered end-to-end by the bash_replay suite.
+        let mut a = app(b"");
+        a.set_tools_enabled(false);
+        let reply = a.run_once("hello there").unwrap();
+        assert!(!reply.is_empty(), "stub should echo a reply");
+        assert_eq!(a.last_reply, reply);
+        let roles: Vec<_> = a.conversation().messages.iter().map(|m| m.role).collect();
+        assert!(roles.contains(&Role::User));
+        assert!(roles.contains(&Role::Assistant));
+        assert_eq!(a.context_stats().total_saved(), 0);
+    }
+
+    #[test]
+    fn run_once_with_tools_drives_the_loop_via_the_stub() {
+        // tools-on arm of run_once: the stub emits no tool call, so the loop
+        // finishes in one round with the stub's text. Exercises run_tool_turn
+        // through run_once without any new uncovered backend code.
+        let mut a = app(b"");
+        a.set_tools_enabled(true);
+        let reply = a.run_once("anything").unwrap();
+        assert!(!reply.is_empty());
+        assert_eq!(a.last_reply, reply);
+        assert!(a
+            .conversation()
+            .messages
+            .iter()
+            .any(|m| m.role == Role::User));
+    }
+
+    #[test]
+    fn set_tools_enabled_toggles_the_flag() {
+        let mut a = app(b"");
+        a.set_tools_enabled(true);
+        assert!(a.tools_enabled);
+        a.set_tools_enabled(false);
+        assert!(!a.tools_enabled);
     }
 
     #[test]
@@ -4660,5 +4752,109 @@ mod tests {
         a.out.clear();
         a.redraw_input().unwrap();
         assert!(rendered(&a).contains("\x1b["));
+    }
+    #[test]
+    fn run_once_then_context_command_reports_via_headless_path() {
+        // Covers run_once's tools arm + a follow-up /context render in one go,
+        // using only known-good helpers (no new backend types).
+        let mut a = app(b"");
+        a.set_tools_enabled(true);
+        let _ = a.run_once("do something").unwrap();
+        type_str(&mut a, "/context");
+        a.dispatch(Key::Enter).unwrap();
+        // Either "no tool output yet" (stub made no tool call) or a savings line —
+        // both are valid; assert the command produced a context report.
+        let out = rendered(&a);
+        assert!(out.contains("context") || out.contains("tool output"));
+    }
+    #[test]
+    fn tool_turn_read_cache_hit_returns_stub_on_second_read() {
+        // Covers the executor read-cache hit branch end to end: a read_file under
+        // the workspace root succeeds (recorded), then a second read of the same
+        // unchanged file returns the cached stub instead of re-reading.
+        use std::sync::Mutex;
+        struct TwoReads {
+            n: Arc<Mutex<u32>>,
+        }
+        impl Backend for TwoReads {
+            fn name(&self) -> &str {
+                "tworeads"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                sink(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+            fn complete(
+                &self,
+                _c: &Conversation,
+                _t: &[ToolDef],
+                _to: Duration,
+            ) -> Result<zero_core::backend::Completion, zero_core::backend::BackendError>
+            {
+                let mut n = self.n.lock().unwrap();
+                *n += 1;
+                Ok(match *n {
+                    1 | 2 => zero_core::backend::Completion {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall::new(
+                            format!("r{n}"),
+                            "read_file",
+                            r#"{"path":"f.txt"}"#,
+                        )],
+                    },
+                    _ => zero_core::backend::Completion {
+                        content: "done".to_string(),
+                        tool_calls: vec![],
+                    },
+                })
+            }
+        }
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("zero-rch-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "the file body long enough to matter").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(TwoReads {
+                n: Arc::new(Mutex::new(0)),
+            }),
+            None,
+        );
+        a.tools_enabled = true;
+        a.set_artifact_dir(Some(dir.clone()));
+        let res = a.run_tool_turn("read it twice");
+        std::env::set_current_dir(&prev).unwrap(); // restore before asserting
+        res.unwrap();
+
+        let reads: Vec<&Message> = a
+            .conv
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert_eq!(reads.len(), 2);
+        assert!(
+            reads[0].content.contains("the file body"),
+            "first read body: {}",
+            reads[0].content
+        );
+        assert!(
+            reads[1].content.contains("unchanged"),
+            "second read stub: {}",
+            reads[1].content
+        );
+        // cache hit was recorded (the file is tiny, so the stub may be larger than
+        // the would-be re-read → saturating saving of 0; the point is the branch
+        // fired and the second read did NOT re-inject the body).
+        assert!(!reads[1].content.contains("the file body"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

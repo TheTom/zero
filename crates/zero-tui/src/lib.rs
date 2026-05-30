@@ -16,7 +16,7 @@ pub mod markdown;
 pub mod term;
 pub mod viewport;
 
-pub use app::App;
+pub use app::{App, Input};
 pub use editor::LineEditor;
 pub use key::{decode_keys, Key};
 pub use term::{terminal_size, RawTerminal, Size};

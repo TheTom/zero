@@ -10,7 +10,23 @@ use zero_core::backend::{Backend, StubBackend};
 use zero_core::config::Config;
 use zero_core::openai::OpenAiBackend;
 use zero_core::session::SessionLog;
-use zero_tui::{App, RawTerminal};
+use zero_tui::{App, Input, RawTerminal};
+
+/// A no-op input source for headless runs: always at EOF (never reads keys).
+struct EofInput;
+impl Input for EofInput {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Ok(0)
+    }
+}
+
+/// Read all of stdin as the prompt (for `zero -p -`).
+fn read_stdin() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut s = String::new();
+    std::io::stdin().read_to_string(&mut s)?;
+    Ok(s)
+}
 
 fn main() -> ExitCode {
     let args = match Args::parse(std::env::args().skip(1)) {
@@ -69,6 +85,20 @@ fn run(args: &Args) -> std::io::Result<()> {
     } else {
         open_log(backend.name())
     };
+
+    // Headless one-shot (`-p`/`--print`): no raw terminal. The turn's trace goes
+    // to stderr so stdout carries only the final reply (`zero -p "…" > out.txt`).
+    // `-p -` reads the prompt from stdin.
+    if let Some(p) = &args.print {
+        let prompt = if p == "-" { read_stdin()? } else { p.clone() };
+        let mut app = App::new(EofInput, std::io::stderr(), backend, log);
+        app.set_config(cfg.clone(), Some(cfg_path.clone()), servers_path());
+        app.set_artifact_dir(outputs_dir());
+        app.set_tools_enabled(args.tools);
+        let reply = app.run_once(prompt.trim())?;
+        println!("{reply}");
+        return Ok(());
+    }
 
     let term = RawTerminal::enable().map_err(|e| {
         std::io::Error::new(
@@ -141,6 +171,10 @@ struct Args {
     model: Option<String>,
     api_key: Option<String>,
     config_path: Option<std::path::PathBuf>,
+    /// Headless one-shot prompt (`-p`/`--print`). `-` reads the prompt from stdin.
+    print: Option<String>,
+    /// Enable the agentic tool loop in a headless run (`--tools`).
+    tools: bool,
 }
 
 impl Args {
@@ -156,6 +190,8 @@ impl Args {
                 "--instant" => out.instant = true,
                 "--no-log" => out.no_log = true,
                 "--stub" => out.stub = true,
+                "--tools" => out.tools = true,
+                "-p" | "--print" => out.print = Some(take("-p")?),
                 "--url" => out.url = Some(take("--url")?),
                 "--model" => out.model = Some(take("--model")?),
                 "--api-key" => out.api_key = Some(take("--api-key")?),
@@ -189,6 +225,8 @@ fn print_usage() {
          \x20 --model <name>   model name to request\n\
          \x20 --api-key <key>  bearer token (local servers usually need none)\n\
          \x20 --config <path>  use a specific config file\n\
+         \x20 -p, --print <s>  headless: run one prompt, print the reply, exit ('-' = stdin)\n\
+         \x20 --tools          enable the agentic tool loop in a headless run\n\
          \x20 --stub           force the built-in stub backend\n\
          \x20 --instant        stub streams with no pacing delay\n\
          \x20 --no-log         do not write a session transcript\n\
@@ -209,6 +247,22 @@ mod tests {
         assert_eq!(a.url.as_deref(), Some("http://h:1"));
         assert_eq!(a.model.as_deref(), Some("qwen"));
         assert!(a.no_log);
+    }
+
+    #[test]
+    fn parses_headless_print_and_tools() {
+        let a = Args::parse(["-p", "do the thing", "--tools"].map(String::from)).unwrap();
+        assert_eq!(a.print.as_deref(), Some("do the thing"));
+        assert!(a.tools);
+        // long form + stdin sentinel
+        let b = Args::parse(["--print", "-"].map(String::from)).unwrap();
+        assert_eq!(b.print.as_deref(), Some("-"));
+        assert!(!b.tools);
+    }
+
+    #[test]
+    fn print_without_value_errors() {
+        assert!(Args::parse(["-p".to_string()]).is_err());
     }
 
     #[test]
