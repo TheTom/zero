@@ -6,11 +6,12 @@
 //! Request building and SSE-line parsing are pure and unit-tested; the network
 //! round-trip rides on the localhost-mock-tested `http` module.
 
-use crate::backend::{Backend, BackendError, StopReason, StreamEvent};
+use crate::backend::{Backend, BackendError, StopReason, StreamEvent, Usage};
 use crate::config::Config;
 use crate::http;
 use crate::json::Value;
 use crate::message::{Conversation, Message, Role};
+use std::time::Duration;
 
 /// A backend that streams from an OpenAI-compatible server.
 pub struct OpenAiBackend {
@@ -48,6 +49,12 @@ impl OpenAiBackend {
         let mut obj = vec![
             ("model".to_string(), Value::Str(self.model.clone())),
             ("stream".to_string(), Value::Bool(true)),
+            // Ask the server to append a final usage chunk so the status line can
+            // show real context usage (no client-side token estimation).
+            (
+                "stream_options".to_string(),
+                Value::Object(vec![("include_usage".to_string(), Value::Bool(true))]),
+            ),
             ("messages".to_string(), Value::Array(messages)),
         ];
         if let Some(t) = self.temperature {
@@ -73,11 +80,16 @@ impl Backend for OpenAiBackend {
             headers.push(("Authorization".to_string(), format!("Bearer {key}")));
         }
 
-        http::post_stream(&self.endpoint, &headers, &body, &mut |line| {
-            if let Some(SseEvent::Token(t)) = parse_sse_line(line) {
-                sink(StreamEvent::Token(t));
-            }
-        })
+        http::post_stream(
+            &self.endpoint,
+            &headers,
+            &body,
+            &mut |line| match parse_sse_line(line) {
+                Some(SseEvent::Token(t)) => sink(StreamEvent::Token(t)),
+                Some(SseEvent::Usage(u)) => sink(StreamEvent::Usage(u)),
+                _ => {}
+            },
+        )
         .map_err(|e| BackendError(e.to_string()))?;
 
         sink(StreamEvent::Done(StopReason::EndTurn));
@@ -85,10 +97,38 @@ impl Backend for OpenAiBackend {
     }
 }
 
+/// Fetch the model's context window (`n_ctx`) from a llama.cpp-style server's
+/// `/props` endpoint. Best-effort: any network/parse failure yields `None`.
+pub fn fetch_context_window(base_url: &str, timeout: Duration) -> Option<u64> {
+    let url = format!("{}/props", base_url.trim_end_matches('/'));
+    let (status, body) = http::get(&url, timeout).ok()?;
+    if status != 200 {
+        return None;
+    }
+    parse_context_window(&body)
+}
+
+/// Pull `n_ctx` out of a `/props` JSON body. llama.cpp nests it under
+/// `default_generation_settings`; some builds expose it at the top level.
+fn parse_context_window(body: &str) -> Option<u64> {
+    let v = Value::parse(body).ok()?;
+    let n_ctx = v
+        .get("default_generation_settings")
+        .and_then(|g| g.get("n_ctx"))
+        .or_else(|| v.get("n_ctx"))
+        .and_then(Value::as_f64)?;
+    if n_ctx > 0.0 {
+        Some(n_ctx as u64)
+    } else {
+        None
+    }
+}
+
 /// What an SSE line meant, if anything.
 #[derive(Debug, PartialEq, Eq)]
 enum SseEvent {
     Token(String),
+    Usage(Usage),
     Done,
 }
 
@@ -100,6 +140,11 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
         return Some(SseEvent::Done);
     }
     let v = Value::parse(data).ok()?;
+    // A usage chunk (sent last when `stream_options.include_usage` is set) has an
+    // empty `choices` array and a populated `usage` object.
+    if let Some(usage) = v.get("usage").and_then(parse_usage) {
+        return Some(SseEvent::Usage(usage));
+    }
     let delta = v.get("choices")?.as_array()?.first()?.get("delta")?;
     let content = delta.get("content").and_then(Value::as_str)?;
     if content.is_empty() {
@@ -107,6 +152,16 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
     } else {
         Some(SseEvent::Token(content.to_string()))
     }
+}
+
+/// Read `{prompt_tokens, completion_tokens}` from a usage object.
+fn parse_usage(v: &Value) -> Option<Usage> {
+    let prompt = v.get("prompt_tokens").and_then(Value::as_f64)?;
+    let completion = v.get("completion_tokens").and_then(Value::as_f64)?;
+    Some(Usage {
+        prompt_tokens: prompt as u64,
+        completion_tokens: completion as u64,
+    })
 }
 
 #[cfg(test)]
@@ -164,6 +219,117 @@ mod tests {
             v.get("messages").and_then(Value::as_array).map(<[_]>::len),
             Some(0)
         );
+    }
+
+    #[test]
+    fn build_body_requests_usage_in_the_stream() {
+        let b = OpenAiBackend::from_config(&cfg()).unwrap();
+        let v = Value::parse(&b.build_body(&Conversation::new())).unwrap();
+        let opt = v.get("stream_options").unwrap();
+        assert_eq!(
+            opt.get("include_usage").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn parses_usage_chunk() {
+        let line = r#"data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":5}}"#;
+        assert_eq!(
+            parse_sse_line(line),
+            Some(SseEvent::Usage(Usage {
+                prompt_tokens: 12,
+                completion_tokens: 5,
+            }))
+        );
+    }
+
+    #[test]
+    fn partial_usage_object_is_ignored() {
+        // Missing completion_tokens → not a usable usage chunk.
+        let line = r#"data: {"choices":[],"usage":{"prompt_tokens":12}}"#;
+        assert_eq!(parse_sse_line(line), None);
+    }
+
+    #[test]
+    fn parse_context_window_reads_nested_and_top_level() {
+        assert_eq!(
+            parse_context_window(r#"{"default_generation_settings":{"n_ctx":32768}}"#),
+            Some(32768)
+        );
+        assert_eq!(parse_context_window(r#"{"n_ctx":4096}"#), Some(4096));
+        assert_eq!(parse_context_window(r#"{"foo":1}"#), None);
+        assert_eq!(parse_context_window(r#"{"n_ctx":0}"#), None);
+        assert_eq!(parse_context_window("not json"), None);
+    }
+
+    #[test]
+    fn fetch_context_window_against_a_localhost_mock() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(150))).ok();
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = sock.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+            let body = r#"{"default_generation_settings":{"n_ctx":8192}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+
+        let ctx = fetch_context_window(
+            &format!("http://127.0.0.1:{port}"),
+            Duration::from_millis(500),
+        );
+        assert_eq!(ctx, Some(8192));
+    }
+
+    #[test]
+    fn fetch_context_window_on_dead_endpoint_is_none() {
+        assert_eq!(
+            fetch_context_window("http://127.0.0.1:1", Duration::from_millis(100)),
+            None
+        );
+    }
+
+    #[test]
+    fn fetch_context_window_non_200_is_none() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(150))).ok();
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = sock.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+            let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+
+        let ctx = fetch_context_window(
+            &format!("http://127.0.0.1:{port}"),
+            Duration::from_millis(500),
+        );
+        assert_eq!(ctx, None);
     }
 
     #[test]
@@ -244,6 +410,7 @@ mod tests {
         backend
             .stream(&conv, &mut |ev| match ev {
                 StreamEvent::Token(t) => text.push_str(&t),
+                StreamEvent::Usage(_) => {}
                 StreamEvent::Done(r) => stop = Some(r),
             })
             .unwrap();

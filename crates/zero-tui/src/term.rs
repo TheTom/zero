@@ -72,7 +72,10 @@ extern "C" {
     fn tcgetattr(fd: c_int, termios: *mut Termios) -> c_int;
     fn tcsetattr(fd: c_int, optional_actions: c_int, termios: *const Termios) -> c_int;
     fn cfmakeraw(termios: *mut Termios);
-    fn ioctl(fd: c_int, request: c_ulong, argp: *mut WinSize) -> c_int;
+    // `ioctl` is variadic in C. On Apple aarch64 variadic args go on the stack
+    // (fixed args go in registers), so it MUST be declared variadic or the
+    // `winsize` pointer is read from the wrong place and the call silently fails.
+    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn isatty(fd: c_int) -> c_int;
 }
@@ -97,7 +100,7 @@ pub fn terminal_size() -> Size {
     for fd in [1, 2, 0] {
         let mut ws = WinSize::default();
         // SAFETY: ws is a valid, sized-out WinSize for the kernel to fill.
-        let rc = unsafe { ioctl(fd, TIOCGWINSZ, &mut ws) };
+        let rc = unsafe { ioctl(fd, TIOCGWINSZ, &mut ws as *mut WinSize) };
         if rc == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
             return Size {
                 cols: ws.ws_col,

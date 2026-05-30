@@ -93,10 +93,11 @@ impl Scrollback {
     }
 
     /// All wrapped rows at the given width (used for scroll math and tests).
+    /// ANSI-aware so styled transcript lines wrap on visible width, not bytes.
     fn all_rows(&self, width: usize) -> Vec<String> {
         let mut rows = Vec::new();
         for line in &self.lines {
-            rows.extend(wrap_line(line, width));
+            rows.extend(crate::ansi::wrap_ansi(line, width));
         }
         rows
     }

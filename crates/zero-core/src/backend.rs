@@ -15,8 +15,25 @@ use std::fmt;
 pub enum StreamEvent {
     /// An incremental piece of assistant text.
     Token(String),
+    /// Token accounting reported by the server (if it sends a usage chunk).
+    Usage(Usage),
     /// The response finished; carries why it stopped.
     Done(StopReason),
+}
+
+/// Server-reported token counts for one turn. `prompt_tokens` is everything fed
+/// in (the live context), `completion_tokens` is what the model produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+impl Usage {
+    /// Total tokens the turn occupied — i.e. how much context is now in use.
+    pub fn total(&self) -> u64 {
+        self.prompt_tokens + self.completion_tokens
+    }
 }
 
 /// Why a response ended. Mirrors OpenAI-compatible `finish_reason` values plus
@@ -154,10 +171,20 @@ mod tests {
         let mut stop = None;
         b.stream(conv, &mut |ev| match ev {
             StreamEvent::Token(t) => tokens.push(t),
+            StreamEvent::Usage(_) => {}
             StreamEvent::Done(r) => stop = Some(r),
         })
         .unwrap();
         (tokens, stop)
+    }
+
+    #[test]
+    fn usage_total_sums_prompt_and_completion() {
+        let u = Usage {
+            prompt_tokens: 30,
+            completion_tokens: 12,
+        };
+        assert_eq!(u.total(), 42);
     }
 
     #[test]

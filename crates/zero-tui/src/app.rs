@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
-use zero_core::backend::{Backend, StopReason, StreamEvent};
+use zero_core::backend::{Backend, StopReason, StreamEvent, Usage};
 use zero_core::clock::{format_duration, Stopwatch};
 use zero_core::config::Config;
 use zero_core::discovery::Discovered;
@@ -30,6 +30,93 @@ use zero_core::session::SessionLog;
 /// Prefix drawn before continuation rows of a multiline input (aligns under the
 /// prompt). Same display width as the prompt.
 const CONT: &str = "  ";
+
+/// Slash commands, in the order shown as autocomplete suggestions. Single source
+/// of truth for completion + the popup list.
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/help", "show this help"),
+    ("/config", "show the active backend and model"),
+    ("/scan", "find model servers on your network"),
+    ("/servers", "list saved servers"),
+    ("/connect", "attach to a discovered model"),
+    ("/model", "switch model on the current endpoint"),
+    ("/clip", "copy last response, or code block n"),
+    ("/quit", "leave Zero"),
+    ("/exit", "leave Zero"),
+];
+
+/// If `text` is a slash token still being typed (starts with `/`, no whitespace
+/// yet), return it; otherwise `None`. Once a space is typed the rest is args, so
+/// completion stops.
+fn slash_query(text: &str) -> Option<&str> {
+    if text.starts_with('/') && !text.contains(char::is_whitespace) {
+        Some(text)
+    } else {
+        None
+    }
+}
+
+/// Commands whose name has `query` as a prefix, in table order.
+fn slash_matches(query: &str) -> Vec<(&'static str, &'static str)> {
+    SLASH_COMMANDS
+        .iter()
+        .filter(|(name, _)| name.starts_with(query))
+        .copied()
+        .collect()
+}
+
+/// Longest common prefix of a set of command names — what Tab/Enter completes to
+/// when several commands still match (shell-style).
+fn common_prefix(names: &[&str]) -> String {
+    let Some(first) = names.first() else {
+        return String::new();
+    };
+    let mut end = first.len();
+    for name in &names[1..] {
+        end = end.min(name.len());
+        while !first.is_char_boundary(end) || first[..end] != name[..end] {
+            end -= 1;
+        }
+    }
+    first[..end].to_string()
+}
+
+/// One-line preview of a queued message: its first line, capped to `max`
+/// display columns. Appends `…` when truncated or when more lines follow, so a
+/// big paste shows as a short, single-row hint instead of dominating the view.
+fn queue_preview(msg: &str, max: usize) -> String {
+    let first = msg.split('\n').next().unwrap_or("");
+    let multiline = msg.contains('\n');
+    let mut preview: String = first.chars().take(max).collect();
+    if first.chars().count() > max || multiline {
+        preview.push('…');
+    }
+    preview
+}
+
+/// Compact a token count for the status line: `840`, `1.2k`, `33k`.
+fn fmt_count(n: u64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else {
+        let k = n as f64 / 1000.0;
+        if k >= 10.0 {
+            format!("{}k", k.round() as u64)
+        } else {
+            format!("{k:.1}k")
+        }
+    }
+}
+
+/// Strip the scheme and trailing slash from a base URL for a tidy status line:
+/// `http://192.168.50.125:8000/` → `192.168.50.125:8000`.
+fn short_host(url: &str) -> String {
+    url.strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url)
+        .trim_end_matches('/')
+        .to_string()
+}
 
 /// A source of input bytes. `read` returns 0 on a poll timeout (not EOF).
 /// `RawTerminal` implements this (see `term.rs`); tests use a scripted source.
@@ -56,6 +143,15 @@ struct Search {
     idx: Option<usize>,
 }
 
+/// Queue-edit mode (`^Q`): pause the pending queue and edit a queued message in
+/// place before it's sent.
+struct QueueEdit {
+    /// Index into `queue` currently being edited.
+    sel: usize,
+    /// The input line in progress before editing began, restored on exit.
+    saved_input: String,
+}
+
 /// State of an in-flight model turn: the backend streams on another thread and
 /// sends events down `rx`; the event loop drains them so it stays responsive
 /// (can queue more input, or `^C` to interrupt).
@@ -64,6 +160,9 @@ struct StreamState {
     reply: String,
     md: MarkdownStream,
     sw: Stopwatch,
+    /// Token usage reported by the server for this turn, once its usage chunk
+    /// arrives (kept for the status line).
+    usage: Option<Usage>,
 }
 
 /// The running terminal application.
@@ -84,6 +183,8 @@ pub struct App<I: Input, W: Write> {
     esc_pending: bool,
     /// `Some` while in `^R` reverse-search mode.
     search: Option<Search>,
+    /// `Some` while in `^Q` queue-edit mode (sending is paused).
+    queue_edit: Option<QueueEdit>,
     /// A dangerous shell command awaiting `y/N` confirmation.
     pending_shell: Option<String>,
     /// Human-readable backend/config summary, shown by `/config`.
@@ -106,6 +207,16 @@ pub struct App<I: Input, W: Write> {
     queue: VecDeque<String>,
     /// Run the backend inline instead of on a thread — deterministic for tests.
     synchronous: bool,
+    /// Server-reported context window (`n_ctx`), fetched on connect. `None` until
+    /// known (e.g. the stub, or a server that doesn't expose `/props`).
+    ctx_window: Option<u64>,
+    /// Token usage from the most recent completed turn, for the status line.
+    last_usage: Option<Usage>,
+    /// The uncommitted tail of the streaming reply (rendered ANSI): the part of
+    /// the current line not yet ended by a newline. It is repainted *above* the
+    /// pinned input box each frame; complete lines are committed to scrollback.
+    /// Empty when not streaming.
+    pending: String,
 }
 
 impl<I: Input, W: Write> App<I, W> {
@@ -128,6 +239,7 @@ impl<I: Input, W: Write> App<I, W> {
             ctrl_c_armed: false,
             esc_pending: false,
             search: None,
+            queue_edit: None,
             pending_shell: None,
             info: String::new(),
             config: Config::default(),
@@ -140,6 +252,9 @@ impl<I: Input, W: Write> App<I, W> {
             streaming: None,
             queue: VecDeque::new(),
             synchronous: false,
+            ctx_window: None,
+            last_usage: None,
+            pending: String::new(),
         }
     }
 
@@ -167,6 +282,55 @@ impl<I: Input, W: Write> App<I, W> {
         self.servers_path = servers_path;
     }
 
+    /// Ask the configured server for its context window (`n_ctx`) so the status
+    /// line can show context usage. Best-effort and skipped in synchronous (test)
+    /// mode so the unit tests never touch the network.
+    fn refresh_context_window(&mut self) {
+        if self.synchronous {
+            return;
+        }
+        self.ctx_window = self.config.base_url.as_deref().and_then(|url| {
+            zero_core::openai::fetch_context_window(url, Duration::from_millis(500))
+        });
+    }
+
+    /// The dim footer under the input box: model · endpoint · context usage.
+    /// Always shows the model; the context segment appears once we have real
+    /// numbers (from the server's `/props` and/or a turn's usage chunk).
+    fn status_line(&self) -> String {
+        let model = if !self.config.model.is_empty() {
+            self.config.model.as_str()
+        } else {
+            self.backend.name()
+        };
+        let mut parts = vec![model.to_string()];
+        if let Some(url) = &self.config.base_url {
+            parts.push(short_host(url));
+        }
+        if let Some(ctx) = self.context_summary() {
+            parts.push(ctx);
+        }
+        parts.join("  ·  ")
+    }
+
+    /// The context-usage segment, or `None` when nothing is known yet.
+    fn context_summary(&self) -> Option<String> {
+        let used = self.last_usage.map(|u| u.total());
+        match (self.ctx_window, used) {
+            (Some(ctx), Some(used)) if ctx > 0 => {
+                let pct = (used * 100 / ctx).min(100);
+                Some(format!(
+                    "{}/{} ctx ({pct}%)",
+                    fmt_count(used),
+                    fmt_count(ctx)
+                ))
+            }
+            (Some(ctx), _) => Some(format!("{} ctx", fmt_count(ctx))),
+            (None, Some(used)) => Some(format!("{} tok", fmt_count(used))),
+            (None, None) => None,
+        }
+    }
+
     /// Run the event loop until the user quits.
     pub fn run(&mut self) -> io::Result<()> {
         // Ask the terminal to report disambiguated keys (kitty keyboard
@@ -174,13 +338,15 @@ impl<I: Input, W: Write> App<I, W> {
         // `ESC [ 13 ; 2 u`; on others this is silently ignored. Popped in finish.
         self.out.write_all(b"\x1b[>1u")?;
         // NOTE: we deliberately do NOT enable SGR mouse reporting. It would catch
-        // clicks for click-to-copy, but it also steals the scroll wheel from the
-        // terminal, killing native scrollback — a core feature. Mouse capture
-        // belongs in a future full-screen mode. Copy with `/clip <n>`.
+        // clicks for click-to-copy, but it also steals the scroll wheel, killing
+        // native scrollback — a core feature. Copy with `/clip`.
         self.print_banner()?;
+        // Best-effort: learn the server's context window so the status line can
+        // show usage from the first turn.
+        self.refresh_context_window();
         self.redraw_input()?;
 
-        let mut pending: Vec<u8> = Vec::new();
+        let mut inbuf: Vec<u8> = Vec::new();
         let mut buf = [0u8; 1024];
         loop {
             // Drain any streamed tokens first so the reply renders promptly.
@@ -189,26 +355,25 @@ impl<I: Input, W: Write> App<I, W> {
             }
             let n = self.input.read(&mut buf)?; // returns within ~100ms (VTIME)
             if n == 0 {
-                if pending == [0x1b] {
-                    pending.clear();
+                if inbuf == [0x1b] {
+                    inbuf.clear();
                     self.dispatch(Key::Esc)?; // Esc never quits, only clears/arms
                     self.redraw_if_idle()?;
                 }
                 continue;
             }
-            pending.extend_from_slice(&buf[..n]);
-            let (keys, consumed) = decode_keys(&pending);
-            pending.drain(0..consumed);
+            inbuf.extend_from_slice(&buf[..n]);
+            let (keys, consumed) = decode_keys(&inbuf);
+            inbuf.drain(0..consumed);
             for key in keys {
                 if self.dispatch(key)? == Flow::Quit {
                     return self.finish();
                 }
             }
-            // While streaming we don't draw a live input line (it would collide
-            // with the in-place reply); the input shows once the turn finishes.
-            if self.streaming.is_none() {
-                self.redraw_if_idle()?;
-            }
+            // The input box is pinned at the bottom in every mode now, so repaint
+            // after handling input — including mid-stream, so the queue preview
+            // and what you're typing stay visible while a reply generates.
+            self.redraw_if_idle()?;
         }
     }
 
@@ -236,6 +401,11 @@ impl<I: Input, W: Write> App<I, W> {
         if self.search.is_some() {
             return self.handle_search_key(key);
         }
+        // Queue-edit takes priority over streaming: you edit the queue *while* a
+        // reply generates, with sending paused until you exit.
+        if self.queue_edit.is_some() {
+            return self.handle_queue_edit_key(key);
+        }
         if self.streaming.is_some() {
             return self.handle_streaming_key(key);
         }
@@ -255,6 +425,7 @@ impl<I: Input, W: Write> App<I, W> {
             Key::Esc => return self.on_esc(),
             Key::Ctrl('d') if self.editor.is_empty() => return Ok(Flow::Quit),
             Key::Ctrl('d') => self.editor.delete(),
+            Key::Ctrl('q') => self.enter_queue_edit()?,
             Key::Ctrl('r') => self.enter_search()?,
             Key::Ctrl('l') => self.write_text("\x1b[2J\x1b[H")?,
             Key::Ctrl('a') | Key::Home => self.editor.home(),
@@ -267,8 +438,20 @@ impl<I: Input, W: Write> App<I, W> {
             Key::WordLeft => self.editor.word_left(),
             Key::WordRight => self.editor.word_right(),
             Key::ShiftEnter => self.editor.insert_newline(),
-            Key::Ctrl(_) | Key::Tab => {} // unmapped; ignore
-            Key::Enter => return self.on_submit(),
+            // Tab completes a slash command (shell-style); no-op otherwise.
+            Key::Tab => {
+                self.try_complete_slash();
+            }
+            // Scrollback is the terminal's own (native); we don't intercept it.
+            Key::PageUp | Key::PageDown => {}
+            Key::Ctrl(_) => {} // unmapped; ignore
+            // Enter completes an in-progress slash command instead of submitting;
+            // a second Enter (now a full command) submits.
+            Key::Enter => {
+                if !self.try_complete_slash() {
+                    return self.on_submit();
+                }
+            }
             Key::Backspace => self.editor.backspace(),
             Key::Delete => self.editor.delete(),
             Key::Left => self.editor.left(),
@@ -426,8 +609,9 @@ impl<I: Input, W: Write> App<I, W> {
         if let Some(log) = self.log.as_mut() {
             let _ = log.record_message(Role::User, prompt);
         }
-        self.write_text(&format!("\x1b[2m{}›\x1b[0m ", zero_core::brand::slug()))?;
-        self.out.flush()?;
+        // The assistant label leads the live reply tail (repainted above the box
+        // as tokens arrive), so it isn't committed until the line completes.
+        self.pending = format!("\x1b[2m{}›\x1b[0m ", zero_core::brand::slug());
 
         let (tx, rx) = mpsc::channel();
         let backend = Arc::clone(&self.backend);
@@ -461,6 +645,7 @@ impl<I: Input, W: Write> App<I, W> {
             reply: String::new(),
             md: MarkdownStream::new(),
             sw: Stopwatch::start(),
+            usage: None,
         });
         Ok(())
     }
@@ -470,10 +655,12 @@ impl<I: Input, W: Write> App<I, W> {
     fn pump_stream(&mut self) -> io::Result<()> {
         let mut tokens = Vec::new();
         let mut done = false;
+        let mut usage = None;
         if let Some(s) = &self.streaming {
             loop {
                 match s.rx.try_recv() {
                     Ok(StreamEvent::Token(t)) => tokens.push(t),
+                    Ok(StreamEvent::Usage(u)) => usage = Some(u),
                     Ok(StreamEvent::Done(_)) => {
                         done = true;
                         break;
@@ -486,19 +673,23 @@ impl<I: Input, W: Write> App<I, W> {
                 }
             }
         }
+        if let (Some(u), Some(s)) = (usage, self.streaming.as_mut()) {
+            s.usage = Some(u);
+        }
         if !tokens.is_empty() {
-            // Render markdown without overlapping the &mut self borrow.
-            let mut chunks = Vec::with_capacity(tokens.len());
+            // Render markdown (raw kept in `reply`, ANSI appended to `pending`)
+            // without overlapping the &mut self borrow.
+            let mut rendered = String::new();
             if let Some(s) = self.streaming.as_mut() {
                 for t in &tokens {
                     s.reply.push_str(t);
-                    chunks.push(s.md.feed(t));
+                    rendered.push_str(&s.md.feed(t));
                 }
             }
-            for c in &chunks {
-                self.write_text(c)?;
-            }
-            self.out.flush()?;
+            self.pending.push_str(&rendered);
+            // Repaint: commits completed reply lines to scrollback and redraws
+            // the tail + pinned box (a single repaint per pump, no flicker).
+            self.redraw_input()?;
         }
         if done {
             self.finalize_stream()?;
@@ -512,11 +703,20 @@ impl<I: Input, W: Write> App<I, W> {
         let Some(mut s) = self.streaming.take() else {
             return Ok(());
         };
-        let tail = s.md.finish();
-        if !tail.is_empty() {
-            self.write_text(&tail)?;
+        // Erase the live region, then commit the final reply line (pending tail +
+        // any closing styling) permanently to scrollback.
+        self.clear_input_block()?;
+        self.cursor_row = 0;
+        let mut final_line = std::mem::take(&mut self.pending);
+        final_line.push_str(&s.md.finish());
+        if !final_line.is_empty() {
+            write_raw(&mut self.out, &final_line)?;
+            write_raw(&mut self.out, "\x1b[0m\n")?;
         }
         let elapsed = s.sw.elapsed();
+        if s.usage.is_some() {
+            self.last_usage = s.usage;
+        }
         let reply = std::mem::take(&mut s.reply);
         self.conv.push(Message::assistant(&reply));
         if let Some(log) = self.log.as_mut() {
@@ -525,18 +725,22 @@ impl<I: Input, W: Write> App<I, W> {
         }
         self.last_reply = reply.clone();
         self.last_blocks = crate::markdown::code_blocks(&reply);
-        self.write_text(&format!("\n\x1b[2m  {}\x1b[0m\n", format_duration(elapsed)))?;
+        self.write_text(&format!("\x1b[2m  {}\x1b[0m\n", format_duration(elapsed)))?;
 
-        if let Some(next) = self.queue.pop_front() {
-            self.start_turn(&next)?;
-        } else {
-            self.redraw_input()?;
+        // Sending is paused while the queue is being edited (`^Q`): leave the
+        // items in place and just repaint; they run when editing exits.
+        if self.queue_edit.is_none() {
+            if let Some(next) = self.queue.pop_front() {
+                return self.start_turn(&next);
+            }
         }
+        self.redraw_input()?;
         Ok(())
     }
 
     /// Keys during a streaming turn: `^C` interrupts, `Enter` queues the typed
-    /// line, `/quit` still exits. Other keys edit the (not-yet-shown) input.
+    /// line, `/quit` still exits. Editing keys update the pinned input box, which
+    /// the run loop repaints; the queued count shows in the footer.
     fn handle_streaming_key(&mut self, key: Key) -> io::Result<Flow> {
         // `Esc Esc` interrupts too; reset the latch on any other key.
         if key != Key::Esc {
@@ -544,6 +748,7 @@ impl<I: Input, W: Write> App<I, W> {
         }
         match key {
             Key::Ctrl('c') => self.interrupt_stream()?, // single ^C interrupts
+            Key::Ctrl('q') => self.enter_queue_edit()?, // edit the pending queue
             Key::Esc => {
                 if self.esc_pending {
                     self.esc_pending = false;
@@ -560,11 +765,8 @@ impl<I: Input, W: Write> App<I, W> {
                 }
                 if !trimmed.is_empty() {
                     self.queue.push_back(text.clone());
-                    self.write_text(&format!(
-                        "\n\x1b[2m⏎ queued ({}): {}\x1b[0m\n",
-                        self.queue.len(),
-                        trimmed
-                    ))?;
+                    // editor cleared by submit(); footer shows the queued count
+                    // on the next repaint.
                 }
             }
             Key::Backspace => self.editor.backspace(),
@@ -580,11 +782,16 @@ impl<I: Input, W: Write> App<I, W> {
         let Some(mut s) = self.streaming.take() else {
             return Ok(());
         };
-        let tail = s.md.finish();
-        if !tail.is_empty() {
-            self.write_text(&tail)?;
+        // Erase the live region and commit the partial reply + interrupt note.
+        self.clear_input_block()?;
+        self.cursor_row = 0;
+        let mut final_line = std::mem::take(&mut self.pending);
+        final_line.push_str(&s.md.finish());
+        if !final_line.is_empty() {
+            write_raw(&mut self.out, &final_line)?;
+            write_raw(&mut self.out, "\x1b[0m\n")?;
         }
-        self.write_text("\n\x1b[2m^C interrupted\x1b[0m\n")?;
+        self.write_text("\x1b[2m^C interrupted\x1b[0m\n")?;
         let reply = std::mem::take(&mut s.reply);
         if !reply.trim().is_empty() {
             self.conv.push(Message::assistant(&reply));
@@ -592,7 +799,6 @@ impl<I: Input, W: Write> App<I, W> {
             self.last_blocks = crate::markdown::code_blocks(&reply);
         }
         self.queue.clear();
-        self.cursor_row = 0;
         self.redraw_input()?;
         // The detached thread (if any) finishes on its own; its sends are
         // dropped harmlessly now that `rx` is gone.
@@ -769,6 +975,9 @@ impl<I: Input, W: Write> App<I, W> {
             let _ = self.config.save(path);
         }
         self.info = self.config.summary();
+        // Endpoint/model changed: old token counts are stale; relearn n_ctx.
+        self.last_usage = None;
+        self.refresh_context_window();
     }
 
     /// List the locally-saved servers (`~/.zero/servers.json`).
@@ -788,6 +997,84 @@ impl<I: Input, W: Write> App<I, W> {
             self.write_text(&format!("  {model}  \x1b[2m{}\x1b[0m\n", s.base_url))?;
         }
         Ok(())
+    }
+
+    // --- queue editing (^Q) ----------------------------------------------
+
+    /// Enter queue-edit mode: pause sending and load the nearest queued message
+    /// into the editor for editing. No-op when the queue is empty.
+    fn enter_queue_edit(&mut self) -> io::Result<()> {
+        if self.queue.is_empty() {
+            return Ok(());
+        }
+        let sel = self.queue.len() - 1; // nearest the box (bottom of the list)
+        let saved_input = self.editor.text();
+        self.editor.set_text(&self.queue[sel]);
+        self.queue_edit = Some(QueueEdit { sel, saved_input });
+        self.redraw_input()
+    }
+
+    /// Keys while editing the queue: `↑`/`↓` (or repeated `^Q`) move between
+    /// items, editing keys change the selected one, `Enter`/`Esc` exit. Edits to
+    /// the current item are saved before moving or exiting; an item emptied this
+    /// way is dropped.
+    fn handle_queue_edit_key(&mut self, key: Key) -> io::Result<Flow> {
+        match key {
+            Key::Up | Key::Ctrl('q') => {
+                self.queue_edit_select(-1);
+            }
+            Key::Down => {
+                self.queue_edit_select(1);
+            }
+            Key::Enter | Key::Esc => {
+                self.exit_queue_edit()?;
+            }
+            Key::Backspace => self.editor.backspace(),
+            Key::Delete => self.editor.delete(),
+            Key::Left | Key::Ctrl('b') => self.editor.left(),
+            Key::Right | Key::Ctrl('f') => self.editor.right(),
+            Key::Home | Key::Ctrl('a') => self.editor.home(),
+            Key::End | Key::Ctrl('e') => self.editor.end(),
+            Key::WordLeft => self.editor.word_left(),
+            Key::WordRight => self.editor.word_right(),
+            Key::Ctrl('u') => self.editor.kill_to_start(),
+            Key::Ctrl('k') => self.editor.kill_to_end(),
+            Key::Ctrl('w') => self.editor.kill_word(),
+            Key::ShiftEnter => self.editor.insert_newline(),
+            Key::Char(c) => self.editor.insert(c),
+            _ => {}
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// Persist the current edit, then move the selection by `delta` (clamped).
+    fn queue_edit_select(&mut self, delta: isize) {
+        let Some(qe) = self.queue_edit.as_mut() else {
+            return;
+        };
+        self.queue[qe.sel] = self.editor.text();
+        let last = self.queue.len() - 1;
+        qe.sel = (qe.sel as isize + delta).clamp(0, last as isize) as usize;
+        let text = self.queue[qe.sel].clone();
+        self.editor.set_text(&text);
+    }
+
+    /// Save the current edit, drop any emptied items, restore the in-progress
+    /// input line, and resume sending (run the next queued message if idle).
+    fn exit_queue_edit(&mut self) -> io::Result<()> {
+        let Some(qe) = self.queue_edit.take() else {
+            return Ok(());
+        };
+        self.queue[qe.sel] = self.editor.text();
+        self.queue.retain(|m| !m.trim().is_empty());
+        self.editor.set_text(&qe.saved_input);
+        // Resume: if nothing is streaming, kick off the next queued message.
+        if self.streaming.is_none() {
+            if let Some(next) = self.queue.pop_front() {
+                return self.start_turn(&next);
+            }
+        }
+        self.redraw_input()
     }
 
     // --- reverse history search (^R) -------------------------------------
@@ -889,7 +1176,8 @@ impl<I: Input, W: Write> App<I, W> {
         Ok(())
     }
 
-    /// Move to the top-left of the current input block and clear downward.
+    /// Move to the top-left of the current live region (reply tail + box) and
+    /// clear downward, so it can be repainted.
     fn clear_input_block(&mut self) -> io::Result<()> {
         if self.cursor_row > 0 {
             write!(self.out, "\x1b[{}A", self.cursor_row)?;
@@ -898,41 +1186,187 @@ impl<I: Input, W: Write> App<I, W> {
         Ok(())
     }
 
-    /// Redraw the bordered input box and position the cursor. Layout (a future
-    /// status line — token usage, etc. — will sit just below the bottom rule):
+    /// The status footer under the box: model · endpoint · ctx, plus live turn
+    /// state (elapsed + interrupt hint) while a reply streams. Queued messages
+    /// are listed above the box, not here.
+    fn footer_text(&self) -> String {
+        if let Some(qe) = &self.queue_edit {
+            // Editing pauses sending; show how to navigate and finish.
+            return format!(
+                "editing queued {}/{}  ·  ↑↓ move · ⏎ done · sending paused",
+                qe.sel + 1,
+                self.queue.len()
+            );
+        }
+        let mut footer = self.status_line();
+        if let Some(s) = &self.streaming {
+            footer.push_str(&format!(
+                "  ·  {} · esc to interrupt",
+                format_duration(s.sw.elapsed())
+            ));
+        }
+        // Tell the user the queue is editable whenever one exists.
+        if !self.queue.is_empty() {
+            footer.push_str("  ·  ^Q edit queue");
+        }
+        footer
+    }
+
+    /// Slash commands to show in the popup for the current input — empty unless
+    /// a slash token is being typed, and hidden once it's a complete unique
+    /// command (nothing left to suggest).
+    fn slash_suggestions(&self) -> Vec<(&'static str, &'static str)> {
+        let text = self.editor.text();
+        let Some(q) = slash_query(&text) else {
+            return Vec::new();
+        };
+        let m = slash_matches(q);
+        if m.len() == 1 && m[0].0 == q {
+            return Vec::new(); // already fully typed; nothing to complete
+        }
+        m
+    }
+
+    /// Try to complete the in-progress slash command. Returns true if Enter/Tab
+    /// was consumed for completion (so it must NOT also submit). Completes fully
+    /// on a single match, to the longest common prefix on several, and swallows
+    /// the key while a partial command is ambiguous so a stray `/c` is never sent
+    /// to the model.
+    fn try_complete_slash(&mut self) -> bool {
+        let text = self.editor.text();
+        let Some(q) = slash_query(&text) else {
+            return false;
+        };
+        let matches = slash_matches(q);
+        if matches.is_empty() {
+            return false;
+        }
+        // Exactly the typed command exists → let Enter submit it.
+        if matches.iter().any(|(name, _)| *name == q) {
+            return false;
+        }
+        let names: Vec<&str> = matches.iter().map(|(name, _)| *name).collect();
+        let completed = if names.len() == 1 {
+            names[0].to_string()
+        } else {
+            common_prefix(&names)
+        };
+        if completed.len() > text.len() {
+            self.editor.set_text(&completed);
+        }
+        true // swallow the key; the suggestion list stays visible
+    }
+
+    /// Redraw the input box + status footer, pinned at the bottom. Layout:
     /// ```text
-    /// ──────────────  (top rule)
-    /// › the input…    (one or more rows)
-    /// ──────────────  (bottom rule)
+    /// …reply tail…       (live, only while streaming — completed lines committed)
+    /// ⏎ queued: …        (messages waiting to run after this reply)
+    /// ──────────────     (top rule)
+    /// › the input…       (one or more rows)
+    /// ──────────────     (bottom rule)
+    /// model · ctx …      (status footer)
+    /// › /help …          (slash suggestions, if any)
     /// ```
+    /// The live region is everything from the reply tail down; complete reply
+    /// lines are committed to scrollback first so the region stays small and the
+    /// terminal's own scrollback keeps working.
     fn redraw_input(&mut self) -> io::Result<()> {
         self.clear_input_block()?;
         let width = (crate::term::terminal_size().cols as usize).max(1);
         let rule = "─".repeat(width);
+
+        // `head` counts rows drawn above the input box's top rule, so the cursor
+        // can be placed correctly and the region erased next time.
+        let mut head = 0;
+
+        // While streaming, commit any now-complete reply lines to scrollback,
+        // then repaint the still-incomplete tail above the box.
+        if self.streaming.is_some() {
+            while let Some(nl) = self.pending.find('\n') {
+                let line: String = self.pending[..nl].to_string();
+                write_raw(&mut self.out, &line)?;
+                write_raw(&mut self.out, "\x1b[0m\n")?;
+                self.pending.drain(..=nl);
+            }
+            if !self.pending.is_empty() {
+                let rows = crate::ansi::wrap_ansi(&self.pending, width);
+                for r in &rows {
+                    write!(self.out, "{r}\r\n")?;
+                }
+                head += rows.len();
+            }
+        }
+
+        // In queue-edit mode the editor holds the selected item; mirror it back
+        // so the list preview stays live with the box.
+        let editing = self.queue_edit.as_ref().map(|qe| qe.sel);
+        if let Some(i) = editing {
+            self.queue[i] = self.editor.text();
+        }
+
+        // Queued messages waiting to run after the current reply, listed above
+        // the box. Each is capped to one line that fits the width (with an
+        // ellipsis) so a huge paste can't dominate the view — and so each row
+        // stays exactly one terminal row (keeping `head` accurate). The item
+        // under edit is marked.
+        let cap = width.saturating_sub(11).clamp(8, 80);
+        let queued: Vec<String> = self.queue.iter().map(|q| queue_preview(q, cap)).collect();
+        for (i, q) in queued.iter().enumerate() {
+            if Some(i) == editing {
+                write!(self.out, "\x1b[36m✎ editing: {q}\x1b[0m\r\n")?;
+            } else {
+                write!(self.out, "\x1b[2m⏎ queued: {q}\x1b[0m\r\n")?;
+            }
+            head += 1;
+        }
+
+        // Top rule, then each input row, then the bottom rule. The prompt marker
+        // changes to `✎` while editing a queued item (same width as `›`).
+        let prompt: &str = if editing.is_some() {
+            "✎ "
+        } else {
+            self.prompt.as_str()
+        };
+        write!(self.out, "\x1b[2m{rule}\x1b[0m")?;
         let text = self.editor.text();
         let lines: Vec<&str> = text.split('\n').collect();
-
-        // Top rule, then each input row, then the bottom rule.
-        write!(self.out, "\x1b[2m{rule}\x1b[0m")?;
         for (i, line) in lines.iter().enumerate() {
-            let prefix = if i == 0 { self.prompt.as_str() } else { CONT };
-            write!(self.out, "\r\n{prefix}{line}")?;
+            let pfx = if i == 0 { prompt } else { CONT };
+            write!(self.out, "\r\n{pfx}{line}")?;
         }
         write!(self.out, "\r\n\x1b[2m{rule}\x1b[0m")?;
 
-        // Cursor is on the bottom rule; move it up to its logical input row/col.
+        // Status footer directly under the bottom rule.
+        write!(self.out, "\r\n\x1b[2m{}\x1b[0m", self.footer_text())?;
+
+        // Slash-command suggestions, one per line below the status footer. The
+        // first (best) match is highlighted as the one Enter/Tab completes to.
+        let suggestions = self.slash_suggestions();
+        for (i, (name, desc)) in suggestions.iter().enumerate() {
+            let mark = if i == 0 { "›" } else { " " };
+            write!(
+                self.out,
+                "\r\n\x1b[2m{mark}\x1b[0m \x1b[36m{name}\x1b[0m  \x1b[2m{desc}\x1b[0m"
+            )?;
+        }
+
+        // Cursor is on the last footer/suggestion line; move it up to its logical
+        // input row/col.
         let (trow, tcol) = self.cursor_rowcol();
         let prefix_w = if trow == 0 {
-            self.prompt.chars().count()
+            prompt.chars().count()
         } else {
             CONT.chars().count()
         };
-        let up = lines.len() - trow; // bottom rule is `len - trow` rows below it
+        // Rows below the input row: bottom rule, the status line, and each
+        // suggestion.
+        let up = lines.len() - trow + 1 + suggestions.len();
         write!(self.out, "\x1b[{up}A\r")?;
         let col = prefix_w + tcol;
         write!(self.out, "\x1b[{col}C")?;
-        // Row 0 of the box is the top rule; input row `trow` is at box row 1+trow.
-        self.cursor_row = 1 + trow;
+        // Rows above the cursor: the head rows (reply tail + queued list), the
+        // top rule (1), and the input rows before this one (`trow`).
+        self.cursor_row = head + 1 + trow;
         self.out.flush()
     }
 
@@ -1010,6 +1444,11 @@ impl<I: Input, W: Write> App<I, W> {
                 "queue a message — runs after the current reply",
             ),
             ('K', "^C  ·  Esc Esc", "interrupt the running reply"),
+            (
+                'K',
+                "^Q",
+                "edit queued messages (↑↓ move, ⏎ done) — pauses sending",
+            ),
             ('H', "Exit", ""),
             ('K', "Esc Esc", "clear the line"),
             (
@@ -1031,7 +1470,9 @@ impl<I: Input, W: Write> App<I, W> {
         self.write_text(&out)
     }
 
-    /// Write text, translating `\n` to `\r\n` for raw mode.
+    /// Write committed text straight to the terminal (raw-mode newline
+    /// translation). Callers clear the live input region first (see
+    /// `clear_input_block`) so committed output lands above the pinned box.
     fn write_text(&mut self, s: &str) -> io::Result<()> {
         write_raw(&mut self.out, s)
     }
@@ -1207,6 +1648,293 @@ mod tests {
     }
 
     #[test]
+    fn common_prefix_handles_empty_single_and_divergent() {
+        assert_eq!(common_prefix(&[]), "");
+        assert_eq!(common_prefix(&["/help"]), "/help");
+        assert_eq!(common_prefix(&["/config", "/connect", "/clip"]), "/c");
+        assert_eq!(common_prefix(&["/scan", "/help"]), "/");
+    }
+
+    #[test]
+    fn slash_query_only_matches_a_bare_slash_token() {
+        assert_eq!(slash_query("/he"), Some("/he"));
+        assert_eq!(slash_query("/clip 1"), None); // args started
+        assert_eq!(slash_query("hello"), None);
+        assert_eq!(slash_query("a /help"), None);
+    }
+
+    #[test]
+    fn slash_matches_filters_by_prefix() {
+        let m = slash_matches("/co");
+        assert_eq!(m.len(), 2); // /config, /connect
+        assert!(m.iter().all(|(n, _)| n.starts_with("/co")));
+        assert!(slash_matches("/zzz").is_empty());
+    }
+
+    #[test]
+    fn enter_completes_a_unique_partial_command_without_submitting() {
+        let mut a = app(b"");
+        type_into(&mut a, "/he");
+        assert_eq!(a.dispatch(Key::Enter).unwrap(), Flow::Continue);
+        assert_eq!(a.editor.text(), "/help"); // completed, not sent
+    }
+
+    #[test]
+    fn tab_also_completes_a_unique_partial_command() {
+        let mut a = app(b"");
+        type_into(&mut a, "/se");
+        a.dispatch(Key::Tab).unwrap();
+        assert_eq!(a.editor.text(), "/servers");
+    }
+
+    #[test]
+    fn enter_on_ambiguous_prefix_completes_to_common_prefix_and_is_swallowed() {
+        let mut a = app(b"");
+        type_into(&mut a, "/co");
+        // /config + /connect share "/con" — Enter extends to the LCP, no submit.
+        assert_eq!(a.dispatch(Key::Enter).unwrap(), Flow::Continue);
+        assert_eq!(a.editor.text(), "/con");
+    }
+
+    #[test]
+    fn enter_on_a_fully_typed_command_submits_it() {
+        let mut a = app(b"");
+        type_into(&mut a, "/help");
+        // Exact command → not completion; runs the command (prints help).
+        a.dispatch(Key::Enter).unwrap();
+        assert!(a.editor.is_empty());
+        assert!(rendered(&a).contains("show this help"));
+    }
+
+    #[test]
+    fn suggestions_show_while_typing_and_hide_once_unique_complete() {
+        let mut a = app(b"");
+        type_into(&mut a, "/he");
+        assert_eq!(a.slash_suggestions(), vec![("/help", "show this help")]);
+        a.redraw_input().unwrap();
+        let out = rendered(&a);
+        assert!(out.contains("/help"));
+        assert!(out.contains("show this help"));
+        // Finish typing it: nothing left to suggest.
+        type_into(&mut a, "lp");
+        assert!(a.slash_suggestions().is_empty());
+    }
+
+    #[test]
+    fn no_suggestions_for_plain_text_or_after_a_space() {
+        let mut a = app(b"");
+        type_into(&mut a, "hello");
+        assert!(a.slash_suggestions().is_empty());
+        a.editor.clear();
+        type_into(&mut a, "/clip 1");
+        assert!(a.slash_suggestions().is_empty());
+    }
+
+    #[test]
+    fn streaming_pins_the_box_below_the_live_reply() {
+        let (mut a, tx) = streaming_app();
+        a.pending = "zero› ".to_string(); // assistant label leads the tail
+        tx.send(StreamEvent::Token("hello".into())).unwrap();
+        a.pump_stream().unwrap();
+        let out = rendered(&a);
+        assert!(out.contains("hello")); // reply tail painted
+        assert!(out.contains('─')); // the input box is drawn below it
+        assert!(out.contains("esc to interrupt")); // footer shows live turn state
+    }
+
+    #[test]
+    fn streaming_commits_completed_lines_and_keeps_the_tail() {
+        let (mut a, tx) = streaming_app();
+        tx.send(StreamEvent::Token("line one\nline two".into()))
+            .unwrap();
+        a.pump_stream().unwrap();
+        // "line one" committed (newline seen); only "line two" stays live.
+        assert_eq!(a.pending, "line two");
+        assert!(rendered(&a).contains("line one"));
+    }
+
+    #[test]
+    fn typing_while_streaming_shows_in_the_pinned_box_and_queues() {
+        let (mut a, _tx) = streaming_app();
+        a.dispatch(Key::Char('h')).unwrap();
+        a.dispatch(Key::Char('i')).unwrap();
+        a.redraw_input().unwrap();
+        assert!(rendered(&a).contains("› hi")); // live preview in the box
+        a.dispatch(Key::Enter).unwrap(); // queues, doesn't submit
+        assert_eq!(a.queue.len(), 1);
+        a.redraw_input().unwrap();
+        assert!(rendered(&a).contains("⏎ queued: hi")); // listed above the box
+    }
+
+    #[test]
+    fn queue_preview_caps_and_marks_truncation() {
+        assert_eq!(queue_preview("short", 20), "short"); // fits, no marker
+        assert_eq!(queue_preview("abcdefghij", 4), "abcd…"); // capped + ellipsis
+        assert_eq!(queue_preview("one\ntwo", 20), "one…"); // multiline → first + …
+                                                           // A huge paste collapses to a short hint.
+        let big = "x".repeat(5000);
+        let p = queue_preview(&big, 60);
+        assert_eq!(p.chars().count(), 61); // 60 + the ellipsis
+    }
+
+    #[test]
+    fn footer_hints_at_queue_editing_when_a_queue_exists() {
+        let mut a = app(b"");
+        assert!(!a.footer_text().contains("^Q")); // no queue → no hint
+        a.queue.push_back("later".to_string());
+        assert!(a.footer_text().contains("^Q edit queue")); // hint appears
+    }
+
+    #[test]
+    fn ctrl_q_on_empty_queue_is_a_noop() {
+        let mut a = app(b"");
+        a.dispatch(Key::Ctrl('q')).unwrap();
+        assert!(a.queue_edit.is_none());
+    }
+
+    #[test]
+    fn queue_edit_navigates_and_edits_in_place() {
+        let mut a = app(b"");
+        a.editor.set_text("draft"); // in-progress input to restore later
+        a.queue.push_back("first".to_string());
+        a.queue.push_back("second".to_string());
+        a.dispatch(Key::Ctrl('q')).unwrap(); // enter, selects the last item
+        assert!(a.queue_edit.is_some());
+        assert_eq!(a.editor.text(), "second");
+        a.dispatch(Key::Char('!')).unwrap(); // edit → "second!"
+        a.dispatch(Key::Up).unwrap(); // persist + move to "first"
+        assert_eq!(a.queue[1], "second!");
+        assert_eq!(a.editor.text(), "first");
+    }
+
+    #[test]
+    fn queue_edit_renders_marker_and_paused_footer() {
+        let mut a = app(b"");
+        a.queue.push_back("alpha".to_string());
+        a.dispatch(Key::Ctrl('q')).unwrap();
+        let out = rendered(&a);
+        assert!(out.contains("✎ editing: alpha"));
+        assert!(a.footer_text().contains("editing queued 1/1"));
+        assert!(a.footer_text().contains("sending paused"));
+    }
+
+    #[test]
+    fn queue_edit_pauses_sending_until_exit() {
+        let (mut a, tx) = streaming_app();
+        a.queue.push_back("next".to_string());
+        a.dispatch(Key::Ctrl('q')).unwrap(); // edit while streaming
+        tx.send(StreamEvent::Done(StopReason::EndTurn)).unwrap();
+        a.pump_stream().unwrap(); // turn finishes…
+        assert!(a.streaming.is_none());
+        assert_eq!(a.queue.len(), 1); // …but the queue is NOT drained (paused)
+        assert!(a.queue_edit.is_some());
+        a.dispatch(Key::Enter).unwrap(); // exit → resume
+        assert!(a.queue_edit.is_none());
+        assert!(a.queue.is_empty()); // the queued message now runs
+    }
+
+    #[test]
+    fn queue_edit_dropping_an_emptied_item_and_restoring_input() {
+        let mut a = app(b"");
+        a.editor.set_text("keep me");
+        a.queue.push_back("toss".to_string());
+        a.dispatch(Key::Ctrl('q')).unwrap();
+        a.editor.set_text(""); // empty the queued item
+        a.dispatch(Key::Esc).unwrap(); // exit
+        assert!(a.queue.is_empty()); // emptied item dropped
+        assert!(a.streaming.is_none()); // nothing to run
+        assert_eq!(a.editor.text(), "keep me"); // original input restored
+    }
+
+    #[test]
+    fn fmt_count_is_compact() {
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(840), "840");
+        assert_eq!(fmt_count(1234), "1.2k");
+        assert_eq!(fmt_count(32768), "33k");
+    }
+
+    #[test]
+    fn short_host_strips_scheme_and_slash() {
+        assert_eq!(
+            short_host("http://192.168.50.125:8000/"),
+            "192.168.50.125:8000"
+        );
+        assert_eq!(short_host("https://api.x.ai/v1"), "api.x.ai/v1");
+        assert_eq!(short_host("bare:1234"), "bare:1234");
+    }
+
+    #[test]
+    fn status_line_shows_model_endpoint_and_context() {
+        let mut a = app(b"");
+        a.config.model = "qwen-heretic".to_string();
+        a.config.base_url = Some("http://192.168.50.125:8000".to_string());
+        a.ctx_window = Some(32768);
+        a.last_usage = Some(Usage {
+            prompt_tokens: 1000,
+            completion_tokens: 200,
+        });
+        let s = a.status_line();
+        assert!(s.contains("qwen-heretic"));
+        assert!(s.contains("192.168.50.125:8000"));
+        assert!(s.contains("1.2k/33k ctx (3%)"));
+    }
+
+    #[test]
+    fn context_summary_covers_each_knowledge_state() {
+        let mut a = app(b"");
+        assert_eq!(a.context_summary(), None); // nothing known
+        a.ctx_window = Some(8192);
+        assert_eq!(a.context_summary().unwrap(), "8.2k ctx"); // window only
+        a.last_usage = Some(Usage {
+            prompt_tokens: 4096,
+            completion_tokens: 0,
+        });
+        assert_eq!(a.context_summary().unwrap(), "4.1k/8.2k ctx (50%)");
+        a.ctx_window = None; // usage but no window
+        assert_eq!(a.context_summary().unwrap(), "4.1k tok");
+    }
+
+    #[test]
+    fn status_line_falls_back_to_backend_name_without_a_model() {
+        let a = app(b""); // stub backend, empty config model
+        let s = a.status_line();
+        assert!(s.contains(a.backend.name()));
+    }
+
+    #[test]
+    fn redraw_renders_the_status_footer() {
+        let mut a = app(b"");
+        a.config.model = "qwen".to_string();
+        a.redraw_input().unwrap();
+        assert!(rendered(&a).contains("qwen"));
+    }
+
+    #[test]
+    fn a_usage_chunk_updates_last_usage() {
+        let (mut a, tx) = streaming_app();
+        tx.send(StreamEvent::Usage(Usage {
+            prompt_tokens: 50,
+            completion_tokens: 10,
+        }))
+        .unwrap();
+        a.pump_stream().unwrap();
+        // Held in the streaming state, not promoted until the turn finishes.
+        assert_eq!(a.last_usage.map(|u| u.total()), None);
+        tx.send(StreamEvent::Done(StopReason::EndTurn)).unwrap();
+        a.pump_stream().unwrap();
+        assert_eq!(a.last_usage.map(|u| u.total()), Some(60));
+    }
+
+    #[test]
+    fn refresh_context_window_is_skipped_in_synchronous_mode() {
+        let mut a = app(b"");
+        a.config.base_url = Some("http://127.0.0.1:1".to_string());
+        a.refresh_context_window(); // synchronous → no network, stays None
+        assert_eq!(a.ctx_window, None);
+    }
+
+    #[test]
     fn scripted_input_returns_zero_after_exhaustion() {
         let mut si = ScriptedInput::new(b"ab");
         let mut b = [0u8; 8];
@@ -1350,8 +2078,9 @@ mod tests {
         type_into(&mut a, "second");
         a.dispatch(Key::Enter).unwrap(); // queued, not started
         assert_eq!(a.queue.len(), 1);
-        assert!(rendered(&a).contains("queued"));
-        // Pump to completion: first finalizes → second starts → finalizes.
+        a.redraw_input().unwrap();
+        assert!(rendered(&a).contains("⏎ queued: second")); // listed above the box
+                                                            // Pump to completion: first finalizes → second starts → finalizes.
         for _ in 0..4 {
             a.pump_stream().unwrap();
         }
@@ -1385,6 +2114,7 @@ mod tests {
             reply: String::new(),
             md: MarkdownStream::new(),
             sw: Stopwatch::start(),
+            usage: None,
         });
         (a, tx)
     }

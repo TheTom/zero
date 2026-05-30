@@ -22,6 +22,9 @@ pub enum Key {
     Right,
     Home,
     End,
+    /// Page up / down — scroll the transcript in full-screen mode.
+    PageUp,
+    PageDown,
     /// Word-wise cursor moves (Ctrl/Alt + Left/Right).
     WordLeft,
     WordRight,
@@ -181,6 +184,8 @@ fn decode_csi(buf: &[u8]) -> Step {
             1 | 7 => Key::Home,
             4 | 8 => Key::End,
             3 => Key::Delete,
+            5 => Key::PageUp,
+            6 => Key::PageDown,
             _ => return Step::Consume(total),
         },
         // Unknown final byte; drop the whole sequence.
@@ -438,9 +443,15 @@ mod tests {
     }
 
     #[test]
+    fn page_up_and_down_decode() {
+        assert_eq!(keys(b"\x1b[5~"), vec![Key::PageUp]);
+        assert_eq!(keys(b"\x1b[6~"), vec![Key::PageDown]);
+    }
+
+    #[test]
     fn unmapped_numeric_csi_is_dropped() {
-        // ESC [ 5 ~ (PageUp) — we don't map it; consumed, no key.
-        let (k, consumed) = decode_keys(b"\x1b[5~");
+        // ESC [ 9 ~ is not a key we map; consumed, no key emitted.
+        let (k, consumed) = decode_keys(b"\x1b[9~");
         assert!(k.is_empty());
         assert_eq!(consumed, 4);
     }

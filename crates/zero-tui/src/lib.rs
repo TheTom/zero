@@ -2,11 +2,13 @@
 //!
 //! Layered as functional-core / imperative-shell:
 //! - pure, fully-tested models — [`key`] (byte→key decoding), [`editor`]
-//!   (line editing + history), [`viewport`] (scrollback + wrapping);
+//!   (line editing + history), [`viewport`] (scrollback + wrapping), [`ansi`]
+//!   (display-width-aware wrapping for the live region);
 //! - a thin `unsafe` shell — [`term`] (raw mode + size via libc symbols we
 //!   declare ourselves, no `libc` crate);
-//! - the wiring — [`app`], the Claude-Code-style inline REPL.
+//! - the wiring — [`app`], the inline REPL with a bottom-pinned input box.
 
+pub mod ansi;
 pub mod app;
 pub mod editor;
 pub mod key;

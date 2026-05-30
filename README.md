@@ -25,8 +25,9 @@ zero/
     │   ├── key.rs            bytes → keys (UTF-8 + ANSI)      [pure]
     │   ├── editor.rs         line editor + history           [pure]
     │   ├── viewport.rs       scrollback + word wrap           [pure]
+    │   ├── ansi.rs           display-width-aware wrapping      [pure]
     │   ├── term.rs           raw mode via libc FFI            [unsafe shell]
-    │   └── app.rs            the inline REPL loop
+    │   └── app.rs            the REPL loop + bottom-pinned box
     └── zero/               the binary — args, wiring
         └── main.rs
 ```
@@ -43,6 +44,15 @@ cargo build --release
 ./target/release/zero --stub     # force the built-in echo backend
 ./target/release/zero --no-log   # no session transcript
 ```
+
+### Rendering
+
+Inline, with a **bottom-pinned input box** (Claude-Code-style). Output prints in
+normal flow so your terminal's own scrollback keeps working — but the input box
++ status footer stay parked at the bottom *the whole time*, including while a
+reply streams. The trick is a small live region: completed reply lines are
+committed to scrollback as they finish, and only the unfinished tail + the box
+are repainted in place each frame (no alt-screen, no lost scrollback).
 
 ## Connecting a model
 
@@ -107,13 +117,34 @@ serves a different one.
 
 Sessions log to `~/.zero/sessions/zero-<unixtime>.jsonl`.
 
+### Status line
+
+A dim footer under the input box always shows what you're talking to and how
+full the context is:
+
+```
+qwen-heretic  ·  192.168.50.125:8000  ·  1.2k/33k ctx (4%)
+```
+
+The context window (`n_ctx`) is read from the server's `/props` endpoint on
+connect; per-turn token usage comes from the server's own usage report (via
+`stream_options.include_usage`) — never an estimate. Until the server reports
+numbers, the segment shows what's known (just the window, or nothing for the
+stub).
+
 ### While a reply is generating
 
-The model streams on a background thread, so the prompt stays live:
+The model streams on a background thread and the input box stays pinned at the
+bottom, so the prompt is live the whole time:
 
-- **Type ahead / queue** — keep typing; each `Enter` **queues** a message
-  (`⏎ queued (n)`) that runs in order once the current reply finishes. Doesn't
+- **Type ahead / queue** — keep typing; the pinned box previews the line. Each
+  `Enter` **queues** it — queued messages are listed just above the box
+  (`⏎ queued: …`) and run in order once the current reply finishes. Doesn't
   interrupt.
+- **`^Q` — edit the queue** — jump up into the queued messages and edit them in
+  place before they're sent. `↑`/`↓` (or repeated `^Q`) move between items, edit
+  the selected one inline, `Enter`/`Esc` to finish. **Sending is paused** while
+  you edit (the current reply keeps streaming); empty an item to drop it.
 - **`^C` or `Esc Esc`** — interrupt the in-flight reply (keeps the partial text
   in context, clears the queue), e.g. to redirect it.
 
@@ -129,9 +160,11 @@ The model streams on a background thread, so the prompt stays live:
 | `^L` | clear screen |
 | `^J` | insert newline — multiline input (works in every terminal) |
 | `Shift+Enter` / `⌥+Enter` | insert newline (on terminals that send a distinct code) |
-| `Enter` | submit |
+| `Tab` | complete the slash command you're typing |
+| `Enter` | submit — or complete an in-progress slash command (`/he`→`/help`) |
 | `↑` / `↓` | move between input lines, else recall history |
 | `^R` | reverse history search (type to match, `^R` for older, `Enter` accept, `Esc` cancel) |
+| `^Q` | edit queued messages before they send (↑↓ move, `Enter`/`Esc` done) |
 | `Esc Esc` | clear the line |
 | `^C` | clear the line; on an empty line, `^C` again to exit |
 | `^D` | exit on an empty line |
