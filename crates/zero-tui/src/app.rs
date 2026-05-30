@@ -299,6 +299,11 @@ pub struct App<I: Input, W: Write> {
     read_cache: zero_core::context::ReadCache,
     /// Measured, cumulative bytes the context levers saved this session (`/context`).
     context_stats: zero_core::context::ContextStats,
+    /// Directory where full tool outputs are spilled before compression, so the
+    /// model can re-fetch dropped content (cap = offload, never silent delete).
+    /// `None` (tests/no session) → compression still runs, just without a
+    /// re-fetch path. Set from the session dir by the binary.
+    artifact_dir: Option<PathBuf>,
 }
 
 // Canonical context-cap defaults live in zero_core::context (shared with Config);
@@ -351,6 +356,7 @@ impl<I: Input, W: Write> App<I, W> {
             max_turn_output: DEFAULT_MAX_TURN_OUTPUT,
             read_cache: zero_core::context::ReadCache::new(),
             context_stats: zero_core::context::ContextStats::new(),
+            artifact_dir: None,
         }
     }
 
@@ -391,6 +397,12 @@ impl<I: Input, W: Write> App<I, W> {
     pub fn set_mcp_discovery(&mut self, home: Option<PathBuf>, cwd: Option<PathBuf>) {
         self.mcp_home = home;
         self.mcp_cwd = cwd;
+    }
+
+    /// Set where full tool outputs are spilled so compressed results stay
+    /// re-fetchable. The binary points this at the session's output directory.
+    pub fn set_artifact_dir(&mut self, dir: Option<PathBuf>) {
+        self.artifact_dir = dir;
     }
 
     /// Ask the configured server for its context window (`n_ctx`) so the status
@@ -776,6 +788,7 @@ impl<I: Input, W: Write> App<I, W> {
         // block scopes those borrows so `self` is free again after it returns.
         let cap = self.max_tool_output;
         let turn_budget = self.max_turn_output;
+        let artifact_dir = self.artifact_dir.clone();
         let spent = RefCell::new(0usize); // cumulative result bytes this turn
         let read_cache = RefCell::new(std::mem::take(&mut self.read_cache));
         let stats = RefCell::new(std::mem::take(&mut self.context_stats));
@@ -815,7 +828,7 @@ impl<I: Input, W: Write> App<I, W> {
                 let raw_len = raw.len();
                 let remaining = turn_budget.saturating_sub(*spent.borrow());
                 let eff_cap = cap.min(remaining.max(TURN_OUTPUT_FLOOR));
-                let result = cap_tool_result(call, raw, eff_cap);
+                let result = cap_tool_result(call, raw, eff_cap, artifact_dir.as_deref());
                 *spent.borrow_mut() += result.len();
                 stats.borrow_mut().record_result(raw_len, result.len());
                 // Maintain the read cache: remember successful whole reads; forget
@@ -2014,17 +2027,48 @@ fn has_range(call: &ToolCall) -> bool {
 }
 
 /// Cap a tool result to `max` bytes with a tool-aware re-fetch hint.
-fn cap_tool_result(call: &ToolCall, result: String, max: usize) -> String {
+fn cap_tool_result(
+    call: &ToolCall,
+    result: String,
+    max: usize,
+    artifact_dir: Option<&std::path::Path>,
+) -> String {
     if result.len() <= max {
         return result;
     }
-    let hint = match call.name.as_str() {
-        "read_file" => "re-read this file with a narrower line range",
-        "grep" => "narrow the search pattern or path",
-        "list_dir" => "list a more specific subdirectory",
-        _ => "request a smaller slice",
-    };
-    zero_core::context::cap_middle(&result, max, hint)
+    use zero_core::compress;
+    // Offload, don't delete: spill the full output first (when a session dir is
+    // set) so the compressed view can point the model back at the complete bytes.
+    let artifact =
+        artifact_dir.and_then(|d| compress::spill(d, &sanitize_id(&call.id), result.as_bytes()));
+    compress::compress(&shape_cmd(call), &result, max, artifact.as_deref()).text
+}
+
+/// Command hint for shape detection. `read_file` is blank so the content sniff
+/// decides (json vs source vs log); `bash` uses the real command.
+fn shape_cmd(call: &ToolCall) -> String {
+    match call.name.as_str() {
+        "grep" => "grep".to_string(),
+        "list_dir" => "ls".to_string(),
+        "bash" => zero_core::tools::parse_arguments(call)
+            .ok()
+            .and_then(|a| a.get("command").and_then(|v| v.as_str().map(String::from)))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Filename-safe slice of a tool-call id, for the spill artifact name.
+fn sanitize_id(id: &str) -> String {
+    let s: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if s.is_empty() {
+        "x".to_string()
+    } else {
+        s
+    }
 }
 
 /// After a tool turn, drop bulky payloads of successfully-applied write/edit calls

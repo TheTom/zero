@@ -83,6 +83,8 @@ fn run(args: &Args) -> std::io::Result<()> {
     // also imported from Claude Desktop / Claude Code + the project's .mcp.json.
     app.set_mcp_path(cfg_path.parent().map(|d| d.join("mcp.json")));
     app.set_mcp_discovery(home(), std::env::current_dir().ok());
+    // Where full tool outputs spill so compressed results stay re-fetchable.
+    app.set_artifact_dir(outputs_dir());
     app.run()
 }
 
@@ -112,6 +114,16 @@ fn config_path() -> Option<std::path::PathBuf> {
 
 fn session_dir() -> Option<std::path::PathBuf> {
     home().map(|h| h.join(zero_core::brand::dot_dir()).join("sessions"))
+}
+
+/// Per-launch directory for spilled tool-output artifacts (the re-fetch path for
+/// compressed results). Timestamped so launches don't collide.
+fn outputs_dir() -> Option<std::path::PathBuf> {
+    home().map(|h| {
+        h.join(zero_core::brand::dot_dir())
+            .join("outputs")
+            .join(zero_core::clock::unix_millis().to_string())
+    })
 }
 
 fn servers_path() -> Option<std::path::PathBuf> {

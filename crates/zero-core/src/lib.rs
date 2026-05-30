@@ -17,6 +17,7 @@ pub mod backend;
 pub mod brand;
 pub mod builtins;
 pub mod clock;
+pub mod compress;
 pub mod config;
 pub mod context;
 pub mod discovery;
