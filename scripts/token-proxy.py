@@ -29,6 +29,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM = os.environ.get("UPSTREAM", "http://192.168.50.125:8000").rstrip("/")
 TOKEN_LOG = os.environ.get("TOKEN_LOG", "/tmp/zero-token-proxy.log")
+# Optional: if set, each forwarded request body is dumped to DUMP_DIR/req-NNN.json
+# so we can inspect what pre-context (system prompt, tool schemas) a wrapper sends.
+DUMP_DIR = os.environ.get("DUMP_DIR", "")
+_dump_n = [0]
 
 
 def _log_usage(usage):
@@ -71,6 +75,13 @@ class Proxy(BaseHTTPRequestHandler):
     def _forward(self, method):
         length = int(self.headers.get("Content-Length", 0) or 0)
         req_body = self.rfile.read(length) if length else None
+        if DUMP_DIR and req_body and self.path.endswith("/chat/completions"):
+            _dump_n[0] += 1
+            try:
+                with open(os.path.join(DUMP_DIR, f"req-{_dump_n[0]:03d}.json"), "wb") as f:
+                    f.write(req_body)
+            except Exception:
+                pass
         url = UPSTREAM + self.path
         req = urllib.request.Request(url, data=req_body, method=method)
         for k, v in self.headers.items():
