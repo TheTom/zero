@@ -187,12 +187,18 @@ fn same_answer_when_the_marker_is_in_the_kept_tail() {
 
 #[test]
 fn unstructured_middle_is_dropped_from_view_but_recoverable_from_disk() {
-    // The honest converse: for SHAPELESS output (no error/ref structure), a needle
-    // buried mid-stream is NOT kept in the head+tail donut — but it IS spilled, so
-    // it stays recoverable. This documents the real boundary of inline compression
+    // The honest converse: for GENUINELY SHAPELESS output — high-entropy lines that
+    // share no skeleton, so the repeat-fold can't collapse them — a needle buried
+    // mid-stream is NOT kept in the head+tail donut. But it IS spilled, so it stays
+    // recoverable. This documents the real, residual boundary of inline compression
     // and proves the cap is offload-not-delete even when the view can't keep the
     // middle. (A real model sees the elision marker + re-fetches via the artifact.)
-    let cmd = "for i in $(seq 1 5000); do if [ $i -eq 2500 ]; then echo MARKER=42; else echo filler line $i; fi; done";
+    //
+    // NB: semi-uniform middles (e.g. `filler line N` runs) are now *rescued* by the
+    // repeat-fold — a needle that breaks such a run survives as a fold boundary. To
+    // hit the true donut-drops-the-middle case we use distinct-length `x` lines (no
+    // two share a skeleton ⇒ no fold) with the marker buried at line 100 of 200.
+    let cmd = "for i in $(seq 1 200); do if [ $i -eq 100 ]; then echo MARKER=42; else printf 'x%.0s' $(seq 1 $i); echo; fi; done";
     let needle = "MARKER=";
     let d_on = tmp("uns-on");
     let (ans_on, bytes_on) = run_with_cap(cmd, needle, 512, &d_on);

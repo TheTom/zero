@@ -3052,7 +3052,13 @@ mod tests {
             .find(|m| m.role == Role::Tool)
             .expect("a tool result");
         assert!(tool_msg.content.len() < 2000, "bash output not capped");
-        assert!(tool_msg.content.contains("elided"));
+        // `seq` is uniform, so the repeat-fold collapses it to first+count+last
+        // rather than a byte donut — a compression marker must still be present.
+        assert!(
+            tool_msg.content.contains("similar lines") || tool_msg.content.contains("elided"),
+            "no compression marker: {}",
+            tool_msg.content
+        );
         // Recoverable: the full output spilled byte-identical and is referenced.
         assert!(tool_msg.content.contains("full output:"));
         let art = dir.join("out-b1.txt");

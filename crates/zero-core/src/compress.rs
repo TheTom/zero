@@ -26,13 +26,15 @@ use std::path::{Path, PathBuf};
 pub enum OutputShape {
     /// `grep`/`rg` results: `path:line:body` — keep refs, drop bodies.
     Grep,
-    /// A unified diff: keep `--stat` + hunk headers, drop unchanged context.
+    /// A unified diff: keep file + hunk headers and every +/- change line, drop the
+    /// unchanged context; fold near-identical change runs (bulk inserts).
     Diff,
     /// Build/test logs: keep the first error, severity lines, and the tail.
     Log,
-    /// Directory listings: depth + fan-out caps.
+    /// Directory listings: generic donut + repeat-fold (no dedicated handler yet).
     Dir,
-    /// JSON: minify (v1); structural summarize (v2).
+    /// JSON: lossless whitespace minify (keeps it valid); donut the minified bytes
+    /// only if still over budget.
     Json,
     /// Binary blob: never inline; just report size.
     Binary,
@@ -246,7 +248,9 @@ pub fn compress(cmd: &str, raw: &str, budget: usize, artifact: Option<&Path>) ->
     let text = match shape {
         OutputShape::Log => compress_log(raw, budget, artifact),
         OutputShape::Grep => compress_grep(raw, budget, artifact),
-        // Diff / Dir / Json get the generic donut in v1; dedicated handlers are v2.
+        OutputShape::Json => compress_json(raw, budget, artifact),
+        OutputShape::Diff => compress_diff(raw, budget, artifact),
+        // Dir falls through to the generic donut, which now folds repeated runs.
         _ => compress_generic(raw, budget, artifact),
     };
     let kept_bytes = text.len();
@@ -407,10 +411,186 @@ fn trim_grep_body(line: &str, cap: usize) -> String {
     }
 }
 
-/// Generic / unknown line output: head + tail "donut", middle elided, on char
-/// boundaries. Recoverable via the artifact. Tail-weighted slightly (errors and
-/// exit status live at the end).
+/// JSON: minify losslessly (strip insignificant whitespace — ~20-40% free and,
+/// unlike a byte-donut, keeps the JSON *valid* for the model to parse). A donut on
+/// JSON would splice head+tail into syntactic garbage, so we never donut raw JSON:
+/// if the minified form still exceeds budget we donut the *minified* bytes (the
+/// view is then truncated JSON, flagged + recoverable via the artifact).
+fn compress_json(raw: &str, budget: usize, artifact: Option<&Path>) -> String {
+    match json_minify(raw) {
+        // Lossless win that fits — the ideal case, no marker needed.
+        Some(min) if min.len() <= budget => min,
+        // Minified but still over budget: donut the smaller minified bytes.
+        Some(min) => {
+            let inner = compress_generic(&min, budget, artifact);
+            format!(
+                "[json minified to {} bytes, then truncated]\n{inner}",
+                min.len()
+            )
+        }
+        // Not valid JSON (e.g. unterminated string) — treat as generic text.
+        None => compress_generic(raw, budget, artifact),
+    }
+}
+
+/// Strip whitespace that sits *outside* string literals. Byte-exact for the kept
+/// content (preserves big integers, key order, escapes — everything a parse →
+/// re-serialize round-trip would risk). Returns `None` on an unterminated string
+/// (malformed input) so the caller can fall back to the generic donut.
+fn json_minify(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_str = false;
+    let mut esc = false;
+    for ch in raw.chars() {
+        if in_str {
+            out.push(ch);
+            if esc {
+                esc = false;
+            } else if ch == '\\' {
+                esc = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+        } else if ch == '"' {
+            in_str = true;
+            out.push(ch);
+        } else if !ch.is_whitespace() {
+            out.push(ch);
+        }
+        // insignificant whitespace outside strings is dropped
+    }
+    if in_str {
+        return None; // unterminated string ⇒ not well-formed JSON
+    }
+    Some(out)
+}
+
+/// Unified diff: the signal is *what changed and where* — keep every file header
+/// (`diff `, `index `, `--- `, `+++ `), every hunk header (`@@ … @@`), and every
+/// added/removed line; drop the unchanged context lines (leading space) that pad
+/// most diffs. Recoverable via the artifact. Line-driven like the log compressor.
+fn compress_diff(raw: &str, budget: usize, artifact: Option<&Path>) -> String {
+    let mut out = String::new();
+    let mut elided = 0usize;
+    let mut kept = 0usize;
+    let flush = |out: &mut String, elided: &mut usize| {
+        if *elided > 0 {
+            out.push_str(&format!("… [{} context lines elided] …\n", *elided));
+            *elided = 0;
+        }
+    };
+    for line in raw.lines() {
+        let b = line.as_bytes();
+        let is_header = line.starts_with("diff ")
+            || line.starts_with("index ")
+            || line.starts_with("--- ")
+            || line.starts_with("+++ ")
+            || line.starts_with("@@");
+        // A change line is +/- but NOT the +++/--- file headers (already caught).
+        let is_change = matches!(b.first(), Some(b'+') | Some(b'-'));
+        if is_header || is_change {
+            flush(&mut out, &mut elided);
+            out.push_str(line);
+            out.push('\n');
+            kept += 1;
+        } else {
+            elided += 1; // unchanged context (leading space) or blank
+        }
+    }
+    flush(&mut out, &mut elided);
+    // Fold runs of near-identical header/change lines (bulk inserts, generated
+    // code, repeated edits) so a diff that's *all* changes can't blow the budget.
+    // Distinct changes keep their own skeleton and never fold. Recoverable.
+    let folded = fold_repeats(&out);
+    let _ = budget; // diff compressor is structure-driven, not byte-driven
+    format!(
+        "{folded}[diff compressed: {kept} header/change lines kept, context dropped.{}]\n",
+        artifact_hint(artifact)
+    )
+}
+
+/// FNV-1a hash of a line's *skeleton*: every maximal run of ASCII digits collapses
+/// to a single `#`, so `Compiling foo v0.1` and `Compiling bar v0.2` — or `1` and
+/// `50000` — share a hash. Computed without allocating the skeleton string.
+fn skeleton_hash(line: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let byte = if b[i].is_ascii_digit() {
+            while i + 1 < b.len() && b[i + 1].is_ascii_digit() {
+                i += 1;
+            }
+            b'#'
+        } else {
+            b[i]
+        };
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    h
+}
+
+/// Collapse runs of adjacent same-skeleton lines (progress spam, numeric ranges,
+/// repeated "Compiling x" lines) to first + last + a count, so the high-signal
+/// boundaries survive while the redundant middle goes. Keeps both ends because the
+/// answer is often at a boundary (e.g. the *last* number of a `seq`). Runs shorter
+/// than REPEAT_MIN are left untouched. Lossless-of-signal; full bytes in artifact.
+fn fold_repeats(raw: &str) -> String {
+    const REPEAT_MIN: usize = 4;
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut out = String::with_capacity(raw.len());
+    let mut folded_any = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let h = skeleton_hash(lines[i]);
+        let mut j = i + 1;
+        while j < lines.len() && skeleton_hash(lines[j]) == h {
+            j += 1;
+        }
+        let run = j - i;
+        if run >= REPEAT_MIN {
+            // first line, count of the dropped middle, last line — all verbatim.
+            folded_any = true;
+            out.push_str(lines[i]);
+            out.push('\n');
+            out.push_str(&format!("… {} similar lines …\n", run - 2));
+            out.push_str(lines[j - 1]);
+            out.push('\n');
+        } else {
+            for &l in &lines[i..j] {
+                out.push_str(l);
+                out.push('\n');
+            }
+        }
+        i = j;
+    }
+    // No run folded → return the input untouched so byte counts and trailing-
+    // newline shape are preserved exactly (the caller relies on len comparison).
+    if !folded_any {
+        return raw.to_string();
+    }
+    out
+}
+
+/// Generic / unknown line output: fold repeated runs first (kills uniform spam
+/// like a 50k-line `seq` or progress bars), then a head + tail "donut" over what
+/// remains, middle elided on char boundaries. Recoverable via the artifact.
+/// Tail-weighted slightly (errors and exit status live at the end).
 fn compress_generic(raw: &str, budget: usize, artifact: Option<&Path>) -> String {
+    // Fold first: a uniform dump collapses to a few lines and may now fit budget
+    // outright, turning a lossy donut into a folded view that keeps every run's
+    // boundaries. Still byte-lossy (the middle of each run is gone), so when it
+    // fits we append the artifact pointer rather than returning silently.
+    let folded = fold_repeats(raw);
+    if folded.len() < raw.len() && folded.len() <= budget {
+        return format!(
+            "{folded}[folded repeated runs.{}]\n",
+            artifact_hint(artifact)
+        );
+    }
+    let raw = folded.as_str();
     let hint = artifact_hint(artifact);
     // Marker overhead reservation.
     let marker_room = 80 + hint.len();
@@ -702,23 +882,142 @@ mod tests {
     }
 
     #[test]
-    fn diff_dir_json_use_generic_donut_in_v1() {
-        // v1: these shapes are detected but routed through the generic donut.
-        let big_json = format!("[{}]", "\"x\",".repeat(3000));
-        let cj = compress("./tool", &big_json, 400, art());
-        assert_eq!(cj.shape, OutputShape::Json);
-        assert!(cj.text.contains("elided"));
-        assert!(cj.kept_bytes < cj.raw_bytes);
+    fn json_minify_is_lossless_outside_strings() {
+        // Whitespace between tokens goes; whitespace INSIDE strings stays.
+        let src = "{\n  \"a\" : 1,\n  \"b\": \"keep  me\"\n}";
+        let min = json_minify(src).unwrap();
+        assert_eq!(min, "{\"a\":1,\"b\":\"keep  me\"}");
+    }
 
-        let big_diff = format!("diff --git a b\n{}", "+added line\n".repeat(2000));
-        let cd = compress("git diff", &big_diff, 400, art());
-        assert_eq!(cd.shape, OutputShape::Diff);
-        assert!(cd.text.contains("elided"));
+    #[test]
+    fn json_minify_preserves_large_integers_exactly() {
+        // A parse→f64→serialize round-trip would corrupt this; byte minify must not.
+        let src = "{ \"id\": 1780157881126000007 }";
+        let min = json_minify(src).unwrap();
+        assert!(
+            min.contains("1780157881126000007"),
+            "big int corrupted: {min}"
+        );
+    }
 
-        let big_dir = "afile\n".repeat(3000);
+    #[test]
+    fn json_minify_rejects_unterminated_string() {
+        assert!(json_minify("{\"a\": \"oops").is_none());
+    }
+
+    #[test]
+    fn json_escaped_quote_does_not_end_string() {
+        let src = "{\"a\":\"he said \\\"hi\\\"  x\"}";
+        // the double-spaced run is inside the string → preserved
+        assert_eq!(json_minify(src).unwrap(), src.replace("\n", ""));
+    }
+
+    #[test]
+    fn compress_json_minifies_and_stays_valid_when_it_fits() {
+        // budget between the spaced (38 B) and minified (22 B) sizes → minify path,
+        // result fits, no donut, no marker. (Under-budget input passes verbatim by
+        // the global rule; minify is the over-budget JSON handler.)
+        let spaced = "{ \"k\" : 1 ,  \"list\" : [ 1 , 2 , 3 ] }";
+        let c = compress("./tool", spaced, 30, art());
+        assert_eq!(c.shape, OutputShape::Json);
+        assert_eq!(c.text, "{\"k\":1,\"list\":[1,2,3]}");
+    }
+
+    #[test]
+    fn compress_json_donuts_minified_bytes_when_still_too_big() {
+        // Minify alone can't get under budget → donut the minified form, flagged.
+        let big = format!("[{}]", "\"x\" , ".repeat(3000));
+        let c = compress("./tool", &big, 400, art());
+        assert_eq!(c.shape, OutputShape::Json);
+        assert!(c.text.contains("json minified"));
+        assert!(c.text.contains("elided"));
+        assert!(c.kept_bytes < c.raw_bytes);
+    }
+
+    #[test]
+    fn compress_diff_keeps_headers_and_changes_drops_context() {
+        let mut d =
+            String::from("diff --git a/x b/x\nindex 111..222\n--- a/x\n+++ b/x\n@@ -1,5 +1,5 @@\n");
+        d.push_str(" unchanged context\n".repeat(500).as_str());
+        d.push_str("-removed line\n+added line\n");
+        let c = compress("git diff", &d, 400, art());
+        assert_eq!(c.shape, OutputShape::Diff);
+        assert!(c.text.contains("@@ -1,5 +1,5 @@"), "hunk header dropped");
+        assert!(c.text.contains("-removed line") && c.text.contains("+added line"));
+        assert!(c.text.contains("+++ b/x") && c.text.contains("--- a/x"));
+        assert!(
+            !c.text.contains("unchanged context"),
+            "context should be dropped"
+        );
+        assert!(c.text.contains("context lines elided"));
+        assert!(c.kept_bytes < c.raw_bytes);
+    }
+
+    #[test]
+    fn repeat_fold_collapses_a_numeric_range_keeping_both_ends() {
+        // The seq-1-50000 case: folds to first + count + last, far under budget.
+        let mut s: String = (1..=50_000).map(|i| format!("{i}\n")).collect();
+        s.push_str("[exit 0]\n");
+        let c = compress("seq 1 50000", &s, 4096, art());
+        assert!(
+            c.text.contains("\n1\n") || c.text.starts_with("1\n"),
+            "first kept"
+        );
+        assert!(c.text.contains("50000"), "last value of the run kept");
+        assert!(c.text.contains("[exit 0]"), "trailing distinct line kept");
+        assert!(c.text.contains("similar lines"), "fold marker present");
+        assert!(
+            c.kept_bytes < 500,
+            "should fold to well under 500 B, got {}",
+            c.kept_bytes
+        );
+        assert!(c.text.contains("folded repeated runs"));
+    }
+
+    #[test]
+    fn repeat_fold_leaves_short_runs_untouched() {
+        // Fewer than REPEAT_MIN identical-skeleton lines must not fold.
+        let s = "1\n2\n3\nalpha\nbeta\n";
+        let folded = fold_repeats(s);
+        assert_eq!(folded, s, "short run wrongly folded");
+    }
+
+    #[test]
+    fn skeleton_hash_masks_digit_runs() {
+        assert_eq!(
+            skeleton_hash("Compiling foo v0.1"),
+            skeleton_hash("Compiling foo v9.9")
+        );
+        assert_eq!(skeleton_hash("1"), skeleton_hash("50000"));
+        assert_ne!(skeleton_hash("alpha"), skeleton_hash("beta"));
+    }
+
+    #[test]
+    fn dir_output_donuts_when_lines_dont_fold() {
+        // Dir has no dedicated handler. Use letters-only base-26 names (no digits,
+        // so no shared skeleton) → adjacent lines differ → no fold → generic donut.
+        let big_dir: String = (0..3000)
+            .map(|i| {
+                let mut s = String::new();
+                let mut n = i;
+                loop {
+                    s.push((b'a' + (n % 26) as u8) as char);
+                    n /= 26;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                s.push('\n');
+                s
+            })
+            .collect();
         let cdir = compress("ls -R", &big_dir, 400, art());
         assert_eq!(cdir.shape, OutputShape::Dir);
-        assert!(cdir.text.contains("elided"));
+        assert!(
+            cdir.text.contains("elided"),
+            "expected a donut on non-folding dir output"
+        );
+        assert!(cdir.kept_bytes < cdir.raw_bytes);
     }
 
     #[test]

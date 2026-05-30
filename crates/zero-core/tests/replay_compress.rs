@@ -108,14 +108,58 @@ fn pr_diff() -> Fixture {
         name: "gh pr diff (~4.6KB)",
         cmd: "gh pr diff 93",
         raw,
-        must_keep: vec!["diff --git".into()],
-        min_reduction_pct: 10,
+        // Headers + hunk location must survive; bulk near-identical adds fold.
+        must_keep: vec!["diff --git".into(), "@@ -10,7 +10,9 @@".into()],
+        min_reduction_pct: 80, // real diff compressor (was generic-donut at 10%)
         expect_shape: OutputShape::Diff,
     }
 }
 
+/// A pretty-printed JSON blob (config / API response). A byte-donut would splice
+/// it into invalid JSON; the minifier must keep it valid and shrink it losslessly.
+fn json_blob() -> Fixture {
+    let mut raw = String::from("{\n  \"items\": [\n");
+    for i in 0..400 {
+        raw.push_str(&format!(
+            "    {{ \"id\": {}, \"name\": \"item number {i}\", \"ok\": true }},\n",
+            1_780_000_000_000_i64 + i as i64 // big int the minifier must keep exact
+        ));
+    }
+    raw.push_str("    null\n  ]\n}\n");
+    Fixture {
+        name: "pretty JSON (400 items)",
+        cmd: "cat config.json",
+        raw,
+        // A large id must survive byte-exact (no f64 round-trip corruption).
+        must_keep: vec!["1780000000000".into(), "\"items\"".into()],
+        min_reduction_pct: 30,
+        expect_shape: OutputShape::Json,
+    }
+}
+
+/// A uniform dump (`seq`-style): every line shares a digit-masked skeleton, so the
+/// repeat-fold must collapse it to first + count + last instead of a lossy donut.
+fn uniform_dump() -> Fixture {
+    let mut raw: String = (1..=20_000).map(|i| format!("{i}\n")).collect();
+    raw.push_str("[exit 0]\n");
+    Fixture {
+        name: "seq 1 20000 (uniform)",
+        cmd: "seq 1 20000",
+        raw,
+        must_keep: vec!["20000".into(), "[exit 0]".into()], // both ends survive
+        min_reduction_pct: 95,
+        expect_shape: OutputShape::Generic,
+    }
+}
+
 fn fixtures() -> Vec<Fixture> {
-    vec![grep_dump(), build_log(), pr_diff()]
+    vec![
+        grep_dump(),
+        build_log(),
+        pr_diff(),
+        json_blob(),
+        uniform_dump(),
+    ]
 }
 
 #[test]

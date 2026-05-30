@@ -144,8 +144,10 @@ fn large_output_is_capped_but_fully_recoverable() {
     let r = &tool_results(&app)[0];
     // Capped in the model's view.
     assert!(r.len() < 2000, "not capped: {} bytes", r.len());
+    // seq is uniform → repeat-fold collapses it (first+count+last); other shapes
+    // donut ("elided") or summarize ("compressed"). Any cap marker is acceptable.
     assert!(
-        r.contains("elided") || r.contains("compressed"),
+        r.contains("elided") || r.contains("compressed") || r.contains("folded"),
         "no cap marker: {r}"
     );
     // Recoverable: the full output spilled byte-identical and is referenced.
@@ -244,8 +246,12 @@ fn replays_a_multi_command_session_bounding_each_result() {
     let results = tool_results(&app);
     assert_eq!(results.len(), 3, "expected 3 tool results");
 
-    // 1) big seq capped + recoverable.
-    assert!(results[0].contains("elided") || results[0].contains("compressed"));
+    // 1) big seq capped + recoverable (uniform → repeat-fold).
+    assert!(
+        results[0].contains("elided")
+            || results[0].contains("compressed")
+            || results[0].contains("folded")
+    );
     assert!(results[0].contains("full output:"));
     assert!(dir.join("out-m1.txt").exists());
 
