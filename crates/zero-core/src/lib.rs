@@ -12,6 +12,7 @@
 //! core — anything the terminal can do, the app can do, because the capability
 //! lives here, not in the UI.
 
+pub mod agent;
 pub mod backend;
 pub mod brand;
 pub mod builtins;

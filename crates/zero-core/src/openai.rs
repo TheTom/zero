@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::http;
 use crate::json::Value;
 use crate::message::{Conversation, Message, Role};
+use crate::tools::ToolDef;
 use std::time::Duration;
 
 /// A backend that streams from an OpenAI-compatible server.
@@ -62,6 +63,80 @@ impl OpenAiBackend {
         }
         Value::Object(obj).to_json()
     }
+
+    /// Build a NON-streaming request body for the tool loop, advertising `tools`.
+    /// Streaming is deliberately off: local servers' streaming tool-call parsers
+    /// are buggy (calls split/lost/mis-typed across chunks), so the loop reads
+    /// the whole completion at once.
+    fn build_tool_body(&self, conv: &Conversation, tools: &[ToolDef]) -> String {
+        let mut messages: Vec<Value> = Vec::new();
+        if let Some(sys) = &self.system_prompt {
+            messages.push(Message::new(Role::System, sys.clone()).to_value());
+        }
+        messages.extend(conv.messages.iter().map(Message::to_value));
+
+        let mut obj = vec![
+            ("model".to_string(), Value::Str(self.model.clone())),
+            ("stream".to_string(), Value::Bool(false)),
+            ("messages".to_string(), Value::Array(messages)),
+        ];
+        if !tools.is_empty() {
+            obj.push(("tools".to_string(), crate::tools::tools_value(tools)));
+        }
+        if let Some(t) = self.temperature {
+            obj.push(("temperature".to_string(), Value::Num(t)));
+        }
+        Value::Object(obj).to_json()
+    }
+
+    /// One non-streaming completion turn with tools. Returns the assistant's
+    /// text plus any tool calls it requested (structured or text-fallback).
+    pub fn complete(
+        &self,
+        conv: &Conversation,
+        tools: &[ToolDef],
+        timeout: Duration,
+    ) -> Result<Completion, BackendError> {
+        let body = self.build_tool_body(conv, tools);
+        let mut headers: Vec<(String, String)> = Vec::new();
+        if let Some(key) = &self.api_key {
+            headers.push(("Authorization".to_string(), format!("Bearer {key}")));
+        }
+        let (code, text) = http::post(&self.endpoint, &headers, &body, timeout)
+            .map_err(|e| BackendError(e.to_string()))?;
+        if !(200..300).contains(&code) {
+            return Err(BackendError(format!("HTTP {code}: {}", text.trim())));
+        }
+        parse_completion(&text)
+    }
+}
+
+/// The result of a non-streaming completion: assistant text + requested calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub content: String,
+    pub tool_calls: Vec<crate::message::ToolCall>,
+}
+
+/// Parse a non-streaming `/v1/chat/completions` response into a [`Completion`].
+fn parse_completion(body: &str) -> Result<Completion, BackendError> {
+    let v = Value::parse(body).map_err(|e| BackendError(format!("bad JSON: {e}")))?;
+    let message = v
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(<[_]>::first)
+        .and_then(|c| c.get("message"))
+        .ok_or_else(|| BackendError("response has no choices[0].message".to_string()))?;
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let tool_calls = crate::tools::parse_tool_calls(message);
+    Ok(Completion {
+        content,
+        tool_calls,
+    })
 }
 
 impl Backend for OpenAiBackend {
@@ -249,6 +324,178 @@ mod tests {
         // Missing completion_tokens → not a usable usage chunk.
         let line = r#"data: {"choices":[],"usage":{"prompt_tokens":12}}"#;
         assert_eq!(parse_sse_line(line), None);
+    }
+
+    #[test]
+    fn build_tool_body_is_non_streaming_and_includes_tools() {
+        let b = OpenAiBackend::from_config(&cfg()).unwrap();
+        let defs = vec![ToolDef::new(
+            "ls",
+            "list",
+            Value::Object(vec![("type".to_string(), Value::Str("object".to_string()))]),
+        )];
+        let v = Value::parse(&b.build_tool_body(&Conversation::new(), &defs)).unwrap();
+        assert_eq!(v.get("stream").and_then(Value::as_bool), Some(false));
+        let tools = v.get("tools").and_then(Value::as_array).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0]
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str),
+            Some("ls")
+        );
+    }
+
+    #[test]
+    fn build_tool_body_omits_tools_when_empty() {
+        let b = OpenAiBackend::from_config(&cfg()).unwrap();
+        let v = Value::parse(&b.build_tool_body(&Conversation::new(), &[])).unwrap();
+        assert!(v.get("tools").is_none());
+    }
+
+    #[test]
+    fn parse_completion_extracts_text_and_calls() {
+        let body = r#"{"choices":[{"message":{"content":"sure","tool_calls":[
+            {"id":"c1","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]}}]}"#;
+        let c = parse_completion(body).unwrap();
+        assert_eq!(c.content, "sure");
+        assert_eq!(c.tool_calls.len(), 1);
+        assert_eq!(c.tool_calls[0].name, "read_file");
+    }
+
+    #[test]
+    fn parse_completion_text_only() {
+        let body = r#"{"choices":[{"message":{"content":"just text"}}]}"#;
+        let c = parse_completion(body).unwrap();
+        assert_eq!(c.content, "just text");
+        assert!(c.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn parse_completion_errors_on_no_choices() {
+        assert!(parse_completion(r#"{"choices":[]}"#).is_err());
+        assert!(parse_completion("not json").is_err());
+    }
+
+    #[test]
+    fn complete_against_a_localhost_mock() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(150))).ok();
+            let mut buf = [0u8; 2048];
+            while let Ok(n) = sock.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+            let body = r#"{"choices":[{"message":{"content":"","tool_calls":[{"id":"x","function":{"name":"grep","arguments":"{}"}}]}}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+
+        let cfg = Config {
+            base_url: Some(format!("http://127.0.0.1:{port}")),
+            model: "m".to_string(),
+            ..Config::default()
+        };
+        let backend = OpenAiBackend::from_config(&cfg).unwrap();
+        let c = backend
+            .complete(&Conversation::new(), &[], Duration::from_millis(500))
+            .unwrap();
+        assert_eq!(c.tool_calls.len(), 1);
+        assert_eq!(c.tool_calls[0].name, "grep");
+    }
+
+    #[test]
+    fn complete_sends_auth_header_and_parses_content_fallback() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let got = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let got2 = got.clone();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(150))).ok();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 2048];
+            // Drain the whole request (headers + body) so the client's body
+            // write always completes — the read timeout ends the loop. (Breaking
+            // early at the header boundary can RST the client mid-body.)
+            while let Ok(n) = sock.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+            }
+            *got2.lock().unwrap() = String::from_utf8_lossy(&req).into_owned();
+            // Tool call hidden in content (quantized-model shape), no structured field.
+            let body = r#"{"choices":[{"message":{"content":"<tool_call>{\"name\":\"ls\",\"arguments\":{}}</tool_call>"}}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+        let cfg = Config {
+            base_url: Some(format!("http://127.0.0.1:{port}")),
+            model: "m".to_string(),
+            api_key: Some("sk-tok".to_string()),
+            ..Config::default()
+        };
+        let backend = OpenAiBackend::from_config(&cfg).unwrap();
+        let c = backend
+            .complete(&Conversation::new(), &[], Duration::from_millis(500))
+            .unwrap();
+        assert_eq!(c.tool_calls.len(), 1);
+        assert_eq!(c.tool_calls[0].name, "ls");
+        assert!(got.lock().unwrap().contains("Authorization: Bearer sk-tok"));
+    }
+
+    #[test]
+    fn complete_surfaces_http_error_status() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(150))).ok();
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = sock.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+            let resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 3\r\n\r\nbad";
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+        let cfg = Config {
+            base_url: Some(format!("http://127.0.0.1:{port}")),
+            model: "m".to_string(),
+            ..Config::default()
+        };
+        let backend = OpenAiBackend::from_config(&cfg).unwrap();
+        let err = backend
+            .complete(&Conversation::new(), &[], Duration::from_millis(500))
+            .unwrap_err();
+        assert!(err.0.contains("400"));
     }
 
     #[test]

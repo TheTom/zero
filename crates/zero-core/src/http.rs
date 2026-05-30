@@ -91,6 +91,52 @@ pub fn post_stream(
     Ok(())
 }
 
+/// POST `body` to `url` and read the full response (with connect + read
+/// timeouts), returning `(status_code, body)`. Used for non-streamed completions
+/// — the agentic tool loop disables streaming to dodge the local-server
+/// streaming-tool-call parser bugs, so it reads the whole JSON in one shot.
+pub fn post(
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+    timeout: Duration,
+) -> io::Result<(u16, String)> {
+    let u = parse_url(url).map_err(io::Error::other)?;
+    let addr = (u.host.as_str(), u.port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::other("could not resolve host"))?;
+    let stream = TcpStream::connect_timeout(&addr, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let mut stream = stream;
+
+    let mut req = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n",
+        u.path,
+        u.host,
+        body.len()
+    );
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let (code, chunked) = read_status_and_headers(&mut reader)?;
+    let mut buf = Vec::new();
+    if chunked {
+        read_chunked_raw(&mut reader, &mut buf)?;
+    } else {
+        reader.read_to_end(&mut buf)?;
+    }
+    Ok((code, String::from_utf8_lossy(&buf).into_owned()))
+}
+
 /// GET `url` (with connect + read timeouts) and return `(status_code, body)`.
 /// Used for short, non-streamed responses like `/v1/models` during discovery.
 pub fn get(url: &str, timeout: Duration) -> io::Result<(u16, String)> {
@@ -371,6 +417,35 @@ mod tests {
         let (code, body) = get(&url, Duration::from_secs(2)).unwrap();
         assert_eq!(code, 200);
         assert!(body.contains("models"));
+    }
+
+    #[test]
+    fn post_reads_status_and_body() {
+        let url = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}".to_vec(),
+        );
+        let (code, body) = post(&url, &[], "{\"q\":1}", Duration::from_secs(2)).unwrap();
+        assert_eq!(code, 200);
+        assert!(body.contains("ok"));
+    }
+
+    #[test]
+    fn post_reads_chunked_body() {
+        let url = serve_once(chunked(&[b"{\"cho", b"ices\":[]}"]));
+        let (code, body) = post(&url, &[], "{}", Duration::from_secs(2)).unwrap();
+        assert_eq!(code, 200);
+        assert!(body.contains("choices"));
+    }
+
+    #[test]
+    fn post_on_refused_port_errors() {
+        assert!(post(
+            "http://127.0.0.1:1/x",
+            &[],
+            "{}",
+            Duration::from_millis(200)
+        )
+        .is_err());
     }
 
     #[test]
