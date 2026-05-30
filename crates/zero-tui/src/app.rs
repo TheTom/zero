@@ -422,6 +422,12 @@ impl<I: Input, W: Write> App<I, W> {
         &self.context_stats
     }
 
+    /// Server-reported token usage of the most recent turn, if the backend
+    /// reported it (`None` for the stub). Lets a headless run print real tokens.
+    pub fn last_usage(&self) -> Option<zero_core::backend::Usage> {
+        self.last_usage
+    }
+
     /// Run a single turn headlessly and return the assistant's final reply.
     /// Uses the agentic tool loop when tools are enabled (so `bash`/builtins run
     /// and their output flows through the spill+compress path), otherwise a bare
@@ -438,6 +444,9 @@ impl<I: Input, W: Write> App<I, W> {
                 Ok(c) => {
                     self.write_text(&c.content)?;
                     self.conv.push(Message::assistant(&c.content));
+                    if let Some(u) = c.usage {
+                        self.last_usage = Some(u);
+                    }
                     self.last_reply = c.content;
                 }
                 Err(e) => {
@@ -925,6 +934,11 @@ impl<I: Input, W: Write> App<I, W> {
                 };
                 self.write_text(&format!("{note}\n"))?;
                 self.last_reply = outcome.final_text.clone();
+                // Summed server-reported tokens across the turn's rounds, so a
+                // headless caller (and the status line) can report real usage.
+                if outcome.usage.total() > 0 {
+                    self.last_usage = Some(outcome.usage);
+                }
                 self.last_blocks = crate::markdown::code_blocks(&outcome.final_text);
                 if let Some(log) = self.log.as_mut() {
                     let _ = log.record_message(Role::Assistant, &outcome.final_text);
@@ -2931,11 +2945,13 @@ mod tests {
                     Ok(zero_core::backend::Completion {
                         content: String::new(),
                         tool_calls: vec![ToolCall::new("c1", "grep", r#"{"pattern":"fn"}"#)],
+                        usage: None,
                     })
                 } else {
                     Ok(zero_core::backend::Completion {
                         content: "done".to_string(),
                         tool_calls: vec![],
+                        usage: None,
                     })
                 }
             }
@@ -3001,11 +3017,13 @@ mod tests {
                             "bash",
                             r#"{"command":"seq 1 5000"}"#,
                         )],
+                        usage: None,
                     })
                 } else {
                     Ok(zero_core::backend::Completion {
                         content: "done".to_string(),
                         tool_calls: vec![],
+                        usage: None,
                     })
                 }
             }
@@ -3184,11 +3202,13 @@ mod tests {
                     zero_core::backend::Completion {
                         content: String::new(),
                         tool_calls: vec![ToolCall::new("c1", "list_dir", r#"{"path":"."}"#)],
+                        usage: None,
                     }
                 } else {
                     zero_core::backend::Completion {
                         content: "all done".to_string(),
                         tool_calls: Vec::new(),
+                        usage: None,
                     }
                 })
             }
@@ -3286,6 +3306,7 @@ mod tests {
             Ok(zero_core::backend::Completion {
                 content: String::new(),
                 tool_calls: vec![ToolCall::new(format!("c{n}"), "list_dir", args)],
+                usage: None,
             })
         }
     }
@@ -3356,11 +3377,13 @@ mod tests {
                             "write_file",
                             format!(r#"{{"path":"{}","content":"hi"}}"#, self.path),
                         )],
+                        usage: None,
                     }
                 } else {
                     zero_core::backend::Completion {
                         content: "saved it".to_string(),
                         tool_calls: Vec::new(),
+                        usage: None,
                     }
                 })
             }
@@ -3431,11 +3454,13 @@ mod tests {
                             "edit_file",
                             r#"{"path":"x","old_string":"a","new_string":"b"}"#,
                         )],
+                        usage: None,
                     }
                 } else {
                     zero_core::backend::Completion {
                         content: "ok, I won't".to_string(),
                         tool_calls: Vec::new(),
+                        usage: None,
                     }
                 })
             }
@@ -4805,10 +4830,12 @@ mod tests {
                             "read_file",
                             r#"{"path":"f.txt"}"#,
                         )],
+                        usage: None,
                     },
                     _ => zero_core::backend::Completion {
                         content: "done".to_string(),
                         tool_calls: vec![],
+                        usage: None,
                     },
                 })
             }

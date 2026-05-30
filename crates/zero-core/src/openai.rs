@@ -127,9 +127,13 @@ fn parse_completion(body: &str) -> Result<Completion, BackendError> {
         .unwrap_or("")
         .to_string();
     let tool_calls = crate::tools::parse_tool_calls(message);
+    // Top-level `usage` on a non-streaming response (OpenAI always includes it;
+    // llama.cpp does too). Best-effort — absent or partial → None.
+    let usage = v.get("usage").and_then(parse_usage);
     Ok(Completion {
         content,
         tool_calls,
+        usage,
     })
 }
 

@@ -96,6 +96,17 @@ fn run(args: &Args) -> std::io::Result<()> {
         app.set_artifact_dir(outputs_dir());
         app.set_tools_enabled(args.tools);
         let reply = app.run_once(prompt.trim())?;
+        // Real, server-reported token usage for the turn (summed across agentic
+        // rounds) — to stderr so stdout stays just the reply. Machine-greppable
+        // for the Zero-vs-Hermes benchmark; absent for the stub backend.
+        if let Some(u) = app.last_usage() {
+            eprintln!(
+                "[usage: prompt={} completion={} total={}]",
+                u.prompt_tokens,
+                u.completion_tokens,
+                u.total()
+            );
+        }
         println!("{reply}");
         return Ok(());
     }

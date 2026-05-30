@@ -26,6 +26,10 @@ pub struct TurnOutcome {
     pub stop: AgentStop,
     /// Number of tool-call rounds executed.
     pub rounds: usize,
+    /// Server-reported token usage summed across every model round of this turn
+    /// (so an agentic turn that took 3 round-trips reports all 3). Zero when the
+    /// backend reported no usage (e.g. the stub).
+    pub usage: crate::backend::Usage,
 }
 
 /// Why the agent loop ended.
@@ -90,8 +94,14 @@ pub fn run_turn(
     on_text: &mut dyn FnMut(&str),
 ) -> Result<TurnOutcome, BackendError> {
     let mut rounds = 0;
+    let mut usage = crate::backend::Usage::default();
     loop {
         let completion = completer.complete(conv, tools)?;
+        // Accumulate server-reported tokens across every round of the turn.
+        if let Some(u) = completion.usage {
+            usage.prompt_tokens += u.prompt_tokens;
+            usage.completion_tokens += u.completion_tokens;
+        }
 
         // No tool calls → this is the final answer. Record it and finish.
         if completion.tool_calls.is_empty() {
@@ -103,6 +113,7 @@ pub fn run_turn(
                 final_text: completion.content,
                 stop: AgentStop::Done,
                 rounds,
+                usage,
             });
         }
 
@@ -128,6 +139,7 @@ pub fn run_turn(
                 final_text: completion.content,
                 stop: AgentStop::DoomLoop,
                 rounds,
+                usage,
             });
         }
 
@@ -149,6 +161,7 @@ pub fn run_turn(
                 final_text: completion.content,
                 stop: AgentStop::MaxSteps,
                 rounds,
+                usage,
             });
         }
     }
@@ -163,12 +176,14 @@ mod tests {
         Completion {
             content: s.to_string(),
             tool_calls: Vec::new(),
+            usage: None,
         }
     }
     fn call_completion(name: &str) -> Completion {
         Completion {
             content: String::new(),
             tool_calls: vec![ToolCall::new("c1", name, "{}")],
+            usage: None,
         }
     }
 
@@ -246,6 +261,7 @@ mod tests {
                         ToolCall::new("a", "ls", "{}"),
                         ToolCall::new("b", "pwd", "{}"),
                     ],
+                    usage: None,
                 }
             } else {
                 text_completion("done")
@@ -286,6 +302,7 @@ mod tests {
                     "ls",
                     format!("{{\"n\":{n}}}"),
                 )],
+                usage: None,
             })
         };
         let mut exec = |_: &ToolCall| "ok".to_string();
@@ -358,6 +375,7 @@ mod tests {
                 Completion {
                     content: "let me check".to_string(),
                     tool_calls: vec![ToolCall::new("c1", "ls", "{}")],
+                    usage: None,
                 }
             } else {
                 text_completion("done")
@@ -415,6 +433,7 @@ mod tests {
                     return Ok(Completion {
                         content: "final".to_string(),
                         tool_calls: vec![],
+                        usage: None,
                     });
                 }
                 let n = r.below(3) + 1;
@@ -424,6 +443,7 @@ mod tests {
                 Ok(Completion {
                     content: String::new(),
                     tool_calls: calls,
+                    usage: None,
                 })
             };
             let mut exec = |_: &ToolCall| "ok".to_string();

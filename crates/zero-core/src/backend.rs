@@ -104,15 +104,19 @@ pub trait Backend: Send + Sync {
         Ok(Completion {
             content,
             tool_calls,
+            usage: None, // the stream-fallback path doesn't capture a usage total
         })
     }
 }
 
-/// The result of a non-streaming completion: assistant text + requested calls.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The result of a non-streaming completion: assistant text + requested calls,
+/// plus the server-reported token usage for the request when available (the
+/// agent loop sums it across rounds so a headless run can report real tokens).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Completion {
     pub content: String,
     pub tool_calls: Vec<crate::message::ToolCall>,
+    pub usage: Option<Usage>,
 }
 
 /// A dependency-free fake backend for the TUI-first slice. It echoes a canned

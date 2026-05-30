@@ -181,14 +181,15 @@ fn headless_tools_run_bash_against_a_real_http_backend() {
             let mut r = round.lock().unwrap();
             *r += 1;
             let body = if *r == 1 {
-                // Structured tool call: run the sentinel echo via bash.
+                // Structured tool call: run the sentinel echo via bash. Includes a
+                // top-level `usage` (as OpenAI / llama.cpp do on non-streaming calls).
                 format!(
-                    r#"{{"choices":[{{"message":{{"content":"","tool_calls":[{{"id":"c1","type":"function","function":{{"name":"bash","arguments":"{{\"command\":\"echo {sentinel}\"}}"}}}}]}}}}]}}"#
+                    r#"{{"choices":[{{"message":{{"content":"","tool_calls":[{{"id":"c1","type":"function","function":{{"name":"bash","arguments":"{{\"command\":\"echo {sentinel}\"}}"}}}}]}}}}],"usage":{{"prompt_tokens":40,"completion_tokens":12}}}}"#
                 )
             } else {
                 // Final answer relaying the output.
                 format!(
-                    r#"{{"choices":[{{"message":{{"content":"the command printed {sentinel}"}}}}]}}"#
+                    r#"{{"choices":[{{"message":{{"content":"the command printed {sentinel}"}}}}],"usage":{{"prompt_tokens":55,"completion_tokens":8}}}}"#
                 )
             };
             let resp = format!(
@@ -228,6 +229,13 @@ fn headless_tools_run_bash_against_a_real_http_backend() {
     assert!(
         stderr.contains("bash") && stderr.contains(sentinel),
         "bash trace missing the sentinel on stderr: {stderr:?}"
+    );
+    // Real token usage is reported on stderr, SUMMED across the two model rounds
+    // (round 1: 40+12, round 2: 55+8 → prompt=95 completion=20 total=115). This is
+    // the figure the Zero-vs-Hermes benchmark reads.
+    assert!(
+        stderr.contains("[usage: prompt=95 completion=20 total=115]"),
+        "summed usage not reported on stderr: {stderr:?}"
     );
 }
 

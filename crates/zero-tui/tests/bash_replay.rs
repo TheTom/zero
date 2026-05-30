@@ -80,11 +80,13 @@ impl Backend for ReplayBackend {
             Ok(Completion {
                 content: String::new(),
                 tool_calls: vec![ToolCall::new(id.as_str(), "bash", args)],
+                usage: None,
             })
         } else {
             Ok(Completion {
                 content: "done".to_string(),
                 tool_calls: vec![],
+                usage: None,
             })
         }
     }
