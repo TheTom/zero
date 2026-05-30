@@ -79,6 +79,26 @@ def extract_json(text):
     raise ValueError("unbalanced JSON in judge reply")
 
 
+def judge_single(prompt, artifact):
+    """Score ONE deliverable 0-10 per criterion against the task. For ablations
+    where each arm is scored absolutely (temp=0 → deterministic). Returns {crit:score}."""
+    rubric_lines = "\n".join(f"  - {k}: {desc}" for k, desc in RUBRIC)
+    user = f"""TASK:
+{prompt}
+
+--- CANDIDATE ---
+{artifact}
+
+Score the candidate 0-10 on every criterion (be strict; the spec is the yardstick,
+not length):
+{rubric_lines}
+
+Return ONLY this JSON (integers 0-10):
+{{{', '.join(f'"{k}": 0' for k, _ in RUBRIC)}, "note": "one sentence"}}"""
+    reply = chat([{"role": "system", "content": SYS}, {"role": "user", "content": user}])
+    return extract_json(reply)
+
+
 def judge_once(prompt, left, right):
     """One scoring pass: X=left, Y=right. Returns {'X':{crit:score}, 'Y':{...}}."""
     rubric_lines = "\n".join(f"  - {k}: {desc}" for k, desc in RUBRIC)
@@ -121,14 +141,28 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt")
     ap.add_argument("--prompt-file")
-    ap.add_argument("--a", required=True, help="path to deliverable A")
-    ap.add_argument("--b", required=True, help="path to deliverable B")
+    ap.add_argument("--a", required=True, help="path to deliverable A (or the only one with --single)")
+    ap.add_argument("--b", help="path to deliverable B (omit with --single)")
     ap.add_argument("--a-name", default="A")
     ap.add_argument("--b-name", default="B")
+    ap.add_argument("--single", action="store_true", help="score just --a absolutely (ablation mode)")
     args = ap.parse_args()
 
     prompt = args.prompt or open(args.prompt_file).read()
     a = open(args.a).read()
+
+    # Single-artifact absolute scoring (for ablations).
+    if args.single:
+        crit = judge_single(prompt, a)
+        total = round(sum(v for k, v in crit.items() if k != "note"), 1)
+        print(json.dumps({
+            "scores": {k: v for k, v in crit.items() if k != "note"},
+            "total": total,
+            "max_total": len(RUBRIC) * 10,
+            "note": crit.get("note", ""),
+        }, indent=2))
+        return
+
     b = open(args.b).read()
 
     # Two passes, positions swapped, to cancel the judge's position bias.
