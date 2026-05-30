@@ -28,7 +28,7 @@ fn cells(line: &str) -> (Vec<Cell>, String) {
             pending.push(c);
             // CSI: ESC [ ... final byte in 0x40..=0x7e.
             if chars.peek() == Some(&'[') {
-                pending.push(chars.next().unwrap());
+                pending.push(chars.next().expect("just peeked '['"));
                 for p in chars.by_ref() {
                     pending.push(p);
                     if ('\x40'..='\x7e').contains(&p) {
