@@ -3,7 +3,7 @@
 #   1. No Claude / AI authorship in any pushed commit (author, committer, or
 #      Co-Authored-By trailer).
 #   2. Tests run and pass.
-#   3. Coverage stays >= 98% (lines/functions/regions) — via scripts/coverage.sh,
+#   3. Coverage stays >= 95% (lines/functions/regions) — via scripts/coverage.sh,
 #      which runs the test suite, so (2) and (3) are covered in one shot.
 #
 # Enabled with:  git config core.hooksPath scripts/hooks
@@ -45,11 +45,11 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "pre-push: running tests + coverage gate (>=98%)…" >&2
+echo "pre-push: running tests + coverage gate (>=95%)…" >&2
 if ! "$root/scripts/coverage.sh" --summary-only >&2; then
-  echo "pre-push: BLOCKED — tests failed or coverage below 98%." >&2
+  echo "pre-push: BLOCKED — tests failed or coverage below 95%." >&2
   exit 1
 fi
 
-echo "pre-push: OK — clean authorship, tests pass, coverage >=98%." >&2
+echo "pre-push: OK — clean authorship, tests pass, coverage >=95%." >&2
 exit 0

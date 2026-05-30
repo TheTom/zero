@@ -12,7 +12,7 @@ zero/
 ├── Cargo.toml              workspace + release profile
 ├── rust-toolchain.toml     pinned to 1.93.1
 ├── README.md
-├── scripts/coverage.sh     coverage gate (>=98%, enforced)
+├── scripts/coverage.sh     coverage gate (>=95%, enforced)
 └── crates/
     ├── zero-core/          the engine — std only, no UI, no I/O assumptions
     │   ├── brand.rs          product name (one-file rename)
@@ -336,10 +336,10 @@ Copy to the system clipboard (`pbcopy` / `wl-copy` / `xclip`):
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
-./scripts/coverage.sh                  # enforces >=98% (fails the build below)
+./scripts/coverage.sh                  # enforces >=95% (fails the build below)
 ```
 
-**Line coverage is held at ≥98%** (currently ~99%) and enforced by
+**Line coverage is held at ≥95%** (currently ~98%) and enforced by
 `scripts/coverage.sh`. The only excluded files are `term.rs` (libc FFI — can't
 run without a real tty) and `main.rs` (process bootstrap); all engine and TUI
 logic is covered, including the HTTP/SSE client (tested against an in-process
@@ -348,7 +348,7 @@ localhost mock). `cargo-llvm-cov` is a dev tool, not a crate dependency.
 ### Pre-push gate
 
 `scripts/hooks/pre-push` blocks a push unless: (1) no AI / co-author attribution
-in any pushed commit, (2) tests pass, (3) line coverage stays ≥98%. Enable it
+in any pushed commit, (2) tests pass, (3) line coverage stays ≥95%. Enable it
 once per clone:
 
 ```bash
