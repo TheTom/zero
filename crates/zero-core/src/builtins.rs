@@ -30,8 +30,24 @@ pub fn definitions() -> Vec<ToolDef> {
     vec![
         ToolDef::new(
             "read_file",
-            "Read a UTF-8 text file and return its contents.",
-            schema(&[("path", "string", "Path to the file to read.", true)]),
+            "Read a UTF-8 text file. Optionally pass a line range (offset/limit) \
+             to fetch only a span — e.g. after grep points you at file:line, read \
+             that span instead of the whole file to save context.",
+            schema(&[
+                ("path", "string", "Path to the file to read.", true),
+                (
+                    "offset",
+                    "integer",
+                    "1-based first line to read (optional; default 1).",
+                    false,
+                ),
+                (
+                    "limit",
+                    "integer",
+                    "Max number of lines to read from offset (optional).",
+                    false,
+                ),
+            ]),
         ),
         ToolDef::new(
             "list_dir",
@@ -100,6 +116,22 @@ pub fn is_builtin(name: &str) -> bool {
 fn read_file(args: &Value, root: Option<&Path>) -> Result<String, String> {
     let path = resolve(req_str(args, "path")?, root)?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("read failed: {e}"))?;
+    // Optional line range (1-based `offset`, `limit` lines) — lets the model fetch
+    // the precise span a grep pointer named instead of the whole file. This is
+    // the second half of the two-stage "search returns pointers, read fetches the
+    // span" pattern that keeps the context window small.
+    let offset = opt_u64(args, "offset");
+    let limit = opt_u64(args, "limit");
+    if offset.is_some() || limit.is_some() {
+        let lines: Vec<&str> = text.lines().collect();
+        let start = offset
+            .map(|o| (o.max(1) - 1) as usize)
+            .unwrap_or(0)
+            .min(lines.len());
+        let count = limit.map(|l| l as usize).unwrap_or(lines.len() - start);
+        let end = start.saturating_add(count).min(lines.len());
+        return Ok(truncate(&lines[start..end].join("\n")));
+    }
     Ok(truncate(&text))
 }
 
@@ -142,7 +174,11 @@ fn grep(args: &Value, root: Option<&Path>) -> Result<String, String> {
         if let Ok(text) = std::fs::read_to_string(file) {
             for (n, line) in text.lines().enumerate() {
                 if line.contains(pattern) {
-                    hits.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
+                    // Cap each preview so one minified/huge line can't bloat the
+                    // pointer list — the model reads the span via read_file if it
+                    // needs more than this snippet.
+                    let preview = grep_preview(line.trim());
+                    hits.push(format!("{}:{}: {}", file.display(), n + 1, preview));
                     if hits.len() >= MAX_GREP_HITS {
                         truncated = true;
                         break;
@@ -237,6 +273,25 @@ fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
 
 fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
+}
+
+/// Trim a grep match line to a single short preview (≤160 chars, char-safe) so a
+/// minified or generated line doesn't blow up the pointer list.
+fn grep_preview(line: &str) -> String {
+    const MAX: usize = 160;
+    if line.chars().count() <= MAX {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(MAX).collect();
+    format!("{cut}…")
+}
+
+/// Optional non-negative integer argument (JSON numbers are f64).
+fn opt_u64(args: &Value, key: &str) -> Option<u64> {
+    args.get(key)
+        .and_then(Value::as_f64)
+        .filter(|n| *n >= 0.0)
+        .map(|n| n as u64)
 }
 
 /// Resolve a tool-supplied path against an optional confinement `root`. An
@@ -367,6 +422,94 @@ mod tests {
         assert!(out.contains("c.txt"));
         assert!(out.contains(":2:"));
         assert!(out.contains("beta needle"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_file_line_range_returns_only_the_span() {
+        let dir = tmp();
+        let body = (1..=100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("f.txt"), &body).unwrap();
+
+        // offset+limit fetches exactly that span — much smaller than the whole.
+        let span = execute(
+            "read_file",
+            r#"{"path":"f.txt","offset":10,"limit":3}"#,
+            Some(&dir),
+        )
+        .unwrap();
+        assert_eq!(span, "line 10\nline 11\nline 12");
+        let whole = execute("read_file", r#"{"path":"f.txt"}"#, Some(&dir)).unwrap();
+        assert!(span.len() < whole.len() / 5, "span not much smaller"); // proven saving
+
+        // offset alone reads to EOF from that line.
+        let tail = execute("read_file", r#"{"path":"f.txt","offset":99}"#, Some(&dir)).unwrap();
+        assert_eq!(tail, "line 99\nline 100");
+
+        // offset past EOF is empty, not an error (graceful).
+        let past = execute("read_file", r#"{"path":"f.txt","offset":9999}"#, Some(&dir)).unwrap();
+        assert_eq!(past, "");
+
+        // No range → whole file unchanged (backward compatible).
+        assert_eq!(whole, body);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_file_offset_defaults_and_clamps() {
+        let dir = tmp();
+        std::fs::write(dir.join("g.txt"), "a\nb\nc\nd").unwrap();
+        // offset 0 is treated as 1 (1-based); limit beyond EOF clamps.
+        let r = execute(
+            "read_file",
+            r#"{"path":"g.txt","offset":0,"limit":99}"#,
+            Some(&dir),
+        )
+        .unwrap();
+        assert_eq!(r, "a\nb\nc\nd");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn grep_preview_is_capped_for_huge_lines() {
+        let dir = tmp();
+        let huge = format!("needle {}", "x".repeat(5000));
+        std::fs::write(dir.join("min.js"), huge).unwrap();
+        let out = execute("grep", r#"{"pattern":"needle"}"#, Some(&dir)).unwrap();
+        // The pointer line is short despite the 5KB source line.
+        let hit = out.lines().find(|l| l.contains("min.js")).unwrap();
+        assert!(
+            hit.chars().count() < 220,
+            "preview not capped: {} chars",
+            hit.chars().count()
+        );
+        assert!(hit.contains('…'));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_stage_grep_then_read_span() {
+        // The differentiator workflow end to end: grep returns path:line pointers;
+        // the model reads only the pointed-at span, never the whole file.
+        let dir = tmp();
+        let mut lines: Vec<String> = (1..=200).map(|i| format!("filler {i}")).collect();
+        lines[120] = "the TARGET line".to_string(); // 0-based 120 → line 121
+        std::fs::write(dir.join("big.rs"), lines.join("\n")).unwrap();
+
+        let hits = execute("grep", r#"{"pattern":"TARGET","path":"."}"#, Some(&dir)).unwrap();
+        assert!(hits.contains(":121:"));
+        // Read a tight window around the hit instead of the 200-line file.
+        let span = execute(
+            "read_file",
+            r#"{"path":"big.rs","offset":120,"limit":3}"#,
+            Some(&dir),
+        )
+        .unwrap();
+        assert!(span.contains("the TARGET line"));
+        assert!(span.lines().count() == 3); // only the window
         std::fs::remove_dir_all(&dir).ok();
     }
 
