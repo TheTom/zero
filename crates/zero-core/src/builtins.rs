@@ -18,8 +18,6 @@ use crate::tools::{parse_arguments, ToolDef};
 use std::fmt::Write as _;
 use std::path::Path;
 
-/// Max bytes of a single tool result before truncation.
-const MAX_OUTPUT: usize = 16_000;
 /// Max matching lines `grep` returns.
 const MAX_GREP_HITS: usize = 100;
 /// Max entries `list_dir` returns.
@@ -143,9 +141,14 @@ fn read_file(args: &Value, root: Option<&Path>) -> Result<String, String> {
             .min(lines.len());
         let count = limit.map(|l| l as usize).unwrap_or(lines.len() - start);
         let end = start.saturating_add(count).min(lines.len());
-        return Ok(truncate(&lines[start..end].join("\n")));
+        return Ok(lines[start..end].join("\n"));
     }
-    Ok(truncate(&text))
+    // Return the file whole. Bounding for the context window is the agent loop's
+    // single, recoverable job (cap_tool_result → compress_file_read): it spills the
+    // COMPLETE bytes and shows a faithful prefix + offset/limit nudge. Truncating
+    // here too would only corrupt that — a partial spill and an understated line
+    // count — and saves no memory (read_to_string already loaded the whole file).
+    Ok(text)
 }
 
 fn list_dir(args: &Value, root: Option<&Path>) -> Result<String, String> {
@@ -327,21 +330,6 @@ fn resolve(path: &str, root: Option<&Path>) -> Result<std::path::PathBuf, String
             Ok(root.join(p))
         }
     }
-}
-
-/// Truncate a result to [`MAX_OUTPUT`] bytes (on a char boundary) with a marker.
-fn truncate(text: &str) -> String {
-    if text.len() <= MAX_OUTPUT {
-        return text.to_string();
-    }
-    let mut end = MAX_OUTPUT;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}\n… (output truncated at {MAX_OUTPUT} bytes; read a smaller range or grep)",
-        &text[..end]
-    )
 }
 
 /// Recursively visit files under `dir`, calling `f` for each regular file.
@@ -626,13 +614,16 @@ mod tests {
     }
 
     #[test]
-    fn read_truncates_huge_files() {
+    fn read_returns_full_content_capping_is_the_loop_layer() {
+        // read_file no longer self-truncates: it returns the file WHOLE so the
+        // agent loop's single recoverable cap (compress_file_read) can spill the
+        // complete bytes and report an accurate line count. (Pre-truncating here
+        // corrupted both and saved no memory — read_to_string already loaded it.)
         let dir = tmp();
-        let big = "a".repeat(MAX_OUTPUT + 500);
+        let big = "a".repeat(50_000);
         std::fs::write(dir.join("big.txt"), &big).unwrap();
         let out = execute("read_file", r#"{"path":"big.txt"}"#, Some(&dir)).unwrap();
-        assert!(out.contains("truncated"));
-        assert!(out.len() < big.len());
+        assert_eq!(out, big, "read_file must return the whole file, uncapped");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -694,17 +685,6 @@ mod tests {
         let dir = tmp();
         let e = execute("read_file", r#"{"path":"ghost.txt"}"#, Some(&dir));
         assert!(e.unwrap_err().contains("read failed"));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn truncate_respects_char_boundary() {
-        // A multi-byte char straddling MAX_OUTPUT must not split mid-codepoint.
-        let dir = tmp();
-        let body = "é".repeat(MAX_OUTPUT); // 2 bytes each → well over the cap
-        std::fs::write(dir.join("u.txt"), &body).unwrap();
-        let out = execute("read_file", r#"{"path":"u.txt"}"#, Some(&dir)).unwrap();
-        assert!(out.contains("truncated")); // and didn't panic on a boundary
         std::fs::remove_dir_all(&dir).ok();
     }
 
