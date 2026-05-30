@@ -417,6 +417,12 @@ fn trim_grep_body(line: &str, cap: usize) -> String {
 /// if the minified form still exceeds budget we donut the *minified* bytes (the
 /// view is then truncated JSON, flagged + recoverable via the artifact).
 fn compress_json(raw: &str, budget: usize, artifact: Option<&Path>) -> String {
+    // JSONL / NDJSON (one JSON value per line) must stay line-oriented: minifying
+    // would strip the inter-record newlines and concatenate the objects. Route it
+    // to the generic (fold + donut) path, which preserves record boundaries.
+    if is_jsonl(raw) {
+        return compress_generic(raw, budget, artifact);
+    }
     match json_minify(raw) {
         // Lossless win that fits — the ideal case, no marker needed.
         Some(min) if min.len() <= budget => min,
@@ -431,6 +437,27 @@ fn compress_json(raw: &str, budget: usize, artifact: Option<&Path>) -> String {
         // Not valid JSON (e.g. unterminated string) — treat as generic text.
         None => compress_generic(raw, budget, artifact),
     }
+}
+
+/// Heuristic: ≥2 non-blank lines and a majority begin a JSON value *at column 0*
+/// ⇒ JSONL/NDJSON, not one pretty-printed document. The column-0 check is what
+/// separates the two: JSONL records are unindented complete values, whereas a
+/// pretty-printed array's inner `{…}` objects are INDENTED (so they don't count)
+/// — without it, a pretty array-of-objects would be misread as JSONL.
+fn is_jsonl(raw: &str) -> bool {
+    let lines: Vec<&str> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(20)
+        .collect();
+    if lines.len() < 2 {
+        return false;
+    }
+    let starters = lines
+        .iter()
+        .filter(|l| l.starts_with('{') || l.starts_with('['))
+        .count();
+    starters * 10 >= lines.len() * 8 // ≥80% of lines begin a JSON value at col 0
 }
 
 /// Strip whitespace that sits *outside* string literals. Byte-exact for the kept
@@ -932,6 +959,45 @@ mod tests {
         assert!(c.text.contains("json minified"));
         assert!(c.text.contains("elided"));
         assert!(c.kept_bytes < c.raw_bytes);
+    }
+
+    #[test]
+    fn jsonl_is_not_minified_into_one_line() {
+        // NDJSON: each line a value. Minify would concatenate them; the guard must
+        // route it to the line-oriented path so record boundaries survive.
+        let jsonl: String = (0..50)
+            .map(|i| format!("{{\"i\": {i}, \"v\": \"x\"}}\n"))
+            .collect();
+        assert!(is_jsonl(&jsonl));
+        let c = compress("cat events.jsonl", &jsonl, 200, art());
+        assert_eq!(c.shape, OutputShape::Json);
+        // boundaries preserved → there are still multiple lines / a fold marker,
+        // never a single concatenated blob.
+        assert!(
+            c.text.contains('\n'),
+            "JSONL collapsed to one line: {}",
+            c.text
+        );
+    }
+
+    #[test]
+    fn pretty_array_of_objects_is_not_jsonl() {
+        // Inner objects are INDENTED, so the column-0 check must not flag this as
+        // JSONL — it's one document and should minify (regression for the trim bug).
+        let pretty = "[\n  { \"a\": 1 },\n  { \"a\": 2 },\n  { \"a\": 3 }\n]";
+        assert!(!is_jsonl(pretty), "pretty array misread as JSONL");
+        let c = compress("cat arr.json", pretty, 25, art());
+        assert_eq!(c.text, "[{\"a\":1},{\"a\":2},{\"a\":3}]");
+    }
+
+    #[test]
+    fn single_multiline_json_object_is_still_minified() {
+        // One pretty-printed object spanning many lines is NOT JSONL — it minifies.
+        let pretty = "{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": [1, 2, 3]\n}";
+        assert!(!is_jsonl(pretty));
+        // budget between minified (25 B) and pretty (~40 B) → clean minified result.
+        let c = compress("cat x.json", pretty, 30, art());
+        assert_eq!(c.text, "{\"a\":1,\"b\":2,\"c\":[1,2,3]}");
     }
 
     #[test]
