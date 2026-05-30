@@ -217,7 +217,8 @@ fn is_severity_line(l: &str) -> bool {
 /// where the full output was spilled — embedded in the marker so the model can
 /// re-fetch the dropped content. Pure: does no I/O.
 ///
-/// Output already within budget is returned verbatim (no marker).
+/// Output already within budget is returned verbatim — EXCEPT JSON, which is
+/// minified losslessly even under budget (a free token win that keeps it valid).
 pub fn compress(cmd: &str, raw: &str, budget: usize, artifact: Option<&Path>) -> Compressed {
     let raw_bytes = raw.len();
     let shape = detect(cmd, raw.as_bytes());
@@ -236,6 +237,35 @@ pub fn compress(cmd: &str, raw: &str, budget: usize, artifact: Option<&Path>) ->
             kept_bytes: kept,
         };
     }
+
+    // JSON minifies losslessly regardless of budget: stripping insignificant
+    // whitespace is free, lossless, and keeps the document valid, so there's no
+    // reason to ship a pretty-printed blob just because it fit. (JSONL is excluded
+    // — its newlines are significant; it falls through to the size gate below.)
+    if shape == OutputShape::Json && !is_jsonl(raw) {
+        if let Some(min) = json_minify(raw) {
+            // Under budget after minify → return it clean (no marker). Over budget
+            // → donut the minified bytes (handled by compress_json).
+            if min.len() <= budget {
+                let kept_bytes = min.len();
+                return Compressed {
+                    text: min,
+                    shape,
+                    raw_bytes,
+                    kept_bytes,
+                };
+            }
+            let text = compress_json(raw, budget, artifact);
+            let kept_bytes = text.len();
+            return Compressed {
+                text,
+                shape,
+                raw_bytes,
+                kept_bytes,
+            };
+        }
+    }
+
     if raw_bytes <= budget {
         return Compressed {
             text: raw.to_string(),
@@ -250,7 +280,7 @@ pub fn compress(cmd: &str, raw: &str, budget: usize, artifact: Option<&Path>) ->
         OutputShape::Grep => compress_grep(raw, budget, artifact),
         OutputShape::Json => compress_json(raw, budget, artifact),
         OutputShape::Diff => compress_diff(raw, budget, artifact),
-        // Dir falls through to the generic donut, which now folds repeated runs.
+        OutputShape::Dir => compress_dir(raw, budget, artifact),
         _ => compress_generic(raw, budget, artifact),
     };
     let kept_bytes = text.len();
@@ -643,6 +673,37 @@ fn fold_repeats(raw: &str) -> String {
         return raw.to_string();
     }
     out
+}
+
+/// Directory listing (`ls`, `tree`, `find`): a list of entries, one per line. The
+/// signal is *which entries exist and how many*, so — unlike a byte donut that can
+/// slice a path mid-name — keep a line-aligned head of whole entries plus an
+/// explicit count of how many were dropped, and fold repeated runs first (numbered
+/// files, generated names) so a uniform tree collapses. Recoverable via artifact.
+fn compress_dir(raw: &str, budget: usize, artifact: Option<&Path>) -> String {
+    let folded = fold_repeats(raw);
+    let total = folded.lines().count();
+    let hint = artifact_hint(artifact);
+    let marker_room = 90 + hint.len();
+    let body = budget.saturating_sub(marker_room);
+    let mut kept = String::new();
+    let mut shown = 0usize;
+    for line in folded.lines() {
+        if kept.len() + line.len() + 1 > body {
+            break;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+        shown += 1;
+    }
+    if shown >= total {
+        // Folding alone brought it under budget — no entries dropped.
+        return format!("{kept}[directory listing: {total} entries.{hint}]\n");
+    }
+    format!(
+        "{kept}[directory listing: {shown} of {total} entries shown — \
+         narrow the path/depth, or read the full output.{hint}]\n"
+    )
 }
 
 /// Generic / unknown line output: fold repeated runs first (kills uniform spam
@@ -1149,9 +1210,10 @@ mod tests {
     }
 
     #[test]
-    fn dir_output_donuts_when_lines_dont_fold() {
-        // Dir has no dedicated handler. Use letters-only base-26 names (no digits,
-        // so no shared skeleton) → adjacent lines differ → no fold → generic donut.
+    fn dir_listing_keeps_whole_entries_and_counts_the_rest() {
+        // Distinct letters-only names (no shared skeleton → no fold) over budget:
+        // the dir handler keeps a line-aligned head + an explicit entry count, and
+        // never slices a filename mid-byte the way a donut could.
         let big_dir: String = (0..3000)
             .map(|i| {
                 let mut s = String::new();
@@ -1170,10 +1232,49 @@ mod tests {
         let cdir = compress("ls -R", &big_dir, 400, art());
         assert_eq!(cdir.shape, OutputShape::Dir);
         assert!(
-            cdir.text.contains("elided"),
-            "expected a donut on non-folding dir output"
+            cdir.text.contains("of 3000 entries shown"),
+            "no entry count: {}",
+            cdir.text
         );
         assert!(cdir.kept_bytes < cdir.raw_bytes);
+        // Last kept line is a whole entry (newline before the marker).
+        let before_marker = cdir.text.split('[').next().unwrap();
+        assert!(before_marker.ends_with('\n'), "entry was sliced mid-line");
+    }
+
+    #[test]
+    fn dir_listing_of_numbered_files_folds_to_a_count() {
+        // find/ls of numbered files shares a skeleton → folds, fits, reports total.
+        let listing: String = (0..2000).map(|i| format!("./build/obj_{i}.o\n")).collect();
+        let c = compress("find . -name '*.o'", &listing, 400, art());
+        assert_eq!(c.shape, OutputShape::Dir);
+        assert!(
+            c.text.contains("similar lines"),
+            "numbered files should fold"
+        );
+        assert!(c.kept_bytes < 400);
+    }
+
+    #[test]
+    fn json_minifies_even_when_already_under_budget() {
+        // Minify-always: a pretty JSON blob that FITS is still stripped of
+        // insignificant whitespace (lossless free win), not passed verbatim.
+        let pretty = "{\n  \"a\": 1,\n  \"b\": [1, 2, 3]\n}";
+        let c = compress("./tool", pretty, 100_000, art()); // huge budget → fits
+        assert_eq!(c.shape, OutputShape::Json);
+        assert_eq!(c.text, "{\"a\":1,\"b\":[1,2,3]}");
+        assert!(
+            c.kept_bytes < c.raw_bytes,
+            "minify should shrink even under budget"
+        );
+    }
+
+    #[test]
+    fn non_json_under_budget_is_still_verbatim() {
+        // The verbatim guarantee still holds for everything that isn't JSON.
+        let c = compress("echo hi", "plain text, fits fine", 100_000, art());
+        assert_eq!(c.text, "plain text, fits fine");
+        assert_eq!(c.saved(), 0);
     }
 
     #[test]
