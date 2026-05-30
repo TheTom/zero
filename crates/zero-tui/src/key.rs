@@ -376,8 +376,8 @@ mod tests {
 
     #[test]
     fn unknown_csi_final_byte_is_consumed() {
-        // ESC [ Z (back-tab) — not modeled; consumed, no key.
-        let (k, consumed) = decode_keys(b"\x1b[Z");
+        // ESC [ X — a final byte we don't map (Z is now Shift+Tab); dropped.
+        let (k, consumed) = decode_keys(b"\x1b[X");
         assert!(k.is_empty());
         assert_eq!(consumed, 3);
     }

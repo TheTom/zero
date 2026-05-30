@@ -19,6 +19,7 @@ pub mod config;
 pub mod discovery;
 pub mod http;
 pub mod json;
+pub mod mcp;
 pub mod message;
 pub mod openai;
 pub mod safety;

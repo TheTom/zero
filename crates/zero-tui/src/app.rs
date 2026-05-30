@@ -22,6 +22,7 @@ use zero_core::backend::{Backend, StopReason, StreamEvent, Usage};
 use zero_core::clock::{format_duration, Stopwatch};
 use zero_core::config::Config;
 use zero_core::discovery::Discovered;
+use zero_core::mcp::{self, McpConfig};
 use zero_core::message::{Conversation, Message, Role};
 use zero_core::openai::OpenAiBackend;
 use zero_core::servers::ServerStore;
@@ -38,6 +39,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/config", "show the active backend and model"),
     ("/scan", "find model servers on your network"),
     ("/servers", "list saved servers"),
+    ("/mcp", "connect MCP servers ( /mcp tools to list )"),
     ("/connect", "attach to a discovered model"),
     ("/model", "switch model on the current endpoint"),
     ("/clip", "copy last response, or code block n"),
@@ -235,6 +237,10 @@ pub struct App<I: Input, W: Write> {
     queue_edit: Option<QueueEdit>,
     /// Current input mode (Shift+Tab cycles it).
     mode: Mode,
+    /// Connected MCP servers (kept alive for the upcoming tool-call loop).
+    mcp: Vec<mcp::Connection>,
+    /// Path to the MCP server config (`~/.zero/mcp.json`).
+    mcp_path: Option<PathBuf>,
     /// A dangerous shell command awaiting `y/N` confirmation.
     pending_shell: Option<String>,
     /// Human-readable backend/config summary, shown by `/config`.
@@ -291,6 +297,8 @@ impl<I: Input, W: Write> App<I, W> {
             search: None,
             queue_edit: None,
             mode: Mode::default(),
+            mcp: Vec::new(),
+            mcp_path: None,
             pending_shell: None,
             info: String::new(),
             config: Config::default(),
@@ -331,6 +339,11 @@ impl<I: Input, W: Write> App<I, W> {
         self.config = config;
         self.config_path = config_path;
         self.servers_path = servers_path;
+    }
+
+    /// Where to read MCP server definitions (`~/.zero/mcp.json`).
+    pub fn set_mcp_path(&mut self, path: Option<PathBuf>) {
+        self.mcp_path = path;
     }
 
     /// Ask the configured server for its context window (`n_ctx`) so the status
@@ -623,6 +636,12 @@ impl<I: Input, W: Write> App<I, W> {
             self.out.flush()?;
             let results = zero_core::discovery::scan(Duration::from_millis(300));
             self.apply_scan(results)?;
+            return Ok(Flow::Continue);
+        }
+        if trimmed == "/mcp" || trimmed.starts_with("/mcp ") {
+            self.echo_committed(&text)?;
+            let arg = trimmed.strip_prefix("/mcp").unwrap_or("").trim();
+            self.mcp_command(arg)?;
             return Ok(Flow::Continue);
         }
         if trimmed == "/servers" {
@@ -1066,6 +1085,78 @@ impl<I: Input, W: Write> App<I, W> {
         Ok(())
     }
 
+    // --- MCP servers (/mcp) ----------------------------------------------
+
+    /// `/mcp` connects configured servers and summarizes; `/mcp tools` lists the
+    /// tools discovered so far.
+    fn mcp_command(&mut self, arg: &str) -> io::Result<()> {
+        if arg == "tools" {
+            return self.print_mcp_tools();
+        }
+        self.connect_mcp()
+    }
+
+    /// Connect every configured-but-not-yet-connected MCP server (blocking,
+    /// best-effort) and report the outcome per server.
+    fn connect_mcp(&mut self) -> io::Result<()> {
+        let Some(path) = self.mcp_path.clone() else {
+            return self.write_text("\x1b[2mno MCP config path\x1b[0m\n");
+        };
+        let cfg = match McpConfig::load(&path) {
+            Ok(c) => c,
+            Err(e) => return self.write_text(&format!("\x1b[31mmcp config: {e}\x1b[0m\n")),
+        };
+        if cfg.is_empty() {
+            return self.write_text(&format!(
+                "\x1b[2mno MCP servers configured — add some to {}\x1b[0m\n",
+                path.display()
+            ));
+        }
+        self.write_text("\x1b[2mconnecting MCP servers…\x1b[0m\n")?;
+        self.out.flush()?;
+        for (name, spec) in &cfg.servers {
+            if self.mcp.iter().any(|c| &c.name == name) {
+                self.write_text(&format!("  \x1b[2m• {name} already connected\x1b[0m\n"))?;
+                continue;
+            }
+            match mcp::Connection::connect(name, spec) {
+                Ok(conn) => {
+                    let n = conn.tools.len();
+                    self.mcp.push(conn);
+                    self.write_text(&format!(
+                        "  \x1b[32m✓\x1b[0m {name} \x1b[2m— {n} tools\x1b[0m\n"
+                    ))?;
+                }
+                Err(e) => {
+                    self.write_text(&format!("  \x1b[31m✗ {name} — {e}\x1b[0m\n"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// List every tool discovered across connected servers.
+    fn print_mcp_tools(&mut self) -> io::Result<()> {
+        if self.mcp.is_empty() {
+            return self.write_text("\x1b[2mno MCP servers connected — run /mcp\x1b[0m\n");
+        }
+        self.write_text("\x1b[1mMCP tools\x1b[0m\n")?;
+        // Borrow-safe: format first, then write.
+        let mut lines = Vec::new();
+        for conn in &self.mcp {
+            for t in &conn.tools {
+                lines.push(format!(
+                    "  \x1b[36m{}\x1b[0m \x1b[2m({})  {}\x1b[0m\n",
+                    t.name, conn.name, t.description
+                ));
+            }
+        }
+        for line in lines {
+            self.write_text(&line)?;
+        }
+        Ok(())
+    }
+
     // --- queue editing (^Q) ----------------------------------------------
 
     /// Enter queue-edit mode: pause sending and load the nearest queued message
@@ -1486,6 +1577,7 @@ impl<I: Input, W: Write> App<I, W> {
             ('K', "/connect <n>", "attach to a discovered model"),
             ('K', "/model <name>", "switch model on the current endpoint"),
             ('K', "/servers", "list saved servers"),
+            ('K', "/mcp", "connect MCP servers (/mcp tools lists tools)"),
             (
                 'K',
                 "/clip [n]",
@@ -1860,6 +1952,101 @@ mod tests {
     }
 
     #[test]
+    fn mcp_without_config_path_reports_it() {
+        let mut a = app(b"");
+        type_str(&mut a, "/mcp");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("no MCP config path"));
+    }
+
+    #[test]
+    fn mcp_tools_with_no_connections_hints_to_connect() {
+        let mut a = app(b"");
+        type_str(&mut a, "/mcp tools");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("no MCP servers connected"));
+    }
+
+    #[test]
+    fn mcp_empty_config_is_reported() {
+        let path = std::env::temp_dir().join(format!("zero-mcp-empty-{}.json", std::process::id()));
+        std::fs::write(&path, "{}").unwrap();
+        let mut a = app(b"");
+        a.set_mcp_path(Some(path.clone()));
+        type_str(&mut a, "/mcp");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("no MCP servers configured"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mcp_connects_a_configured_stdio_server_and_lists_tools() {
+        use zero_core::json::Value;
+        // A tiny MCP server in sh (same handshake as the core test).
+        let script = "read a; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}'; read b; read c; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"echoes\"}]}}'";
+        let cfg = Value::Object(vec![(
+            "mcpServers".to_string(),
+            Value::Object(vec![(
+                "mock".to_string(),
+                Value::Object(vec![
+                    ("command".to_string(), Value::Str("sh".to_string())),
+                    (
+                        "args".to_string(),
+                        Value::Array(vec![
+                            Value::Str("-c".to_string()),
+                            Value::Str(script.to_string()),
+                        ]),
+                    ),
+                ]),
+            )]),
+        )]);
+        let path = std::env::temp_dir().join(format!("zero-mcp-{}.json", std::process::id()));
+        std::fs::write(&path, cfg.to_json()).unwrap();
+
+        let mut a = app(b"");
+        a.set_mcp_path(Some(path.clone()));
+        type_str(&mut a, "/mcp");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("✓"));
+        assert!(rendered(&a).contains("mock"));
+        assert_eq!(a.mcp.len(), 1);
+
+        type_str(&mut a, "/mcp tools");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("echo"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn redraw_lists_a_queue_and_marks_the_edited_item() {
+        let mut a = app(b"");
+        a.queue.push_back("first task".to_string());
+        a.queue.push_back("second task".to_string());
+        // Idle redraw lists every queued item above the box.
+        a.redraw_input().unwrap();
+        let out = rendered(&a);
+        assert!(out.contains("⏎ queued: first task"));
+        assert!(out.contains("⏎ queued: second task"));
+        // In queue-edit mode the selected item is marked and the prompt swaps.
+        a.dispatch(Key::Ctrl('q')).unwrap(); // selects the last item
+        let out = rendered(&a);
+        assert!(out.contains("✎ editing: second task"));
+        assert!(out.contains("✎ ")); // prompt marker swapped
+    }
+
+    #[test]
+    fn redraw_colors_each_mode_chip() {
+        for m in [Mode::Normal, Mode::AutoAccept, Mode::Plan] {
+            let mut a = app(b"");
+            a.mode = m;
+            a.redraw_input().unwrap();
+            let out = rendered(&a);
+            assert!(out.contains(m.label()));
+            assert!(out.contains(m.color())); // the chip's color code is emitted
+        }
+    }
+
+    #[test]
     fn shift_tab_cycles_modes() {
         let mut a = app(b"");
         assert_eq!(a.mode, Mode::Normal);
@@ -1928,8 +2115,9 @@ mod tests {
     fn auto_accept_runs_a_dangerous_command_without_confirm() {
         let mut a = app(b"");
         a.mode = Mode::AutoAccept;
-        // `chmod -r` is flagged dangerous; a nonexistent path makes it harmless.
-        type_str(&mut a, "!chmod -R 755 /tmp/zero-does-not-exist-zzz");
+        // `mv … /dev/null` is flagged dangerous; a nonexistent source makes the
+        // actual execution a harmless no-op (mv errors, deletes nothing).
+        type_str(&mut a, "!mv /tmp/zero-nonexistent-src-zzz /dev/null");
         a.dispatch(Key::Enter).unwrap();
         assert!(a.pending_shell.is_none()); // no y/N gate
         assert!(rendered(&a).contains("auto-accepted"));

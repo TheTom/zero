@@ -79,6 +79,8 @@ fn run(args: &Args) -> std::io::Result<()> {
     let mut app = App::new(term, std::io::stdout(), backend, log);
     app.set_config(cfg.clone(), Some(cfg_path.clone()), servers_path());
     app.set_info(format!("{}\nconfig: {}", cfg.summary(), cfg_path.display()));
+    // MCP server definitions live next to the config (~/.zero/mcp.json).
+    app.set_mcp_path(cfg_path.parent().map(|d| d.join("mcp.json")));
     app.run()
 }
 

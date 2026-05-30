@@ -181,6 +181,33 @@ bottom, so the prompt is live the whole time:
   out an approach for review before acting (the live conversation isn't mutated;
   it's added to the request only).
 
+### MCP servers
+
+Zero speaks the [Model Context Protocol](https://modelcontextprotocol.io) over
+the stdio transport (zero-dep: a subprocess + JSON-RPC over its pipes, one
+message per line). Define servers in `~/.zero/mcp.json`, Claude-compatible shape:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"],
+      "env": {}
+    }
+  }
+}
+```
+
+```
+/mcp          connect configured servers and show what each advertises
+/mcp tools    list every discovered tool (name · server · description)
+```
+
+> **Discovery only for now.** `/mcp` connects and lists the tools a server
+> exposes, but the model can't *call* them yet — that needs the agentic
+> tool-call loop, which is the next slice. MCP tools will plug into it then.
+
 ### Shell mode & the safety guard
 
 Prefix a line with `!` to run it as a shell command inline (`!cargo test`,
