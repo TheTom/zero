@@ -32,8 +32,9 @@ command -v hermes >/dev/null || { echo "hermes not on PATH" >&2; exit 1; }
 run_dir="$(mktemp -d)"
 echo "bench: N=$N  prompt=$(printf '%q' "$PROMPT")"
 echo "artifacts: $run_dir"
-printf '%-8s %-4s %8s %10s %8s %6s\n' "tool" "it" "ms" "out_bytes" "tokens" "exit"
-printf '%s\n' "-------------------------------------------------------"
+[ -n "${ZERO_BENCH_EXPECT:-}" ] && echo "correctness check: stdout must match /${ZERO_BENCH_EXPECT}/"
+printf '%-8s %-4s %8s %10s %8s %6s %4s\n' "tool" "it" "ms" "out_bytes" "tokens" "exit" "ok"
+printf '%s\n' "------------------------------------------------------------"
 
 # Pull a total-token count out of a tool's combined stdout+stderr. Zero emits the
 # canonical `[usage: … total=N]`; for Hermes we fall back to the first
@@ -51,20 +52,30 @@ extract_tokens() {
 }
 
 # accumulators (bash arithmetic; "?" tokens skip the sum)
-declare -A SUM_MS SUM_TOK CNT_TOK
-SUM_MS[zero]=0; SUM_MS[hermes]=0; SUM_TOK[zero]=0; SUM_TOK[hermes]=0; CNT_TOK[zero]=0; CNT_TOK[hermes]=0
+# Optional correctness check: if ZERO_BENCH_EXPECT is set to a regex naming the
+# fact both wrappers should surface (e.g. the known-largest filename), each run's
+# stdout is matched against it. This measures the GOAL's *equivalent data* half
+# alongside the token half — one run proves both: same answer, fewer tokens.
+EXPECT="${ZERO_BENCH_EXPECT:-}"
+
+declare -A SUM_MS SUM_TOK CNT_TOK OK_HITS
+for t in zero hermes; do SUM_MS[$t]=0; SUM_TOK[$t]=0; CNT_TOK[$t]=0; OK_HITS[$t]=0; done
 
 bench_one() {
   local tool="$1" it="$2"; shift 2
   local out="$run_dir/${tool}-${it}.out" err="$run_dir/${tool}-${it}.err"
-  local start end ms code tok
+  local start end ms code tok ok
   start=$(python3 -c 'import time;print(int(time.time()*1000))')
   "$@" >"$out" 2>"$err"
   code=$?
   end=$(python3 -c 'import time;print(int(time.time()*1000))')
   ms=$((end - start))
   tok=$(extract_tokens "$err"); [ "$tok" = "?" ] && tok=$(extract_tokens "$out")
-  printf '%-8s %-4s %8s %10s %8s %6s\n' "$tool" "$it" "$ms" "$(wc -c <"$out" | tr -d ' ')" "$tok" "$code"
+  ok="-"
+  if [ -n "$EXPECT" ]; then
+    if grep -qiE "$EXPECT" "$out"; then ok="Y"; OK_HITS[$tool]=$(( OK_HITS[$tool] + 1 )); else ok="N"; fi
+  fi
+  printf '%-8s %-4s %8s %10s %8s %6s %4s\n' "$tool" "$it" "$ms" "$(wc -c <"$out" | tr -d ' ')" "$tok" "$code" "$ok"
   SUM_MS[$tool]=$(( SUM_MS[$tool] + ms ))
   if [[ "$tok" =~ ^[0-9]+$ ]]; then
     SUM_TOK[$tool]=$(( SUM_TOK[$tool] + tok )); CNT_TOK[$tool]=$(( CNT_TOK[$tool] + 1 ))
@@ -93,5 +104,22 @@ if [ "${CNT_TOK[zero]}" -gt 0 ] && [ "${CNT_TOK[hermes]}" -gt 0 ]; then
     echo "Zero uses $(( zt * 100 / ht ))% of Hermes's tokens on this task (lower = Zero saves)."
   fi
 fi
+
+# The GOAL verdict: equivalent data (both got the right answer) AND fewer tokens.
+if [ -n "$EXPECT" ]; then
+  echo
+  echo "== equivalent-data check (matched /$EXPECT/) =="
+  printf '%-8s %s/%s runs correct\n' "zero" "${OK_HITS[zero]}" "$N"
+  printf '%-8s %s/%s runs correct\n' "hermes" "${OK_HITS[hermes]}" "$N"
+  if [ "${OK_HITS[zero]}" -eq "$N" ] && [ "${OK_HITS[hermes]}" -eq "$N" ]; then
+    echo "GOAL: both wrappers produced equivalent data on every run."
+    [ "${CNT_TOK[zero]:-0}" -gt 0 ] && [ "${CNT_TOK[hermes]:-0}" -gt 0 ] && \
+      echo "      → same answers, compare the token column above for the efficiency win."
+  else
+    echo "NOTE: not every run matched — inspect the mismatching outputs in $run_dir"
+    echo "      (model nondeterminism, or a real difference between wrappers)."
+  fi
+fi
 echo
 echo "Raw outputs + stderr traces under: $run_dir"
+echo "Tip: set ZERO_BENCH_EXPECT='<regex of the expected fact>' to check equivalence."
