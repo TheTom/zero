@@ -209,6 +209,41 @@ pub fn compact_call_args(name: &str, arguments: &str) -> Option<String> {
     changed.then(|| crate::json::Value::Object(compacted).to_json())
 }
 
+/// Compact the bulky args of every SUCCESSFULLY-applied write/edit call in a
+/// conversation, in place. A write whose tool result is present and not an
+/// error/refusal has landed on disk, so its inline `content`/`old_string`/
+/// `new_string` payload is dead weight that's otherwise re-sent every round.
+/// Replaces each with a `[N bytes applied — read_file to view]` stub (the model
+/// still knows the file exists). Returns `(bytes_before, bytes_after)` of the
+/// args it compacted, for measured stats.
+///
+/// Safe to call EVERY round mid-turn (idempotent: the stub is never re-compacted),
+/// which is the point — it stops a long agentic turn from re-sending a just-written
+/// file's full body on each subsequent model call. Pure conversation surgery.
+pub fn compact_applied_writes(conv: &mut crate::message::Conversation) -> (usize, usize) {
+    use crate::message::Role;
+    let ok_ids: std::collections::HashSet<String> = conv
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .filter(|m| !m.content.starts_with("error:") && !m.content.starts_with("refused:"))
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
+    let (mut before, mut after) = (0usize, 0usize);
+    for m in &mut conv.messages {
+        for tc in &mut m.tool_calls {
+            if ok_ids.contains(&tc.id) {
+                if let Some(args) = compact_call_args(&tc.name, &tc.arguments) {
+                    before += tc.arguments.len();
+                    after += args.len();
+                    tc.arguments = args;
+                }
+            }
+        }
+    }
+    (before, after)
+}
+
 /// Cumulative, **measured** (never estimated) record of how many bytes the
 /// context levers saved this session — for an honest `/context` report. Each
 /// counter is the difference between what a tool produced and what actually

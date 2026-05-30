@@ -30,6 +30,10 @@ pub struct TurnOutcome {
     /// (so an agentic turn that took 3 round-trips reports all 3). Zero when the
     /// backend reported no usage (e.g. the stub).
     pub usage: crate::backend::Usage,
+    /// `(bytes_before, bytes_after)` of write/edit args compacted DURING the turn
+    /// (applied-write payloads stubbed each round so a long turn doesn't re-send a
+    /// just-written file's body every model call). For the measured `/context` stat.
+    pub compacted: (usize, usize),
 }
 
 /// Why the agent loop ended.
@@ -95,6 +99,7 @@ pub fn run_turn(
 ) -> Result<TurnOutcome, BackendError> {
     let mut rounds = 0;
     let mut usage = crate::backend::Usage::default();
+    let mut compacted = (0usize, 0usize);
     loop {
         let completion = completer.complete(conv, tools)?;
         // Accumulate server-reported tokens across every round of the turn.
@@ -114,6 +119,7 @@ pub fn run_turn(
                 stop: AgentStop::Done,
                 rounds,
                 usage,
+                compacted,
             });
         }
 
@@ -140,6 +146,7 @@ pub fn run_turn(
                 stop: AgentStop::DoomLoop,
                 rounds,
                 usage,
+                compacted,
             });
         }
 
@@ -155,6 +162,14 @@ pub fn run_turn(
         }
         rounds += 1;
 
+        // Mid-turn compaction: now that this round's writes have landed (their
+        // results are in `conv`), stub their bulky applied payloads so the next
+        // model round doesn't re-send a just-written file's full body. Idempotent,
+        // so re-running it each round only ever touches newly-applied writes.
+        let (b, a) = crate::context::compact_applied_writes(conv);
+        compacted.0 += b;
+        compacted.1 += a;
+
         // Step cap: stop before another model round.
         if !guard.record_step() {
             return Ok(TurnOutcome {
@@ -162,6 +177,7 @@ pub fn run_turn(
                 stop: AgentStop::MaxSteps,
                 rounds,
                 usage,
+                compacted,
             });
         }
     }
@@ -246,6 +262,107 @@ mod tests {
         assert_eq!(conv.messages[2].tool_call_id.as_deref(), Some("c1"));
         assert_eq!(conv.messages[2].content, "ran read_file");
         assert_eq!(conv.messages[3].content, "the file says hi");
+    }
+
+    #[test]
+    fn applied_write_payload_is_compacted_mid_turn() {
+        // The agentic-build finding: a write_file's full content must NOT keep
+        // riding along in history every subsequent round. After round 1 writes a
+        // big file (and its result confirms success), run_turn stubs the payload so
+        // round 2+ don't re-send the body. Verified in the final conversation +
+        // the measured `compacted` counters.
+        let big = "x".repeat(5000);
+        let args = format!("{{\"path\":\"game.py\",\"content\":\"{big}\"}}");
+        let mut step = 0;
+        let mut completer = |_: &Conversation, _: &[ToolDef]| {
+            step += 1;
+            Ok(if step == 1 {
+                Completion {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("w1", "write_file", &args)],
+                    usage: None,
+                }
+            } else {
+                text_completion("done")
+            })
+        };
+        let mut exec = |_: &ToolCall| "{\"bytes_written\":5000}".to_string(); // success
+        let mut guard = LoopGuard::new(10);
+        let mut conv = Conversation::new();
+        conv.push(Message::user("write the game"));
+        let out = run_turn(
+            &mut conv,
+            &[],
+            &mut completer,
+            &mut exec,
+            &mut guard,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(out.stop, AgentStop::Done);
+        // The write_file call in history no longer carries the 5KB body.
+        let wf = conv
+            .messages
+            .iter()
+            .flat_map(|m| &m.tool_calls)
+            .find(|tc| tc.name == "write_file")
+            .expect("the write_file call");
+        assert!(
+            !wf.arguments.contains(&big),
+            "full content still in history"
+        );
+        assert!(wf.arguments.contains("bytes applied"), "no compaction stub");
+        // The saving was measured and rides back on the outcome.
+        assert!(out.compacted.0 > out.compacted.1, "compaction not recorded");
+        assert!(
+            out.compacted.0 >= 5000,
+            "should have compacted the 5KB body"
+        );
+    }
+
+    #[test]
+    fn failed_write_payload_is_kept_for_retry() {
+        // A write whose result is an error keeps its args — the model needs them
+        // to retry. Compaction only ever touches APPLIED writes.
+        let big = "y".repeat(3000);
+        let args = format!("{{\"path\":\"x.py\",\"content\":\"{big}\"}}");
+        let mut step = 0;
+        let mut completer = |_: &Conversation, _: &[ToolDef]| {
+            step += 1;
+            Ok(if step == 1 {
+                Completion {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("w1", "write_file", &args)],
+                    usage: None,
+                }
+            } else {
+                text_completion("gave up")
+            })
+        };
+        let mut exec = |_: &ToolCall| "error: permission denied".to_string();
+        let mut guard = LoopGuard::new(10);
+        let mut conv = Conversation::new();
+        conv.push(Message::user("write it"));
+        let out = run_turn(
+            &mut conv,
+            &[],
+            &mut completer,
+            &mut exec,
+            &mut guard,
+            &mut |_| {},
+        )
+        .unwrap();
+        let wf = conv
+            .messages
+            .iter()
+            .flat_map(|m| &m.tool_calls)
+            .find(|tc| tc.name == "write_file")
+            .unwrap();
+        assert!(
+            wf.arguments.contains(&big),
+            "failed write must keep its payload"
+        );
+        assert_eq!(out.compacted, (0, 0), "nothing should have been compacted");
     }
 
     #[test]

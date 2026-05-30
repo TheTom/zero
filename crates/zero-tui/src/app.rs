@@ -424,6 +424,16 @@ impl<I: Input, W: Write> App<I, W> {
         self.tools_enabled = on;
     }
 
+    /// Enter auto-accept mode (apply write/edit without the per-call gate). For
+    /// headless `-p --tools --accept-edits`: without it a headless run is stuck in
+    /// Normal mode, which refuses every write, forcing the model into bash work-
+    /// arounds. Dangerous shell is still hard-refused; plan mode is unaffected.
+    pub fn set_auto_accept(&mut self, on: bool) {
+        if on {
+            self.mode = Mode::AutoAccept;
+        }
+    }
+
     /// The system prompt for this session: the user's configured one if non-empty,
     /// else the tiny built-in [`DEFAULT_SYSTEM_PROMPT`]. Prepended per-request so
     /// the persisted conversation stays system-free (plan mode adds its own too).
@@ -946,10 +956,9 @@ impl<I: Input, W: Write> App<I, W> {
         self.conv = conv;
         self.read_cache = read_cache.into_inner();
         self.context_stats = stats.into_inner();
-        // Drop bulky content from applied write/edit calls — the file is on disk,
-        // so re-sending the payload to the model each turn just wastes the window.
-        let (before, after) = compact_applied_writes(&mut self.conv);
-        self.context_stats.record_compaction(before, after);
+        // Applied write/edit payloads are now compacted IN-LOOP by run_turn (each
+        // round, so a long turn doesn't re-send a just-written file's body). The
+        // measured savings ride back on the outcome and are recorded below.
 
         match res {
             Ok(outcome) => {
@@ -964,6 +973,11 @@ impl<I: Input, W: Write> App<I, W> {
                 };
                 self.write_text(&format!("{note}\n"))?;
                 self.last_reply = outcome.final_text.clone();
+                // Measured in-loop write-payload compaction (each round of the turn).
+                let (cb, ca) = outcome.compacted;
+                if cb > ca {
+                    self.context_stats.record_compaction(cb, ca);
+                }
                 // Summed server-reported tokens across the turn's rounds, so a
                 // headless caller (and the status line) can report real usage.
                 if outcome.usage.total() > 0 {
@@ -2238,32 +2252,6 @@ fn sanitize_id(id: &str) -> String {
     } else {
         s
     }
-}
-
-/// After a tool turn, drop bulky payloads of successfully-applied write/edit calls
-/// from history (the file is on disk). Failed/refused writes keep their args.
-/// Returns `(bytes_before, bytes_after)` of the args it compacted, for stats.
-fn compact_applied_writes(conv: &mut Conversation) -> (usize, usize) {
-    let ok_ids: std::collections::HashSet<String> = conv
-        .messages
-        .iter()
-        .filter(|m| m.role == Role::Tool)
-        .filter(|m| !m.content.starts_with("error:") && !m.content.starts_with("refused:"))
-        .filter_map(|m| m.tool_call_id.clone())
-        .collect();
-    let (mut before, mut after) = (0usize, 0usize);
-    for m in &mut conv.messages {
-        for tc in &mut m.tool_calls {
-            if ok_ids.contains(&tc.id) {
-                if let Some(args) = zero_core::context::compact_call_args(&tc.name, &tc.arguments) {
-                    before += tc.arguments.len();
-                    after += args.len();
-                    tc.arguments = args;
-                }
-            }
-        }
-    }
-    (before, after)
 }
 
 /// First line of a string, for a compact one-line tool-result preview.
