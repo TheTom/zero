@@ -199,6 +199,36 @@ model can't run away.
 > buggy (calls split/lost across chunks), so the loop reads each turn whole. Zero
 > also recovers tool calls a quantized model emits as `<tool_call>`/```json text.
 
+#### Context efficiency
+
+Local models have small windows (8–32K), and measuring real agentic transcripts
+shows **~95% of a turn's context is raw tool I/O, not reasoning** — a tiny long
+tail of giant tool results carries most of the bytes, the same file gets read
+5–7×, and write payloads sit in history forever. Zero attacks that directly. The
+rule throughout is **cap, don't lose** — every drop is re-fetchable (file on
+disk, line range, or already upstream in the conversation):
+
+1. **Per-result cap** — any single tool result over `max_tool_output` (default
+   4 KB) is collapsed to head + tail with an `… [N bytes elided — <hint>] …`
+   marker naming how to re-fetch the rest. Recovers the bulk of the long tail.
+2. **Per-turn budget** — cumulative tool output within one turn is bounded
+   (default 24 KB); the cap shrinks as the budget depletes, always keeping a
+   256-byte floor per result, so a turn firing many calls can't blow the window
+   by attrition.
+3. **Read cache** — a repeat read of a file unchanged (by mtime + length) since
+   you last read it returns a one-line stub instead of the content; invalidated
+   on `write_file`/`edit_file` so an edited file re-reads in full.
+4. **Two-stage search** — `grep` returns `path:line` pointers (each preview
+   capped), and `read_file` takes an optional `offset`/`limit` line range so the
+   model fetches just the span a pointer named, not the whole file.
+5. **Write compaction** — once a `write_file`/`edit_file` succeeds, its bulky
+   content is stripped from the tool-call args in history (the file is on disk);
+   a refused/failed write keeps its args so the model can retry.
+
+All of it is pure, std-only (`zero_core::context`), and unit-proven — each lever
+has a test asserting both the byte saving and that the full content is still
+reachable.
+
 ### MCP servers
 
 Zero speaks the [Model Context Protocol](https://modelcontextprotocol.io) over
