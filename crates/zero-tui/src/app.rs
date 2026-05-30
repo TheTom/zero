@@ -1305,26 +1305,34 @@ impl<I: Input, W: Write> App<I, W> {
         Ok(())
     }
 
-    /// List every tool discovered across connected servers.
+    /// List discovered tools, grouped by server. One compact line per tool —
+    /// MCP descriptions can be paragraphs (n8n et al.), so the description is
+    /// collapsed to a single line and capped to keep `/mcp tools` scannable.
     fn print_mcp_tools(&mut self) -> io::Result<()> {
         if self.mcp.is_empty() {
             return self.write_text("\x1b[2mno MCP servers connected — run /mcp\x1b[0m\n");
         }
-        self.write_text("\x1b[1mMCP tools\x1b[0m\n")?;
         // Borrow-safe: format first, then write.
-        let mut lines = Vec::new();
+        let mut out = String::new();
         for conn in &self.mcp {
+            out.push_str(&format!(
+                "\x1b[1m{}\x1b[0m \x1b[2m({} tools)\x1b[0m\n",
+                conn.name,
+                conn.tools.len()
+            ));
             for t in &conn.tools {
-                lines.push(format!(
-                    "  \x1b[36m{}\x1b[0m \x1b[2m({})  {}\x1b[0m\n",
-                    t.name, conn.name, t.description
-                ));
+                let desc = tool_desc_snippet(&t.description);
+                if desc.is_empty() {
+                    out.push_str(&format!("  \x1b[36m{}\x1b[0m\n", t.name));
+                } else {
+                    out.push_str(&format!(
+                        "  \x1b[36m{}\x1b[0m \x1b[2m— {desc}\x1b[0m\n",
+                        t.name
+                    ));
+                }
             }
         }
-        for line in lines {
-            self.write_text(&line)?;
-        }
-        Ok(())
+        self.write_text(&out)
     }
 
     // --- queue editing (^Q) ----------------------------------------------
@@ -1892,6 +1900,20 @@ fn first_line(s: &str) -> &str {
     s.split('\n').next().unwrap_or("")
 }
 
+/// A one-line, length-capped snippet of an MCP tool description for `/mcp tools`.
+/// Descriptions can be multi-paragraph (some servers embed whole manuals), so we
+/// collapse all whitespace runs to single spaces and cap to ~80 display chars.
+fn tool_desc_snippet(desc: &str) -> String {
+    let flat: String = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 80;
+    if flat.chars().count() > MAX {
+        let cut: String = flat.chars().take(MAX).collect();
+        format!("{cut}…")
+    } else {
+        flat
+    }
+}
+
 fn write_raw<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
     if s.contains('\n') {
         w.write_all(s.replace('\n', "\r\n").as_bytes())
@@ -2434,6 +2456,70 @@ mod tests {
         // unknown tool reported, not executed
         let unknown = gate_and_execute(Mode::AutoAccept, &ToolCall::new("c", "nope", "{}"), None);
         assert!(unknown.contains("unknown tool"));
+    }
+
+    #[test]
+    fn tool_desc_snippet_collapses_and_caps() {
+        // Multi-line / multi-space descriptions collapse to one capped line.
+        assert_eq!(tool_desc_snippet("short desc"), "short desc");
+        assert_eq!(
+            tool_desc_snippet("line one\n\n   line two"),
+            "line one line two"
+        );
+        assert_eq!(tool_desc_snippet(""), "");
+        let long = "word ".repeat(100);
+        let s = tool_desc_snippet(&long);
+        assert!(s.ends_with('…'));
+        assert_eq!(s.chars().count(), 81); // 80 + ellipsis
+        assert!(!s.contains('\n'));
+    }
+
+    #[test]
+    fn mcp_tools_listing_is_compact_per_server() {
+        // A server with a paragraph-long, newline-laden description must render
+        // as ONE short line per tool (the "novel" bug).
+        use zero_core::json::Value;
+        let huge = "This is a very long tool description. ".repeat(20) + "\nwith\nnewlines";
+        let script = format!(
+            "read a; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"capabilities\":{{}}}}}}'; read b; read c; printf '%s\\n' {}",
+            Value::Str(format!(
+                r#"{{"jsonrpc":"2.0","id":2,"result":{{"tools":[{{"name":"big","description":{}}}]}}}}"#,
+                Value::Str(huge.clone()).to_json()
+            ))
+            .to_json()
+        );
+        let cfg = Value::Object(vec![(
+            "mcpServers".to_string(),
+            Value::Object(vec![(
+                "verbose".to_string(),
+                Value::Object(vec![
+                    ("command".to_string(), Value::Str("sh".to_string())),
+                    (
+                        "args".to_string(),
+                        Value::Array(vec![Value::Str("-c".to_string()), Value::Str(script)]),
+                    ),
+                ]),
+            )]),
+        )]);
+        let path = std::env::temp_dir().join(format!("zero-mcp-big-{}.json", std::process::id()));
+        std::fs::write(&path, cfg.to_json()).unwrap();
+        let mut a = app(b"");
+        a.set_mcp_path(Some(path.clone()));
+        type_str(&mut a, "/mcp");
+        a.dispatch(Key::Enter).unwrap();
+        // Clear the connect output, then list tools.
+        a.out.clear();
+        type_str(&mut a, "/mcp tools");
+        a.dispatch(Key::Enter).unwrap();
+        let out = rendered(&a);
+        assert!(out.contains("big")); // tool name shown
+                                      // The full description must NOT be dumped — the tool line is capped.
+        let tool_line = out.lines().find(|l| l.contains("big")).unwrap();
+        assert!(
+            tool_line.chars().count() < 140,
+            "tool line too long: {tool_line}"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
