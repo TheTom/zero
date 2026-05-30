@@ -48,6 +48,7 @@ impl Value {
         let mut p = Parser {
             bytes: input.as_bytes(),
             pos: 0,
+            depth: 0,
         };
         p.skip_ws();
         let v = p.parse_value()?;
@@ -175,7 +176,15 @@ fn write_json_string(s: &str, out: &mut String) {
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Current container-nesting depth, bounded by [`MAX_DEPTH`] so adversarial
+    /// input (`[[[[…`) can't overflow the stack of this recursive-descent parser.
+    depth: usize,
 }
+
+/// Maximum array/object nesting depth. A model reply or MCP server is untrusted
+/// input; without this, deeply nested JSON would stack-overflow (a DoS). 256 is
+/// far beyond any legitimate chat/tool payload.
+const MAX_DEPTH: usize = 256;
 
 impl Parser<'_> {
     fn err(&self, msg: &str) -> ParseError {
@@ -201,8 +210,25 @@ impl Parser<'_> {
 
     fn parse_value(&mut self) -> Result<Value, ParseError> {
         match self.peek() {
-            Some(b'{') => self.parse_object(),
-            Some(b'[') => self.parse_array(),
+            // Containers recurse — bound the nesting depth (stack-overflow guard).
+            Some(b'{') => {
+                self.depth += 1;
+                if self.depth > MAX_DEPTH {
+                    return Err(self.err("nesting too deep"));
+                }
+                let v = self.parse_object();
+                self.depth -= 1;
+                v
+            }
+            Some(b'[') => {
+                self.depth += 1;
+                if self.depth > MAX_DEPTH {
+                    return Err(self.err("nesting too deep"));
+                }
+                let v = self.parse_array();
+                self.depth -= 1;
+                v
+            }
             Some(b'"') => Ok(Value::Str(self.parse_string()?)),
             Some(b't') | Some(b'f') => self.parse_bool(),
             Some(b'n') => self.parse_null(),

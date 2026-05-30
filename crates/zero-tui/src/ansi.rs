@@ -185,4 +185,103 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows[1].ends_with(RESET));
     }
+
+    // --- property / fuzz (std-only, deterministic) -----------------------
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Random line mixing visible chars, real SGR escapes, and multibyte UTF-8 —
+    /// the inputs most likely to break width counting or split an escape.
+    fn random_line(rng: &mut Rng) -> String {
+        const POOL: &[&str] = &[
+            "a", "Z", "0", " ", "中", "😀", "é", "\x1b[1m", "\x1b[0m", "\x1b[36m", "\x1b7",
+            "\x1b[2m",
+        ];
+        let n = rng.below(20);
+        (0..n)
+            .map(|_| POOL[rng.below(POOL.len() as u64) as usize])
+            .collect()
+    }
+
+    #[test]
+    fn property_wrap_preserves_nonspace_chars_and_bounds_width() {
+        // Invariants for every random (line, width):
+        //   1. no row exceeds `width` display columns;
+        //   2. concatenating the rows' NON-SPACE visible chars reproduces the
+        //      original non-space visible chars exactly, in order.
+        // Spaces are excluded because soft-wrap intentionally drops the single
+        // space at a break boundary (same contract as viewport::wrap_line).
+        let mut rng = Rng(0xA11C_E0F0_1234_5678);
+        for _ in 0..5000 {
+            let line = random_line(&mut rng);
+            let width = (rng.below(12) + 1) as usize;
+            let rows = wrap_ansi(&line, width);
+            assert!(!rows.is_empty());
+            for r in &rows {
+                assert!(
+                    display_width(r) <= width,
+                    "row {r:?} width {} > {width}",
+                    display_width(r)
+                );
+            }
+            let visible: String = rows
+                .iter()
+                .flat_map(|r| visible_chars(r))
+                .filter(|c| *c != ' ')
+                .collect();
+            let original: String = visible_chars(&line)
+                .into_iter()
+                .filter(|c| *c != ' ')
+                .collect();
+            assert_eq!(visible, original, "lost chars wrapping {line:?} @ {width}");
+        }
+    }
+
+    /// Strip escape sequences, returning just the visible characters.
+    fn visible_chars(s: &str) -> Vec<char> {
+        let mut out = Vec::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for p in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&p) {
+                            break;
+                        }
+                    }
+                } else {
+                    chars.next();
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fuzz_wrap_never_panics_on_arbitrary_input() {
+        let mut rng = Rng(0xBEEF_0000_FACE_1111);
+        for _ in 0..20_000 {
+            let len = rng.below(30) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| rng.below(256) as u8).collect();
+            let s = String::from_utf8_lossy(&bytes);
+            let width = rng.below(16) as usize; // includes 0 (the unwrapped path)
+            let _ = wrap_ansi(&s, width); // must not panic
+            let _ = display_width(&s);
+        }
+    }
 }

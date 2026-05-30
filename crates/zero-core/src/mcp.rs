@@ -423,4 +423,81 @@ mod tests {
         };
         assert!(Connection::connect("x", &spec).is_err());
     }
+
+    // --- fuzz: untrusted server stdout + config (std-only) ---------------
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    #[test]
+    fn fuzz_session_request_never_panics_on_garbage_stdout() {
+        use std::io::Cursor;
+        // A misbehaving/hostile MCP server can emit anything on stdout. The
+        // request loop must never panic — it returns Ok (a matching response) or
+        // Err (EOF), skipping all non-JSON / mismatched-id lines in between.
+        let mut rng = Rng(0xC0DE_F00D_1234_5678);
+        const LINES: &[&str] = &[
+            "garbage banner",
+            "",
+            "\x1b[2mANSI log\x1b[0m",
+            "{not json",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/x\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"message\":\"boom\"}}",
+            "中😀\\\"",
+        ];
+        for _ in 0..5000 {
+            let n = rng.below(6);
+            let mut out = String::new();
+            for _ in 0..n {
+                out.push_str(LINES[rng.below(LINES.len() as u64) as usize]);
+                out.push('\n');
+            }
+            let mut written = Vec::new();
+            let mut s = Session::new(Cursor::new(out.into_bytes()), &mut written);
+            let _ = s.request("probe", Value::Object(vec![])); // Ok or Err, never panic
+        }
+    }
+
+    #[test]
+    fn fuzz_mcp_config_parse_never_panics() {
+        // ~/.zero/mcp.json is user/tool-authored — parse must not panic.
+        let mut rng = Rng(0x4242_8888_0000_FFFF);
+        const FRAG: &[&str] = &[
+            "{",
+            "}",
+            "[",
+            "]",
+            "\"mcpServers\"",
+            ":",
+            ",",
+            "\"command\"",
+            "\"args\"",
+            "\"env\"",
+            "\"npx\"",
+            "null",
+            "true",
+            "\\",
+            "中",
+        ];
+        for _ in 0..10_000 {
+            let n = rng.below(14);
+            let text: String = (0..n)
+                .map(|_| FRAG[rng.below(FRAG.len() as u64) as usize])
+                .collect();
+            let _ = McpConfig::parse(&text); // Ok or Err, never panic
+        }
+    }
 }

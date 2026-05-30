@@ -438,4 +438,90 @@ mod tests {
         ];
         assert_eq!(tools_value(&defs).as_array().map(<[_]>::len), Some(2));
     }
+
+    // --- fuzz: tool-call parsing on untrusted model output ---------------
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    #[test]
+    fn fuzz_parse_tool_calls_never_panics() {
+        // parse_tool_calls runs on whatever a (possibly broken, possibly hostile)
+        // model emits. It must never panic, and every returned call must carry a
+        // non-empty name + id (so it can always be answered with a tool_call_id).
+        let mut rng = Rng(0x700F_0005_0000_0001);
+        // Fragments biased toward the structures the parser cares about.
+        const FRAG: &[&str] = &[
+            "<tool_call>",
+            "</tool_call>",
+            "{",
+            "}",
+            "[",
+            "]",
+            "\"name\"",
+            ":",
+            ",",
+            "\"arguments\"",
+            "```json",
+            "```",
+            "ls",
+            "\\",
+            "\"",
+            "{}",
+            "null",
+            "中😀",
+        ];
+        for _ in 0..20_000 {
+            let n = rng.below(12);
+            let content: String = (0..n)
+                .map(|_| FRAG[rng.below(FRAG.len() as u64) as usize])
+                .collect();
+            let msg = Value::Object(vec![("content".to_string(), Value::Str(content))]);
+            for call in parse_tool_calls(&msg) {
+                assert!(!call.name.is_empty(), "tool call with empty name");
+                assert!(!call.id.is_empty(), "tool call with empty id");
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_parse_arguments_never_panics() {
+        // Arguments come from the model verbatim — parse must yield Ok or Err,
+        // never panic, for arbitrary bytes.
+        let mut rng = Rng(0xABCD_0011_2233_4455);
+        for _ in 0..20_000 {
+            let len = rng.below(40) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| rng.below(256) as u8).collect();
+            let args = String::from_utf8_lossy(&bytes).into_owned();
+            let call = ToolCall::new("c", "t", args);
+            let _ = parse_arguments(&call); // must not panic
+        }
+    }
+
+    #[test]
+    fn loop_guard_doom_detection_is_order_independent() {
+        // Property: K identical batches in a row trip the guard regardless of the
+        // call's exact name/args; a different batch always resets the streak.
+        let mut rng = Rng(0x9999_1111_2222_3333);
+        for _ in 0..2000 {
+            let name = format!("t{}", rng.below(5));
+            let args = format!("{{\"x\":{}}}", rng.below(5));
+            let calls = vec![ToolCall::new("c", &name, &args)];
+            let mut g = LoopGuard::new(1000);
+            assert!(!g.is_doom_loop(&calls));
+            assert!(!g.is_doom_loop(&calls));
+            assert!(g.is_doom_loop(&calls)); // 3rd identical → doom
+        }
+    }
 }

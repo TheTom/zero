@@ -380,4 +380,85 @@ mod tests {
         .unwrap();
         assert_eq!(seen, "let me check|done|");
     }
+
+    // --- property: the loop always terminates with well-formed history ----
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    #[test]
+    fn property_loop_terminates_and_history_is_well_formed() {
+        // For a backend that emits random completions (text / 1-3 tool calls,
+        // sometimes repeating), run_turn must ALWAYS:
+        //   1. terminate (bounded by the guard) — the test itself hanging = fail,
+        //   2. leave history where every assistant turn carrying tool_calls is
+        //      followed by exactly one `tool` message per call id, in order.
+        // This is the invariant the whole feature relies on for valid requests.
+        for seed in 0..400u64 {
+            let rng = std::cell::RefCell::new(Rng(0x1000 + seed));
+            let mut conv = Conversation::new();
+            conv.push(Message::user("go"));
+            let mut completer = |_: &Conversation, _: &[ToolDef]| {
+                let mut r = rng.borrow_mut();
+                if r.below(3) == 0 {
+                    return Ok(Completion {
+                        content: "final".to_string(),
+                        tool_calls: vec![],
+                    });
+                }
+                let n = r.below(3) + 1;
+                let calls = (0..n)
+                    .map(|i| ToolCall::new(format!("c{i}"), format!("t{}", r.below(2)), "{}"))
+                    .collect();
+                Ok(Completion {
+                    content: String::new(),
+                    tool_calls: calls,
+                })
+            };
+            let mut exec = |_: &ToolCall| "ok".to_string();
+            let mut guard = LoopGuard::new(15);
+            let out = run_turn(
+                &mut conv,
+                &[],
+                &mut completer,
+                &mut exec,
+                &mut guard,
+                &mut |_| {},
+            )
+            .unwrap();
+            // Some terminal outcome was reached (no infinite loop).
+            assert!(matches!(
+                out.stop,
+                AgentStop::Done | AgentStop::MaxSteps | AgentStop::DoomLoop
+            ));
+            // Well-formedness: each assistant message with tool_calls is followed
+            // by exactly one Tool message per call id, in the same order.
+            let msgs = &conv.messages;
+            for (i, m) in msgs.iter().enumerate() {
+                if m.role == Role::Assistant && !m.tool_calls.is_empty() {
+                    let results = &msgs[i + 1..i + 1 + m.tool_calls.len()];
+                    assert_eq!(
+                        results.len(),
+                        m.tool_calls.len(),
+                        "seed {seed}: missing tool results"
+                    );
+                    for (call, res) in m.tool_calls.iter().zip(results) {
+                        assert_eq!(res.role, Role::Tool);
+                        assert_eq!(res.tool_call_id.as_deref(), Some(call.id.as_str()));
+                    }
+                }
+            }
+        }
+    }
 }
