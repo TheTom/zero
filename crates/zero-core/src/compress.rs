@@ -36,6 +36,9 @@ pub enum OutputShape {
     /// JSON: lossless whitespace minify (keeps it valid); donut the minified bytes
     /// only if still over budget.
     Json,
+    /// A base64-encoded image (data URI or bare blob). Opaque as text — never
+    /// inline; report format + size and offload, like [`OutputShape::Binary`].
+    Image,
     /// Binary blob: never inline; just report size.
     Binary,
     /// Unknown line/stream output: head + tail donut.
@@ -50,6 +53,7 @@ impl OutputShape {
             OutputShape::Log => "log",
             OutputShape::Dir => "dir",
             OutputShape::Json => "json",
+            OutputShape::Image => "image",
             OutputShape::Binary => "binary",
             OutputShape::Generic => "generic",
         }
@@ -120,6 +124,12 @@ pub fn detect(cmd: &str, raw: &[u8]) -> OutputShape {
     // First-bytes sniff for unknown commands.
     let head: String = String::from_utf8_lossy(&raw[..raw.len().min(SNIFF)]).into_owned();
     let first = head.trim_start().chars().next();
+    // Base64 image (data URI or bare blob) before any other text sniff: it's valid
+    // ASCII so it slips past is_binary, but it's just as opaque — detect by the
+    // encoded magic bytes and offload instead of inlining ~100× its worth in tokens.
+    if image_format(&head).is_some() {
+        return OutputShape::Image;
+    }
     if head.starts_with("diff --git") {
         return OutputShape::Diff;
     }
@@ -212,6 +222,47 @@ fn is_severity_line(l: &str) -> bool {
     SEVERITY.iter().any(|k| l.contains(k))
 }
 
+/// base64-encoded magic-byte prefixes → image format. base64 encodes 3 bytes into
+/// 4 chars, so a file's leading bytes map to a stable leading substring regardless
+/// of total length: PNG `\x89PNG` → "iVBORw0KGgo", JPEG `\xff\xd8\xff` → "/9j/",
+/// GIF → "R0lGOD", and RIFF (WebP) → "UklGR". Matching these is exact, not fuzzy.
+const IMAGE_B64_MAGIC: &[(&str, &str)] = &[
+    ("iVBORw0KGgo", "png"),
+    ("/9j/", "jpeg"),
+    ("R0lGOD", "gif"),
+    ("UklGR", "webp"),
+];
+
+/// Detect a base64 image and return its format. Accepts a `data:image/…;base64,`
+/// URI (authoritative — read the declared subtype) or a bare base64 blob whose
+/// decoded magic bytes match a known format. Returns `None` for anything else.
+/// Cheap: looks only at the head string the caller already sniffed.
+fn image_format(head: &str) -> Option<&'static str> {
+    let s = head.trim_start();
+    // data URI: trust the declared MIME, then confirm it's an image.
+    if let Some(rest) = s.strip_prefix("data:image/") {
+        if let Some((subtype, _)) = rest.split_once(';') {
+            // map common subtypes to a short tag; unknown image/* still counts.
+            let fmt = match subtype {
+                "png" => "png",
+                "jpeg" | "jpg" => "jpeg",
+                "gif" => "gif",
+                "webp" => "webp",
+                "svg+xml" => "svg",
+                _ => "image",
+            };
+            return Some(fmt);
+        }
+    }
+    // bare base64 blob: match decoded magic via the encoded prefix.
+    for (prefix, fmt) in IMAGE_B64_MAGIC {
+        if s.starts_with(prefix) {
+            return Some(fmt);
+        }
+    }
+    None
+}
+
 /// Compress `raw` to roughly `budget` bytes, shape-aware. `cmd` is the command
 /// that produced it (drives shape detection). `artifact`, if set, is the path
 /// where the full output was spilled — embedded in the marker so the model can
@@ -227,6 +278,29 @@ pub fn compress(cmd: &str, raw: &str, budget: usize, artifact: Option<&Path>) ->
     if shape == OutputShape::Binary {
         let text = format!(
             "[binary output, {raw_bytes} bytes]{}",
+            artifact_hint(artifact)
+        );
+        let kept = text.len();
+        return Compressed {
+            text,
+            shape,
+            raw_bytes,
+            kept_bytes: kept,
+        };
+    }
+
+    // A base64 image is opaque as text — never inline it (it's ~100× its visual
+    // worth in tokens). Report format + the decoded byte size (base64 inflates ~4/3)
+    // and offload, so the model knows an image is here and can re-fetch the artifact
+    // (or, with a vision backend, the executor can attach the spilled file).
+    if shape == OutputShape::Image {
+        let fmt = image_format(&String::from_utf8_lossy(
+            &raw.as_bytes()[..raw_bytes.min(SNIFF)],
+        ))
+        .unwrap_or("image");
+        let decoded = raw_bytes * 3 / 4; // base64 → bytes
+        let text = format!(
+            "[{fmt} image, ~{decoded} bytes (base64 elided)]{}",
             artifact_hint(artifact)
         );
         let kept = text.len();
@@ -882,6 +956,81 @@ mod tests {
     }
 
     #[test]
+    fn image_format_detects_data_uris_and_bare_blobs() {
+        // data URIs: trust the declared subtype.
+        assert_eq!(
+            image_format("data:image/png;base64,iVBORw0KGgo="),
+            Some("png")
+        );
+        assert_eq!(
+            image_format("data:image/jpeg;base64,/9j/4AAQ"),
+            Some("jpeg")
+        );
+        assert_eq!(
+            image_format("data:image/svg+xml;base64,PHN2Zz4="),
+            Some("svg")
+        );
+        assert_eq!(image_format("data:image/avif;base64,AAAA"), Some("image")); // unknown image/*
+                                                                                // bare base64 blobs: match the encoded magic prefix.
+        assert_eq!(image_format("iVBORw0KGgoAAAANS"), Some("png"));
+        assert_eq!(image_format("/9j/4AAQSkZJRg"), Some("jpeg"));
+        assert_eq!(image_format("R0lGODlhAQAB"), Some("gif"));
+        assert_eq!(image_format("UklGRiQAAABXRUJQ"), Some("webp"));
+        // not images.
+        assert_eq!(image_format("data:text/plain;base64,aGk="), None);
+        assert_eq!(image_format("just some prose"), None);
+        assert_eq!(image_format("{\"json\":1}"), None);
+    }
+
+    #[test]
+    fn base64_image_is_offloaded_not_inlined() {
+        // A big base64 PNG blob is VALID ASCII (slips past is_binary) but opaque —
+        // it must be detected as Image and offloaded with a format+size marker, not
+        // inlined as ~100× its worth in tokens.
+        let blob = format!("iVBORw0KGgoAAAANSUhEUg{}", "ABCDEFGHIJ".repeat(5000));
+        let c = compress("cat shot.png | base64", &blob, 4096, art());
+        assert_eq!(c.shape, OutputShape::Image);
+        assert!(c.text.contains("png image"), "marker: {}", c.text);
+        assert!(c.text.contains("base64 elided"));
+        assert!(c.text.contains("/tmp/zero/out-ab.txt"), "no re-fetch path");
+        assert!(
+            c.kept_bytes < 200,
+            "image marker should be tiny, got {}",
+            c.kept_bytes
+        );
+        assert!(c.kept_bytes < c.raw_bytes);
+    }
+
+    #[test]
+    fn data_uri_image_is_offloaded_even_when_small() {
+        // Opaqueness, not size, is the reason to offload: a small image still has no
+        // text value, so it's offloaded regardless of budget.
+        let uri = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD";
+        let c = compress("", uri, 100_000, art()); // huge budget → would otherwise inline
+        assert_eq!(c.shape, OutputShape::Image);
+        assert!(c.text.contains("jpeg image"));
+        // For a tiny blob the marker can exceed the bytes — that's fine: a "[jpeg
+        // image]" note is meaningful where the raw base64 is useless. The win is
+        // categorical (no opaque blob in context), measured on real-size images.
+        assert!(
+            !c.text.contains("/9j/4AAQ"),
+            "raw base64 must not be inlined"
+        );
+    }
+
+    #[test]
+    fn prose_mentioning_image_is_not_misdetected() {
+        // Guard against false positives: ordinary text that talks about images.
+        let c = compress(
+            "echo hi",
+            "the screenshot shows a png with errors",
+            4096,
+            art(),
+        );
+        assert_ne!(c.shape, OutputShape::Image);
+    }
+
+    #[test]
     fn log_keeps_first_error_and_tail_and_is_recoverable() {
         // Build log: banner, a wall of progress spam, an error in the MIDDLE,
         // more spam, then a summary tail. Naive head/tail would drop the error.
@@ -1006,6 +1155,7 @@ mod tests {
             (OutputShape::Log, "log"),
             (OutputShape::Dir, "dir"),
             (OutputShape::Json, "json"),
+            (OutputShape::Image, "image"),
             (OutputShape::Binary, "binary"),
             (OutputShape::Generic, "generic"),
         ] {
