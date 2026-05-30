@@ -25,6 +25,7 @@ pub mod openai;
 pub mod safety;
 pub mod servers;
 pub mod session;
+pub mod tools;
 
 pub use backend::{Backend, BackendError, StopReason, StreamEvent, StubBackend};
 pub use clock::{format_duration, Stopwatch};
