@@ -8,7 +8,7 @@ use std::io;
 use std::path::Path;
 
 /// Everything needed to talk to a model backend.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// Base URL of an OpenAI-compatible server, e.g. `http://host:8000`.
     /// `None` → run against the built-in stub backend.
@@ -21,6 +21,26 @@ pub struct Config {
     pub temperature: Option<f64>,
     /// Optional system prompt prepended to every conversation.
     pub system_prompt: Option<String>,
+    /// Max bytes of any single tool result fed back into the context window.
+    /// See [`crate::context`]. Defaults to [`crate::context::DEFAULT_MAX_TOOL_OUTPUT`].
+    pub max_tool_output: usize,
+    /// Max cumulative tool-result bytes fed back within one agentic turn.
+    /// Defaults to [`crate::context::DEFAULT_MAX_TURN_OUTPUT`].
+    pub max_turn_output: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            base_url: None,
+            model: String::new(),
+            api_key: None,
+            temperature: None,
+            system_prompt: None,
+            max_tool_output: crate::context::DEFAULT_MAX_TOOL_OUTPUT,
+            max_turn_output: crate::context::DEFAULT_MAX_TURN_OUTPUT,
+        }
+    }
 }
 
 impl Config {
@@ -50,6 +70,17 @@ impl Config {
                 c.system_prompt = Some(s.to_string());
             }
         }
+        // Context caps: positive integers only; anything else keeps the default.
+        if let Some(n) = v.get("max_tool_output").and_then(Value::as_f64) {
+            if n >= 1.0 {
+                c.max_tool_output = n as usize;
+            }
+        }
+        if let Some(n) = v.get("max_turn_output").and_then(Value::as_f64) {
+            if n >= 1.0 {
+                c.max_turn_output = n as usize;
+            }
+        }
         Ok(c)
     }
 
@@ -73,8 +104,16 @@ impl Config {
                 .unwrap_or_else(|| "null".to_string())
         ));
         out.push_str(&format!(
-            "  \"system_prompt\": {}\n",
+            "  \"system_prompt\": {},\n",
             q(self.system_prompt.as_deref().unwrap_or(""))
+        ));
+        out.push_str(&format!(
+            "  \"max_tool_output\": {},\n",
+            self.max_tool_output
+        ));
+        out.push_str(&format!(
+            "  \"max_turn_output\": {}\n",
+            self.max_turn_output
         ));
         out.push('}');
         out.push('\n');
@@ -171,6 +210,39 @@ mod tests {
     }
 
     #[test]
+    fn default_uses_canonical_context_caps() {
+        let c = Config::default();
+        assert_eq!(c.max_tool_output, crate::context::DEFAULT_MAX_TOOL_OUTPUT);
+        assert_eq!(c.max_turn_output, crate::context::DEFAULT_MAX_TURN_OUTPUT);
+    }
+
+    #[test]
+    fn context_caps_round_trip_through_json() {
+        let c = Config {
+            base_url: Some("http://h:8000".to_string()),
+            max_tool_output: 8192,
+            max_turn_output: 65_000,
+            ..Config::default()
+        };
+        let back = Config::from_json(&c.to_json()).unwrap();
+        assert_eq!(back.max_tool_output, 8192);
+        assert_eq!(back.max_turn_output, 65_000);
+        assert_eq!(back.base_url.as_deref(), Some("http://h:8000"));
+    }
+
+    #[test]
+    fn invalid_caps_fall_back_to_defaults() {
+        // Absent → defaults.
+        let c = Config::from_json(r#"{"model":"m"}"#).unwrap();
+        assert_eq!(c.max_tool_output, crate::context::DEFAULT_MAX_TOOL_OUTPUT);
+        assert_eq!(c.max_turn_output, crate::context::DEFAULT_MAX_TURN_OUTPUT);
+        // Zero / negative are rejected (a 0-byte cap would starve every result).
+        let bad = Config::from_json(r#"{"max_tool_output":0,"max_turn_output":-5}"#).unwrap();
+        assert_eq!(bad.max_tool_output, crate::context::DEFAULT_MAX_TOOL_OUTPUT);
+        assert_eq!(bad.max_turn_output, crate::context::DEFAULT_MAX_TURN_OUTPUT);
+    }
+
+    #[test]
     fn roundtrips_through_json() {
         let c = Config {
             base_url: Some("http://h:1".to_string()),
@@ -178,6 +250,7 @@ mod tests {
             api_key: None,
             temperature: Some(0.2),
             system_prompt: Some("sys".to_string()),
+            ..Config::default()
         };
         let reparsed = Config::from_json(&c.to_json()).unwrap();
         assert_eq!(reparsed, c);
@@ -209,6 +282,7 @@ mod tests {
             api_key: Some("k".to_string()),
             temperature: Some(0.5),
             system_prompt: None,
+            ..Config::default()
         };
         c.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), c);

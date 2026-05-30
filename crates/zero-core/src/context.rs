@@ -10,6 +10,16 @@
 //! highest-signal parts (head + tail) and carries an explicit marker telling the
 //! model how to retrieve the dropped span — nothing is destroyed, only deferred.
 
+/// Default per-result context cap (bytes) ≈ ~1K tokens — generous for a 32K
+/// window, safe for an 8K one. Tuned from transcript analysis where a 2.6% long
+/// tail of results carried ~70% of all tool-output bytes.
+pub const DEFAULT_MAX_TOOL_OUTPUT: usize = 4096;
+/// Default cumulative per-turn tool-output budget (bytes) ≈ 6K tokens.
+pub const DEFAULT_MAX_TURN_OUTPUT: usize = 24_000;
+/// Minimum bytes any single result keeps even when the turn budget is spent
+/// (the "always keep at least one" rule — a starved result is useless).
+pub const TURN_OUTPUT_FLOOR: usize = 256;
+
 /// Estimate token count from text via the standard chars/4 heuristic. Exact
 /// counts need the model's tokenizer; chars/4 is the industry approximation and
 /// is all we need to *budget* (we only compare against a budget, never bill).
@@ -199,6 +209,67 @@ pub fn compact_call_args(name: &str, arguments: &str) -> Option<String> {
     changed.then(|| crate::json::Value::Object(compacted).to_json())
 }
 
+/// Cumulative, **measured** (never estimated) record of how many bytes the
+/// context levers saved this session — for an honest `/context` report. Each
+/// counter is the difference between what a tool produced and what actually
+/// reached the model's window, attributed to the lever responsible.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ContextStats {
+    /// Raw bytes tool executions produced, before any capping (cache hits, which
+    /// never run the tool, are not counted here).
+    pub raw_bytes: usize,
+    /// Bytes actually fed back to the model after capping.
+    pub kept_bytes: usize,
+    /// Bytes dropped by per-result + per-turn capping.
+    pub capped_saved: usize,
+    /// Bytes avoided by the read cache (an unchanged re-read returns a stub
+    /// instead of the would-be file content).
+    pub cached_saved: usize,
+    /// Bytes removed by compacting applied write/edit args out of history.
+    pub compacted_saved: usize,
+}
+
+impl ContextStats {
+    pub fn new() -> Self {
+        ContextStats::default()
+    }
+
+    /// Record a tool result that ran: `raw` produced, `kept` fed back. The
+    /// difference (if any) is attributed to capping.
+    pub fn record_result(&mut self, raw: usize, kept: usize) {
+        self.raw_bytes += raw;
+        self.kept_bytes += kept;
+        self.capped_saved += raw.saturating_sub(kept);
+    }
+
+    /// Record a read-cache hit: the tool did NOT run; `would_be` is the size of
+    /// the content that would have been re-injected, `stub` the size returned.
+    pub fn record_cache_hit(&mut self, would_be: usize, stub: usize) {
+        self.cached_saved += would_be.saturating_sub(stub);
+        self.kept_bytes += stub;
+    }
+
+    /// Record a history compaction of write/edit args: `before` → `after` bytes.
+    pub fn record_compaction(&mut self, before: usize, after: usize) {
+        self.compacted_saved += before.saturating_sub(after);
+    }
+
+    /// Total bytes saved across all levers.
+    pub fn total_saved(&self) -> usize {
+        self.capped_saved + self.cached_saved + self.compacted_saved
+    }
+
+    /// Reduction as a percentage of what *would* have entered the window without
+    /// the levers (capped+cached baseline). 0 when nothing has flowed yet.
+    pub fn reduction_pct(&self) -> u32 {
+        let would_be = self.kept_bytes + self.capped_saved + self.cached_saved;
+        if would_be == 0 {
+            return 0;
+        }
+        ((self.capped_saved + self.cached_saved) as u64 * 100 / would_be as u64) as u32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +365,34 @@ mod tests {
             .is_none());
         c.record(std::path::Path::new("/no/such/zero-file")); // no-op
         assert!(c.check(std::env::temp_dir().as_path()).is_none()); // a dir
+    }
+
+    #[test]
+    fn context_stats_measures_each_lever() {
+        let mut s = ContextStats::new();
+        // A 1000-byte result capped to 200 → 800 saved by capping.
+        s.record_result(1000, 200);
+        assert_eq!(s.raw_bytes, 1000);
+        assert_eq!(s.kept_bytes, 200);
+        assert_eq!(s.capped_saved, 800);
+        // A cache hit: 5000 would-be content, 80-byte stub → 4920 saved.
+        s.record_cache_hit(5000, 80);
+        assert_eq!(s.cached_saved, 4920);
+        assert_eq!(s.kept_bytes, 280);
+        // A compaction: 5000-byte args → 40 → 4960 saved.
+        s.record_compaction(5000, 40);
+        assert_eq!(s.compacted_saved, 4960);
+        assert_eq!(s.total_saved(), 800 + 4920 + 4960);
+        // Reduction = (capped+cached) / (kept + capped + cached).
+        // = 5720 / (280 + 5720) = 5720/6000 = 95%.
+        assert_eq!(s.reduction_pct(), 95);
+    }
+
+    #[test]
+    fn context_stats_empty_is_zero_not_a_panic() {
+        let s = ContextStats::new();
+        assert_eq!(s.total_saved(), 0);
+        assert_eq!(s.reduction_pct(), 0); // no divide-by-zero
     }
 
     #[test]

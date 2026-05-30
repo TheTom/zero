@@ -67,9 +67,15 @@ Config lives at `~/.zero/config.json` (created on first run):
   "model": "Qwen3.6-35B-A3B-...-Q5_K_M.gguf",
   "api_key": "",
   "temperature": null,
-  "system_prompt": ""
+  "system_prompt": "",
+  "max_tool_output": 4096,
+  "max_turn_output": 24000
 }
 ```
+
+`max_tool_output` / `max_turn_output` tune the [context caps](#context-efficiency)
+(bytes) — raise them for a big-window model, lower them for an 8K one. Omit either
+to use the default shown.
 
 CLI flags override the file:
 
@@ -227,7 +233,19 @@ disk, line range, or already upstream in the conversation):
 
 All of it is pure, std-only (`zero_core::context`), and unit-proven — each lever
 has a test asserting both the byte saving and that the full content is still
-reachable.
+reachable. The caps are tunable per model via `max_tool_output` / `max_turn_output`
+in `config.json`.
+
+**`/context`** reports the *measured* (never estimated) bytes saved this session,
+broken down by lever:
+
+```
+context savings (measured this session)
+  cap:      36.2 KB  (oversized tool results trimmed)
+  cache:    18.0 KB  (unchanged re-reads skipped)
+  compact:   4.9 KB  (applied write/edit payloads dropped)
+  total:    59.1 KB  →  71% smaller window
+```
 
 ### MCP servers
 

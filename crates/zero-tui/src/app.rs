@@ -297,14 +297,13 @@ pub struct App<I: Input, W: Write> {
     max_turn_output: usize,
     /// Files read this session, so an unchanged re-read returns a stub.
     read_cache: zero_core::context::ReadCache,
+    /// Measured, cumulative bytes the context levers saved this session (`/context`).
+    context_stats: zero_core::context::ContextStats,
 }
 
-/// Default per-result context cap (bytes) ≈ ~1K tokens.
-const DEFAULT_MAX_TOOL_OUTPUT: usize = 4096;
-/// Default cumulative per-turn tool-output budget (bytes) ≈ 6K tokens.
-const DEFAULT_MAX_TURN_OUTPUT: usize = 24_000;
-/// Minimum bytes any single result keeps even when the turn budget is spent.
-const TURN_OUTPUT_FLOOR: usize = 256;
+// Canonical context-cap defaults live in zero_core::context (shared with Config);
+// aliased here so the App-construction defaults can't drift from the core ones.
+use zero_core::context::{DEFAULT_MAX_TOOL_OUTPUT, DEFAULT_MAX_TURN_OUTPUT, TURN_OUTPUT_FLOOR};
 
 impl<I: Input, W: Write> App<I, W> {
     /// Build an app over an input source, an output sink, and a backend.
@@ -351,6 +350,7 @@ impl<I: Input, W: Write> App<I, W> {
             max_tool_output: DEFAULT_MAX_TOOL_OUTPUT,
             max_turn_output: DEFAULT_MAX_TURN_OUTPUT,
             read_cache: zero_core::context::ReadCache::new(),
+            context_stats: zero_core::context::ContextStats::new(),
         }
     }
 
@@ -374,6 +374,9 @@ impl<I: Input, W: Write> App<I, W> {
         servers_path: Option<PathBuf>,
     ) {
         self.config = config;
+        // Apply the context caps from config (Config bakes in the defaults).
+        self.max_tool_output = self.config.max_tool_output;
+        self.max_turn_output = self.config.max_turn_output;
         self.config_path = config_path;
         self.servers_path = servers_path;
     }
@@ -677,6 +680,11 @@ impl<I: Input, W: Write> App<I, W> {
             self.write_text(&format!("\x1b[2m{info}\x1b[0m\n"))?;
             return Ok(Flow::Continue);
         }
+        if trimmed == "/context" {
+            self.echo_committed(&text)?;
+            self.print_context_stats()?;
+            return Ok(Flow::Continue);
+        }
         if trimmed == "/scan" {
             self.echo_committed(&text)?;
             self.write_text("\x1b[2mscanning local network…\x1b[0m\n")?;
@@ -770,6 +778,7 @@ impl<I: Input, W: Write> App<I, W> {
         let turn_budget = self.max_turn_output;
         let spent = RefCell::new(0usize); // cumulative result bytes this turn
         let read_cache = RefCell::new(std::mem::take(&mut self.read_cache));
+        let stats = RefCell::new(std::mem::take(&mut self.context_stats));
         let res = {
             let out = RefCell::new(&mut self.out);
             let mut completer = |c: &Conversation, t: &[ToolDef]| backend.complete(c, t, timeout);
@@ -784,6 +793,12 @@ impl<I: Input, W: Write> App<I, W> {
                 if call.name == "read_file" && !has_range(call) {
                     if let Some(p) = &path {
                         if let Some(stub) = read_cache.borrow().check(p) {
+                            // Measured saving: the would-be re-read is the file's
+                            // current size (unchanged since we cached it).
+                            let would_be = std::fs::metadata(p)
+                                .map(|m| m.len() as usize)
+                                .unwrap_or(stub.len());
+                            stats.borrow_mut().record_cache_hit(would_be, stub.len());
                             let _ = write_raw(
                                 &mut **out.borrow_mut(),
                                 &format!("\x1b[2m  ↳ (cached) {stub}\x1b[0m\n"),
@@ -797,10 +812,12 @@ impl<I: Input, W: Write> App<I, W> {
                 // cap also shrinks as the per-turn budget depletes (always keeping
                 // a floor), so a turn firing many calls can't blow the window by
                 // attrition. Nothing is lost — a re-fetch hint rides along.
+                let raw_len = raw.len();
                 let remaining = turn_budget.saturating_sub(*spent.borrow());
                 let eff_cap = cap.min(remaining.max(TURN_OUTPUT_FLOOR));
                 let result = cap_tool_result(call, raw, eff_cap);
                 *spent.borrow_mut() += result.len();
+                stats.borrow_mut().record_result(raw_len, result.len());
                 // Maintain the read cache: remember successful whole reads; forget
                 // a file after a write/edit so it re-reads in full next time.
                 if let Some(p) = &path {
@@ -831,9 +848,11 @@ impl<I: Input, W: Write> App<I, W> {
         };
         self.conv = conv;
         self.read_cache = read_cache.into_inner();
+        self.context_stats = stats.into_inner();
         // Drop bulky content from applied write/edit calls — the file is on disk,
         // so re-sending the payload to the model each turn just wastes the window.
-        compact_applied_writes(&mut self.conv);
+        let (before, after) = compact_applied_writes(&mut self.conv);
+        self.context_stats.record_compaction(before, after);
 
         match res {
             Ok(outcome) => {
@@ -1359,6 +1378,29 @@ impl<I: Input, W: Write> App<I, W> {
             }
         }
         Ok(())
+    }
+
+    /// Report the *measured* bytes the context levers saved this session — an
+    /// honest accounting (never an estimate), per the measure-don't-guess rule.
+    fn print_context_stats(&mut self) -> io::Result<()> {
+        let s = &self.context_stats;
+        if s.raw_bytes == 0 && s.total_saved() == 0 {
+            return self.write_text("\x1b[2mno tool output yet — run a /tools turn first\x1b[0m\n");
+        }
+        let kb = |n: usize| format!("{:.1} KB", n as f64 / 1024.0);
+        let out = format!(
+            "\x1b[1mcontext savings\x1b[0m (measured this session)\n\
+             \x20 cap:      \x1b[36m{}\x1b[0m  (oversized tool results trimmed)\n\
+             \x20 cache:    \x1b[36m{}\x1b[0m  (unchanged re-reads skipped)\n\
+             \x20 compact:  \x1b[36m{}\x1b[0m  (applied write/edit payloads dropped)\n\
+             \x20 \x1b[1mtotal:    {}\x1b[0m  →  \x1b[32m{}% smaller window\x1b[0m\n",
+            kb(s.capped_saved),
+            kb(s.cached_saved),
+            kb(s.compacted_saved),
+            kb(s.total_saved()),
+            s.reduction_pct(),
+        );
+        self.write_text(&out)
     }
 
     /// List discovered tools, grouped by server. One compact line per tool —
@@ -1987,7 +2029,8 @@ fn cap_tool_result(call: &ToolCall, result: String, max: usize) -> String {
 
 /// After a tool turn, drop bulky payloads of successfully-applied write/edit calls
 /// from history (the file is on disk). Failed/refused writes keep their args.
-fn compact_applied_writes(conv: &mut Conversation) {
+/// Returns `(bytes_before, bytes_after)` of the args it compacted, for stats.
+fn compact_applied_writes(conv: &mut Conversation) -> (usize, usize) {
     let ok_ids: std::collections::HashSet<String> = conv
         .messages
         .iter()
@@ -1995,15 +2038,19 @@ fn compact_applied_writes(conv: &mut Conversation) {
         .filter(|m| !m.content.starts_with("error:") && !m.content.starts_with("refused:"))
         .filter_map(|m| m.tool_call_id.clone())
         .collect();
+    let (mut before, mut after) = (0usize, 0usize);
     for m in &mut conv.messages {
         for tc in &mut m.tool_calls {
             if ok_ids.contains(&tc.id) {
                 if let Some(args) = zero_core::context::compact_call_args(&tc.name, &tc.arguments) {
+                    before += tc.arguments.len();
+                    after += args.len();
                     tc.arguments = args;
                 }
             }
         }
     }
+    (before, after)
 }
 
 /// First line of a string, for a compact one-line tool-result preview.
@@ -2631,6 +2678,93 @@ mod tests {
             "tool line too long: {tool_line}"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn set_config_applies_context_caps() {
+        let mut a = app(b"");
+        let cfg = Config {
+            max_tool_output: 1234,
+            max_turn_output: 56_789,
+            ..Config::default()
+        };
+        a.set_config(cfg, None, None);
+        assert_eq!(a.max_tool_output, 1234);
+        assert_eq!(a.max_turn_output, 56_789);
+    }
+
+    #[test]
+    fn context_command_reports_nothing_before_any_turn() {
+        let mut a = app(b"");
+        type_str(&mut a, "/context");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("no tool output yet"));
+    }
+
+    #[test]
+    fn context_command_reports_measured_savings() {
+        // End-to-end through the agentic loop without touching cwd (which would
+        // race other tests): an inline backend that calls grep — its result is
+        // capped tiny, so the executor records a measured saving — then answers.
+        use std::sync::Mutex;
+        struct CapBackend {
+            step: Arc<Mutex<u32>>,
+        }
+        impl Backend for CapBackend {
+            fn name(&self) -> &str {
+                "cap"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                sink(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+            fn complete(
+                &self,
+                _c: &Conversation,
+                _t: &[ToolDef],
+                _to: Duration,
+            ) -> Result<zero_core::backend::Completion, zero_core::backend::BackendError>
+            {
+                let mut step = self.step.lock().unwrap();
+                *step += 1;
+                if *step == 1 {
+                    // grep the source tree (cwd) for a common token → a big result.
+                    Ok(zero_core::backend::Completion {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall::new("c1", "grep", r#"{"pattern":"fn"}"#)],
+                    })
+                } else {
+                    Ok(zero_core::backend::Completion {
+                        content: "done".to_string(),
+                        tool_calls: vec![],
+                    })
+                }
+            }
+        }
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(CapBackend {
+                step: Arc::new(Mutex::new(0)),
+            }),
+            None,
+        );
+        a.tools_enabled = true;
+        a.max_tool_output = 64; // tiny → the grep result is capped, recording a saving
+        a.run_tool_turn("grep fn").unwrap();
+
+        assert!(a.context_stats.raw_bytes > 0, "no tool output recorded");
+        assert!(a.context_stats.capped_saved > 0, "cap recorded no saving");
+
+        type_str(&mut a, "/context");
+        a.dispatch(Key::Enter).unwrap();
+        let out = rendered(&a);
+        assert!(out.contains("context savings"));
+        assert!(out.contains("smaller window"));
     }
 
     #[test]

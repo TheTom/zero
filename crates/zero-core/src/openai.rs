@@ -253,6 +253,7 @@ mod tests {
             api_key: Some("tok".to_string()),
             temperature: Some(0.3),
             system_prompt: Some("be terse".to_string()),
+            ..Config::default()
         }
     }
 
