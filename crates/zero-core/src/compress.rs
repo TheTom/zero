@@ -241,11 +241,22 @@ fn compress_log(raw: &str, budget: usize, artifact: Option<&Path>) -> String {
 
     let mut keep_head: Vec<usize> = (0..HEAD.min(n)).collect();
     let mut keep_tail: Vec<usize> = (n.saturating_sub(TAIL)..n).collect();
-    // Severity lines anywhere in the middle (cap to avoid a log that's all errors).
-    let mut sev: Vec<usize> = (HEAD..n.saturating_sub(TAIL))
-        .filter(|&i| is_severity_line(lines[i]))
-        .take(60)
-        .collect();
+    // Severity lines anywhere in the middle (cap to avoid a log that's all errors),
+    // PLUS a few trailing context lines per error — compilers put the location
+    // (`--> file:line`) and the offending code snippet on the lines *after* the
+    // `error:` line, so keeping only the error line loses where it is.
+    const CONTEXT_AFTER: usize = 3;
+    let mid = HEAD..n.saturating_sub(TAIL);
+    let mut sev: Vec<usize> = Vec::new();
+    let mut errs = 0;
+    for i in mid.clone() {
+        if is_severity_line(lines[i]) && errs < 60 {
+            errs += 1;
+            for j in i..=(i + CONTEXT_AFTER).min(n.saturating_sub(TAIL).saturating_sub(1)) {
+                sev.push(j);
+            }
+        }
+    }
 
     let mut keep = Vec::new();
     keep.append(&mut keep_head);
