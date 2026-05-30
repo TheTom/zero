@@ -223,6 +223,19 @@ const PLAN_DIRECTIVE: &str = "You are in PLAN MODE. Do not write final code or \
 take actions yet. Think through the approach and present a concise, reviewable \
 plan first; wait for the go-ahead before implementing.";
 
+/// The built-in system prompt, prepended (as a system message) to every request
+/// when the user hasn't configured their own. Deliberately TINY — it's paid on
+/// every call, and Zero's edge is a lean context — but it earns its tokens: it
+/// sets tool-first discipline, minimal-edit and safety norms, and (the synergy
+/// with the compression layer) teaches the model to RE-FETCH capped output via
+/// the offset/limit + artifact markers instead of assuming the omitted part.
+const DEFAULT_SYSTEM_PROMPT: &str = "You are Zero, a terminal coding assistant. \
+Prefer tools over guessing: read and search the real files before you answer or \
+edit, and make minimal, correct changes. Be concise. Avoid destructive shell \
+commands unless asked. Tool output may be capped with a marker — when you need the \
+omitted part, re-fetch it (read_file with offset/limit, or read the named artifact \
+path) rather than assuming it.";
+
 /// The running terminal application.
 pub struct App<I: Input, W: Write> {
     input: I,
@@ -411,6 +424,16 @@ impl<I: Input, W: Write> App<I, W> {
         self.tools_enabled = on;
     }
 
+    /// The system prompt for this session: the user's configured one if non-empty,
+    /// else the tiny built-in [`DEFAULT_SYSTEM_PROMPT`]. Prepended per-request so
+    /// the persisted conversation stays system-free (plan mode adds its own too).
+    fn system_prompt(&self) -> &str {
+        match self.config.system_prompt.as_deref() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => DEFAULT_SYSTEM_PROMPT,
+        }
+    }
+
     /// Read-only view of the live conversation (for headless callers and
     /// integration tests that assert on what was fed back to the model).
     pub fn conversation(&self) -> &Conversation {
@@ -440,7 +463,8 @@ impl<I: Input, W: Write> App<I, W> {
         } else {
             self.conv.push(Message::user(prompt));
             let timeout = Duration::from_secs(120);
-            match self.backend.complete(&self.conv, &[], timeout) {
+            let req = with_system(&self.conv, self.system_prompt());
+            match self.backend.complete(&req, &[], timeout) {
                 Ok(c) => {
                     self.write_text(&c.content)?;
                     self.conv.push(Message::assistant(&c.content));
@@ -842,13 +866,19 @@ impl<I: Input, W: Write> App<I, W> {
         // block scopes those borrows so `self` is free again after it returns.
         let cap = self.max_tool_output;
         let turn_budget = self.max_turn_output;
+        let system = self.system_prompt().to_string();
         let artifact_dir = self.artifact_dir.clone();
         let spent = RefCell::new(0usize); // cumulative result bytes this turn
         let read_cache = RefCell::new(std::mem::take(&mut self.read_cache));
         let stats = RefCell::new(std::mem::take(&mut self.context_stats));
         let res = {
             let out = RefCell::new(&mut self.out);
-            let mut completer = |c: &Conversation, t: &[ToolDef]| backend.complete(c, t, timeout);
+            // Prepend the system prompt per completion call so it leads every round
+            // without persisting into self.conv (kept system-free for replay/tests).
+            let sys = system.clone();
+            let mut completer = |c: &Conversation, t: &[ToolDef]| {
+                backend.complete(&with_system(c, &sys), t, timeout)
+            };
             let mut executor = |call: &ToolCall| {
                 let _ = write_raw(
                     &mut **out.borrow_mut(),
@@ -967,12 +997,13 @@ impl<I: Input, W: Write> App<I, W> {
 
         let (tx, rx) = mpsc::channel();
         let backend = Arc::clone(&self.backend);
-        // Plan mode: prepend a planning directive (system) to *this request only*
-        // — self.conv is untouched, so it doesn't persist across turns/modes.
-        let mut conv = self.conv.clone();
+        // Prepend the system prompt (and, in plan mode, the plan directive) to
+        // *this request only* — self.conv is untouched, so nothing persists across
+        // turns/modes. System leads; the plan directive sits just after it.
+        let mut conv = with_system(&self.conv, self.system_prompt());
         if self.mode == Mode::Plan {
             conv.messages
-                .insert(0, Message::new(Role::System, PLAN_DIRECTIVE.to_string()));
+                .insert(1, Message::new(Role::System, PLAN_DIRECTIVE.to_string()));
         }
         let run = move || {
             // Catch panics so a misbehaving backend can't take down the whole
@@ -2145,6 +2176,18 @@ fn has_range(call: &ToolCall) -> bool {
     }
 }
 
+/// Clone `conv` with `system` prepended as the leading system message. Per-request
+/// so the persisted conversation stays system-free (clean replay + tests). Empty
+/// `system` yields an unchanged clone.
+fn with_system(conv: &Conversation, system: &str) -> Conversation {
+    let mut c = conv.clone();
+    if !system.is_empty() {
+        c.messages
+            .insert(0, Message::new(Role::System, system.to_string()));
+    }
+    c
+}
+
 /// Cap a tool result to `max` bytes with a tool-aware re-fetch hint.
 fn cap_tool_result(
     call: &ToolCall,
@@ -2766,6 +2809,98 @@ mod tests {
         assert!(msgs.iter().any(|m| m.content == "do the thing"));
         // Not persisted: the live conversation has no injected system message.
         assert!(a.conv.messages.iter().all(|m| m.role != Role::System));
+    }
+
+    #[test]
+    fn default_system_prompt_is_sent_and_not_persisted() {
+        use std::sync::Mutex;
+        #[derive(Clone)]
+        struct Rec {
+            seen: Arc<Mutex<Vec<Message>>>,
+        }
+        impl Backend for Rec {
+            fn name(&self) -> &str {
+                "rec"
+            }
+            fn stream(
+                &self,
+                conv: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                *self.seen.lock().unwrap() = conv.messages.clone();
+                sink(StreamEvent::Token("ok".into()));
+                sink(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(Rec { seen: seen.clone() }),
+            None,
+        );
+        a.synchronous = true;
+        a.start_turn("hello").unwrap();
+        while a.streaming.is_some() {
+            a.pump_stream().unwrap();
+        }
+        let msgs = seen.lock().unwrap();
+        // The built-in default leads the request as a system message…
+        let sys = msgs.first().expect("a leading message");
+        assert_eq!(sys.role, Role::System);
+        assert!(sys.content.contains("terminal coding assistant"));
+        assert!(
+            sys.content.contains("re-fetch"),
+            "should teach capped-output recovery"
+        );
+        // …but never persists into the live conversation.
+        assert!(a.conv.messages.iter().all(|m| m.role != Role::System));
+    }
+
+    #[test]
+    fn configured_system_prompt_overrides_the_default() {
+        use std::sync::Mutex;
+        #[derive(Clone)]
+        struct Rec {
+            seen: Arc<Mutex<Vec<Message>>>,
+        }
+        impl Backend for Rec {
+            fn name(&self) -> &str {
+                "rec"
+            }
+            fn stream(
+                &self,
+                conv: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                *self.seen.lock().unwrap() = conv.messages.clone();
+                sink(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(Rec { seen: seen.clone() }),
+            None,
+        );
+        a.synchronous = true;
+        let cfg = Config {
+            system_prompt: Some("custom sys prompt".to_string()),
+            ..Config::default()
+        };
+        a.set_config(cfg, None, None);
+        a.start_turn("hi").unwrap();
+        while a.streaming.is_some() {
+            a.pump_stream().unwrap();
+        }
+        let msgs = seen.lock().unwrap();
+        let sys = msgs.first().unwrap();
+        assert_eq!(sys.role, Role::System);
+        assert_eq!(sys.content, "custom sys prompt");
+        assert!(!sys.content.contains("terminal coding assistant"));
     }
 
     #[test]
