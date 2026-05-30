@@ -4,6 +4,12 @@
 # tokens on agentic tasks. On-demand benchmark — NOT a gate test (a real model is
 # non-deterministic), so it lives in scripts/, never in `cargo test`.
 #
+# TOKENS ARE HALF THE STORY. "6% of the tokens" is meaningless if the output is
+# worse. For build/deliverable tasks, pair this with scripts/judge.py — a blind,
+# position-debiased, same-model rubric judge — to capture QUALITY too. Only claim a
+# win when judge.py says quality holds AND this says tokens dropped. (For the simple
+# fact-retrieval default task here, ZERO_BENCH_EXPECT covers the quality half.)
+#
 # Token measurement: Zero prints `[usage: prompt=N completion=N total=N]` to
 # stderr on a headless run — server-reported, summed across agentic rounds, never
 # estimated. This script parses that for Zero's real total. Hermes token
