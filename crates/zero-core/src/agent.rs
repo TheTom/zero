@@ -10,8 +10,9 @@
 //!  * loop continues on PRESENCE of tool calls, never on `finish_reason`;
 //!  * every assistant turn carrying calls is pushed to history verbatim, each
 //!    answered by exactly one `tool` message with the matching id;
-//!  * bounded by [`crate::tools::LoopGuard`] (step cap + doom-loop), so a
-//!    misbehaving local model can't run forever.
+//!  * bounded by [`crate::tools::LoopGuard`] — progress-based stuck detection
+//!    with a soft nudge (not a step cap), so a misbehaving local model is reined
+//!    in without cutting off a legitimately long task.
 
 use crate::backend::{BackendError, Completion};
 use crate::message::{Conversation, Message, ToolCall};
@@ -41,9 +42,12 @@ pub struct TurnOutcome {
 pub enum AgentStop {
     /// The model produced a text answer with no further tool calls.
     Done,
-    /// The step cap was hit (final text may be partial).
+    /// Reserved: the old hard step cap. No longer produced by `run_turn` (the
+    /// progress-based guard uses `DoomLoop` for stuck/backstop stops); kept for
+    /// API compatibility and any external matcher.
     MaxSteps,
-    /// The same call repeated — broke out to avoid a doom loop.
+    /// The guard ended the turn: the model was stuck (repeating without progress)
+    /// and didn't recover after a nudge, or the catastrophe backstop tripped.
     DoomLoop,
 }
 
@@ -128,37 +132,17 @@ pub fn run_turn(
             on_text(&completion.content);
         }
 
-        // Doom-loop guard: the same calls repeating means we're stuck.
-        if guard.is_doom_loop(&completion.tool_calls) {
-            conv.push(Message::assistant_tool_calls(
-                &completion.content,
-                completion.tool_calls.clone(),
-            ));
-            // Answer each call so history stays well-formed before bailing.
-            for call in &completion.tool_calls {
-                conv.push(Message::tool_result(
-                    &call.id,
-                    "[aborted: repeated identical tool call]",
-                ));
-            }
-            return Ok(TurnOutcome {
-                final_text: completion.content,
-                stop: AgentStop::DoomLoop,
-                rounds,
-                usage,
-                compacted,
-            });
-        }
-
         // Record the assistant's tool-call turn verbatim, then execute each call
         // and append exactly one tool result per id (well-formed history).
         conv.push(Message::assistant_tool_calls(
             &completion.content,
             completion.tool_calls.clone(),
         ));
+        let mut results = Vec::with_capacity(completion.tool_calls.len());
         for call in &completion.tool_calls {
             let result = executor.execute(call);
-            conv.push(Message::tool_result(&call.id, result));
+            conv.push(Message::tool_result(&call.id, result.clone()));
+            results.push(result);
         }
         rounds += 1;
 
@@ -170,17 +154,97 @@ pub fn run_turn(
         compacted.0 += b;
         compacted.1 += a;
 
-        // Step cap: stop before another model round.
-        if !guard.record_step() {
-            return Ok(TurnOutcome {
-                final_text: completion.content,
-                stop: AgentStop::MaxSteps,
-                rounds,
-                usage,
-                compacted,
-            });
+        // Progress-based guard (NOT a step cap): does this (action, result) round
+        // show forward motion, or is the model wandering / repeating? On first
+        // detection we soft-NUDGE (inject guidance, give it one more round to
+        // converge); if still stuck we STOP. A high round backstop is the only
+        // hard ceiling, for a pathological loop that keeps emitting novel calls.
+        match guard.record_round(&completion.tool_calls, &results) {
+            crate::tools::LoopVerdict::Continue => {}
+            crate::tools::LoopVerdict::Nudge(msg) => {
+                on_text(&format!("\n[guard: {msg}]\n"));
+                conv.push(Message::user(&msg));
+            }
+            crate::tools::LoopVerdict::Reset => {
+                // Stuck → discard the polluted history and RESTART from a clean
+                // context: the original task + a concrete, deterministically-built
+                // progress summary (files touched, last result). A fresh context
+                // doesn't carry the repetition attractor, so the model can finish.
+                // We build the summary from the transcript (no extra model call, no
+                // self-reflection — research: 35B self-critique is unreliable).
+                let summary = progress_summary(conv);
+                let task = first_user_task(conv);
+                on_text("\n[guard: resetting context — too much churn; restarting from a clean slate]\n");
+                conv.messages.clear();
+                conv.push(Message::user(&task));
+                conv.push(Message::user(&summary));
+                guard.reset_window();
+            }
+            crate::tools::LoopVerdict::Stop(why) => {
+                on_text(&format!("\n[guard: stopping — {why}]\n"));
+                return Ok(TurnOutcome {
+                    final_text: completion.content,
+                    stop: AgentStop::DoomLoop,
+                    rounds,
+                    usage,
+                    compacted,
+                });
+            }
         }
     }
+}
+
+/// The original task = the first user message in the conversation (what the turn
+/// is ultimately trying to accomplish). Falls back to a generic line if absent.
+fn first_user_task(conv: &Conversation) -> String {
+    conv.messages
+        .iter()
+        .find(|m| matches!(m.role, crate::message::Role::User))
+        .map(|m| m.content.clone())
+        .unwrap_or_else(|| "Continue the task.".to_string())
+}
+
+/// A concrete, deterministic progress summary for a context reset — built from the
+/// transcript, NOT model self-reflection (unreliable at 35B). Lists the distinct
+/// tools used and the files written/edited (so the fresh loop knows what already
+/// exists on disk), then tells the model to verify and finish rather than restart.
+fn progress_summary(conv: &Conversation) -> String {
+    use std::collections::BTreeSet;
+    let mut tools: BTreeSet<&str> = BTreeSet::new();
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    for m in &conv.messages {
+        for tc in &m.tool_calls {
+            tools.insert(tc.name.as_str());
+            if matches!(tc.name.as_str(), "write_file" | "edit_file") {
+                if let Ok(args) = crate::tools::parse_arguments(tc) {
+                    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                        files.insert(p.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut s =
+        String::from("Progress so far (your earlier exploration was discarded to save context): ");
+    if files.is_empty() {
+        s.push_str("no files written yet. ");
+    } else {
+        s.push_str(&format!(
+            "you have already created/edited these files on disk: {}. ",
+            files.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !tools.is_empty() {
+        s.push_str(&format!(
+            "Tools used: {}. ",
+            tools.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    s.push_str(
+        "Do NOT start over. Read the existing file(s) once if needed, verify the work meets \
+         the task, fix only what is actually broken, then give your final answer.",
+    );
+    s
 }
 
 #[cfg(test)]
@@ -406,9 +470,11 @@ mod tests {
     }
 
     #[test]
-    fn step_cap_stops_a_runaway() {
+    fn backstop_stops_a_novel_call_runaway() {
+        // A loop that emits a DISTINCT call + DISTINCT result every round shows no
+        // stuck signal, so only the catastrophe backstop can end it. (This is the
+        // pathological case; normal runaways are caught earlier by stuck detection.)
         let mut conv = Conversation::new();
-        // Always returns a (varying) call so it never naturally stops.
         let mut n = 0;
         let mut completer = |_: &Conversation, _: &[ToolDef]| {
             n += 1;
@@ -416,14 +482,18 @@ mod tests {
                 content: String::new(),
                 tool_calls: vec![ToolCall::new(
                     format!("c{n}"),
-                    "ls",
+                    format!("t{n}"),
                     format!("{{\"n\":{n}}}"),
                 )],
                 usage: None,
             })
         };
-        let mut exec = |_: &ToolCall| "ok".to_string();
-        let mut guard = LoopGuard::new(3);
+        let mut m = 0;
+        let mut exec = |_: &ToolCall| {
+            m += 1;
+            format!("distinct result {m}")
+        };
+        let mut guard = LoopGuard::new(4); // low backstop for the test
         let out = run_turn(
             &mut conv,
             &[],
@@ -433,14 +503,15 @@ mod tests {
             &mut |_| {},
         )
         .unwrap();
-        assert_eq!(out.stop, AgentStop::MaxSteps);
-        assert_eq!(out.rounds, 3);
+        assert_eq!(out.stop, AgentStop::DoomLoop); // backstop returns Stop
+        assert!(out.rounds <= 4);
     }
 
     #[test]
-    fn doom_loop_is_broken() {
+    fn repeated_identical_call_nudges_then_stops() {
+        // Identical call + identical result every round → nudge, then (still stuck
+        // the same way) stop. The model gets one chance to recover via the nudge.
         let mut conv = Conversation::new();
-        // Identical call every time → doom loop on the 3rd.
         let mut completer = |_: &Conversation, _: &[ToolDef]| Ok(call_completion("ls"));
         let mut exec = |_: &ToolCall| "same".to_string();
         let mut guard = LoopGuard::new(100);
@@ -454,14 +525,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.stop, AgentStop::DoomLoop);
-        // History still well-formed: last assistant has calls, each answered.
-        let last_tool = conv
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == Role::Tool)
-            .unwrap();
-        assert!(last_tool.content.contains("aborted"));
+        // The soft nudge was injected as a user message before the stop.
+        assert!(
+            conv.messages.iter().any(|m| m.role == Role::User
+                && m.content
+                    .contains("repeating tool calls without making progress")),
+            "expected a soft-nudge message in history"
+        );
+    }
+
+    #[test]
+    fn reset_policy_rebuilds_a_clean_context_then_finishes() {
+        // With Recovery::Reset: the model churns (writes the same file repeatedly),
+        // the guard signals Reset, run_turn discards history and restarts from
+        // [task + progress summary]; then a clean round answers. Verify the reset
+        // happened (history was rebuilt: task + summary present, churn gone) and the
+        // turn completed rather than hard-stopping.
+        use std::sync::Mutex;
+        let n = Mutex::new(0);
+        let mut completer = |_: &Conversation, _: &[ToolDef]| {
+            let mut k = n.lock().unwrap();
+            *k += 1;
+            // 4 churn rounds (same write) → trips name_limit → Reset; then answer.
+            Ok(if *k <= 4 {
+                Completion {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        format!("w{k}"),
+                        "write_file",
+                        format!("{{\"path\":\"game.py\",\"content\":\"v{k}\"}}"),
+                    )],
+                    usage: None,
+                }
+            } else {
+                text_completion("done — game.py works")
+            })
+        };
+        let mut exec = |_: &ToolCall| "{\"bytes_written\":100}".to_string();
+        let mut guard = LoopGuard::new(100).with_recovery(crate::tools::Recovery::Reset);
+        let mut conv = Conversation::new();
+        conv.push(Message::user("build game.py"));
+        let out = run_turn(
+            &mut conv,
+            &[],
+            &mut completer,
+            &mut exec,
+            &mut guard,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            out.stop,
+            AgentStop::Done,
+            "reset should let it finish, not stop"
+        );
+        // History was rebuilt: original task survived + a progress summary naming the
+        // file was injected, and the pre-reset churn is gone.
+        assert!(conv.messages.iter().any(|m| m.content == "build game.py"));
+        assert!(
+            conv.messages
+                .iter()
+                .any(|m| m.content.contains("game.py") && m.content.contains("Do NOT start over")),
+            "expected a concrete progress-summary message after reset"
+        );
     }
 
     #[test]

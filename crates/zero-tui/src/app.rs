@@ -868,7 +868,27 @@ impl<I: Input, W: Write> App<I, W> {
         let mode = self.mode;
         let root = std::env::current_dir().ok();
         let timeout = Duration::from_secs(120);
-        let mut guard = LoopGuard::new(25);
+        // Progress-based guard: stuck detection (not a step cap) ends runaways via a
+        // soft nudge then a same-way-twice stop. 50 is only the catastrophe backstop
+        // for a loop that keeps emitting novel calls — legitimately long tasks run free.
+        // ZERO_NUDGE overrides the nudge wording; ZERO_RECOVERY selects the
+        // stuck-recovery policy (stop|nudge|reset) — both for the ablation harnesses.
+        let mut guard = LoopGuard::new(50);
+        if let Ok(t) = std::env::var("ZERO_NUDGE") {
+            guard = guard.with_nudge(&t);
+        }
+        if let Ok(r) = std::env::var("ZERO_RECOVERY") {
+            use zero_core::tools::Recovery;
+            let pol = match r.as_str() {
+                "stop" => Some(Recovery::StopOnly),
+                "nudge" => Some(Recovery::Nudge),
+                "reset" => Some(Recovery::Reset),
+                _ => None,
+            };
+            if let Some(p) = pol {
+                guard = guard.with_recovery(p);
+            }
+        }
         let mut conv = std::mem::take(&mut self.conv);
 
         // A RefCell wrapper lets the three loop callbacks each write to the
@@ -968,7 +988,8 @@ impl<I: Input, W: Write> App<I, W> {
                         "\n\x1b[33m[stopped: tool step cap reached]\x1b[0m".to_string()
                     }
                     zero_core::agent::AgentStop::DoomLoop => {
-                        "\n\x1b[33m[stopped: model repeated the same tool call]\x1b[0m".to_string()
+                        "\n\x1b[33m[stopped: no progress — agent was repeating itself]\x1b[0m"
+                            .to_string()
                     }
                 };
                 self.write_text(&format!("{note}\n"))?;
@@ -3464,19 +3485,23 @@ mod tests {
     }
 
     #[test]
-    fn tool_turn_reports_step_cap() {
-        let mut a = loop_app(true); // varying args → never settles
+    fn tool_turn_stops_a_wandering_loop_on_no_progress() {
+        // Varying args but the same list_dir(".") result every round → no progress.
+        // The progress-based guard nudges then stops; the turn ends cleanly (it does
+        // NOT run to some step cap), with the no-progress note rendered.
+        let mut a = loop_app(true);
         a.run_tool_turn("loop forever").unwrap();
         let _ = a.backend.stream(&Conversation::new(), &mut |_| {});
-        assert!(rendered(&a).contains("step cap reached"));
+        assert!(rendered(&a).contains("no progress"));
     }
 
     #[test]
-    fn tool_turn_reports_doom_loop() {
-        let mut a = loop_app(false); // identical call → doom-loop guard trips
+    fn tool_turn_stops_an_identical_call_loop() {
+        // Identical call + identical result → caught and stopped after a nudge.
+        let mut a = loop_app(false);
         a.run_tool_turn("same thing").unwrap();
         let _ = a.backend.stream(&Conversation::new(), &mut |_| {});
-        assert!(rendered(&a).contains("repeated the same tool call"));
+        assert!(rendered(&a).contains("no progress"));
     }
 
     #[test]
