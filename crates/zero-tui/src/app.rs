@@ -291,7 +291,20 @@ pub struct App<I: Input, W: Write> {
     /// call built-in filesystem tools) instead of a plain streamed chat reply.
     /// Toggled by `/tools`.
     tools_enabled: bool,
+    /// Max bytes of any single tool result fed back into the context window.
+    max_tool_output: usize,
+    /// Max cumulative tool-result bytes fed back within one agentic turn.
+    max_turn_output: usize,
+    /// Files read this session, so an unchanged re-read returns a stub.
+    read_cache: zero_core::context::ReadCache,
 }
+
+/// Default per-result context cap (bytes) ≈ ~1K tokens.
+const DEFAULT_MAX_TOOL_OUTPUT: usize = 4096;
+/// Default cumulative per-turn tool-output budget (bytes) ≈ 6K tokens.
+const DEFAULT_MAX_TURN_OUTPUT: usize = 24_000;
+/// Minimum bytes any single result keeps even when the turn budget is spent.
+const TURN_OUTPUT_FLOOR: usize = 256;
 
 impl<I: Input, W: Write> App<I, W> {
     /// Build an app over an input source, an output sink, and a backend.
@@ -335,6 +348,9 @@ impl<I: Input, W: Write> App<I, W> {
             last_usage: None,
             pending: String::new(),
             tools_enabled: false,
+            max_tool_output: DEFAULT_MAX_TOOL_OUTPUT,
+            max_turn_output: DEFAULT_MAX_TURN_OUTPUT,
+            read_cache: zero_core::context::ReadCache::new(),
         }
     }
 
@@ -750,6 +766,10 @@ impl<I: Input, W: Write> App<I, W> {
         // A RefCell wrapper lets the three loop callbacks each write to the
         // output without three simultaneous &mut borrows of `self.out`. The inner
         // block scopes those borrows so `self` is free again after it returns.
+        let cap = self.max_tool_output;
+        let turn_budget = self.max_turn_output;
+        let spent = RefCell::new(0usize); // cumulative result bytes this turn
+        let read_cache = RefCell::new(std::mem::take(&mut self.read_cache));
         let res = {
             let out = RefCell::new(&mut self.out);
             let mut completer = |c: &Conversation, t: &[ToolDef]| backend.complete(c, t, timeout);
@@ -758,7 +778,39 @@ impl<I: Input, W: Write> App<I, W> {
                     &mut **out.borrow_mut(),
                     &format!("\x1b[2m  ⚙ {}({})\x1b[0m\n", call.name, call.arguments),
                 );
-                let result = gate_and_execute(mode, call, root.as_deref());
+                let path = call_path(call, root.as_deref());
+                // Read cache: a repeat read of an unchanged WHOLE file returns a
+                // stub (the content is already upstream). Ranged reads always run.
+                if call.name == "read_file" && !has_range(call) {
+                    if let Some(p) = &path {
+                        if let Some(stub) = read_cache.borrow().check(p) {
+                            let _ = write_raw(
+                                &mut **out.borrow_mut(),
+                                &format!("\x1b[2m  ↳ (cached) {stub}\x1b[0m\n"),
+                            );
+                            return stub;
+                        }
+                    }
+                }
+                let raw = gate_and_execute(mode, call, root.as_deref());
+                // Context cap: bound what goes back into the window. The effective
+                // cap also shrinks as the per-turn budget depletes (always keeping
+                // a floor), so a turn firing many calls can't blow the window by
+                // attrition. Nothing is lost — a re-fetch hint rides along.
+                let remaining = turn_budget.saturating_sub(*spent.borrow());
+                let eff_cap = cap.min(remaining.max(TURN_OUTPUT_FLOOR));
+                let result = cap_tool_result(call, raw, eff_cap);
+                *spent.borrow_mut() += result.len();
+                // Maintain the read cache: remember successful whole reads; forget
+                // a file after a write/edit so it re-reads in full next time.
+                if let Some(p) = &path {
+                    let ok = !result.starts_with("error:") && !result.starts_with("refused:");
+                    match call.name.as_str() {
+                        "read_file" if ok && !has_range(call) => read_cache.borrow_mut().record(p),
+                        "write_file" | "edit_file" if ok => read_cache.borrow_mut().invalidate(p),
+                        _ => {}
+                    }
+                }
                 let _ = write_raw(
                     &mut **out.borrow_mut(),
                     &format!("\x1b[2m  ↳ {}\x1b[0m\n", first_line(&result)),
@@ -778,6 +830,10 @@ impl<I: Input, W: Write> App<I, W> {
             )
         };
         self.conv = conv;
+        self.read_cache = read_cache.into_inner();
+        // Drop bulky content from applied write/edit calls — the file is on disk,
+        // so re-sending the payload to the model each turn just wastes the window.
+        compact_applied_writes(&mut self.conv);
 
         match res {
             Ok(outcome) => {
@@ -1892,6 +1948,61 @@ fn gate_and_execute(mode: Mode, call: &ToolCall, root: Option<&std::path::Path>)
     match builtins::execute(&call.name, &call.arguments, root) {
         Ok(out) => out,
         Err(e) => format!("error: {e}"),
+    }
+}
+
+/// Resolve the file a read/write/edit call targets (relative paths join `root`).
+fn call_path(call: &ToolCall, root: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let args = zero_core::tools::parse_arguments(call).ok()?;
+    let p = args.get("path")?.as_str()?;
+    let pb = std::path::Path::new(p);
+    Some(match root {
+        Some(r) if pb.is_relative() => r.join(pb),
+        _ => pb.to_path_buf(),
+    })
+}
+
+/// True if a `read_file` call requests a line range (offset/limit). Ranged reads
+/// bypass the read cache.
+fn has_range(call: &ToolCall) -> bool {
+    match zero_core::tools::parse_arguments(call) {
+        Ok(args) => args.get("offset").is_some() || args.get("limit").is_some(),
+        Err(_) => false,
+    }
+}
+
+/// Cap a tool result to `max` bytes with a tool-aware re-fetch hint.
+fn cap_tool_result(call: &ToolCall, result: String, max: usize) -> String {
+    if result.len() <= max {
+        return result;
+    }
+    let hint = match call.name.as_str() {
+        "read_file" => "re-read this file with a narrower line range",
+        "grep" => "narrow the search pattern or path",
+        "list_dir" => "list a more specific subdirectory",
+        _ => "request a smaller slice",
+    };
+    zero_core::context::cap_middle(&result, max, hint)
+}
+
+/// After a tool turn, drop bulky payloads of successfully-applied write/edit calls
+/// from history (the file is on disk). Failed/refused writes keep their args.
+fn compact_applied_writes(conv: &mut Conversation) {
+    let ok_ids: std::collections::HashSet<String> = conv
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .filter(|m| !m.content.starts_with("error:") && !m.content.starts_with("refused:"))
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
+    for m in &mut conv.messages {
+        for tc in &mut m.tool_calls {
+            if ok_ids.contains(&tc.id) {
+                if let Some(args) = zero_core::context::compact_call_args(&tc.name, &tc.arguments) {
+                    tc.arguments = args;
+                }
+            }
+        }
     }
 }
 

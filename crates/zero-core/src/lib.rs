@@ -18,6 +18,7 @@ pub mod brand;
 pub mod builtins;
 pub mod clock;
 pub mod config;
+pub mod context;
 pub mod discovery;
 pub mod http;
 pub mod json;
