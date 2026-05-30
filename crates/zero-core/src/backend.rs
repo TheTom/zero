@@ -280,4 +280,65 @@ mod tests {
         assert!(tokenize_keeping_spaces("").is_empty());
         assert_eq!(tokenize_keeping_spaces("a").concat(), "a");
     }
+
+    #[test]
+    fn default_complete_collects_stream_text() {
+        // The default Backend::complete() drives stream() and returns its text.
+        let mut conv = Conversation::new();
+        conv.push(Message::user("ping"));
+        let c = StubBackend::instant()
+            .complete(&conv, &[], std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(c.content.contains("ping"));
+        assert!(c.tool_calls.is_empty()); // plain text → no calls
+    }
+
+    #[test]
+    fn default_complete_recovers_a_text_embedded_tool_call() {
+        // A backend whose stream emits a <tool_call> block: the default
+        // complete() must recover it via the content-fallback parser.
+        struct TextToolBackend;
+        impl Backend for TextToolBackend {
+            fn name(&self) -> &str {
+                "textcall"
+            }
+            fn stream(
+                &self,
+                _conv: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), BackendError> {
+                sink(StreamEvent::Token(
+                    "<tool_call>{\"name\":\"ls\",\"arguments\":{}}</tool_call>".to_string(),
+                ));
+                sink(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+        }
+        let c = TextToolBackend
+            .complete(&Conversation::new(), &[], std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(c.tool_calls.len(), 1);
+        assert_eq!(c.tool_calls[0].name, "ls");
+    }
+
+    #[test]
+    fn default_complete_propagates_stream_error() {
+        struct FailBackend;
+        impl Backend for FailBackend {
+            fn name(&self) -> &str {
+                "fail"
+            }
+            fn stream(
+                &self,
+                _conv: &Conversation,
+                _sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), BackendError> {
+                Err(BackendError("down".to_string()))
+            }
+        }
+        let err = FailBackend
+            .complete(&Conversation::new(), &[], std::time::Duration::from_secs(1))
+            .unwrap_err();
+        assert_eq!(err.0, "down");
+    }
 }

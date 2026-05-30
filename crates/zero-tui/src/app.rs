@@ -23,10 +23,11 @@ use zero_core::clock::{format_duration, Stopwatch};
 use zero_core::config::Config;
 use zero_core::discovery::Discovered;
 use zero_core::mcp::{self, McpConfig};
-use zero_core::message::{Conversation, Message, Role};
+use zero_core::message::{Conversation, Message, Role, ToolCall};
 use zero_core::openai::OpenAiBackend;
 use zero_core::servers::ServerStore;
 use zero_core::session::SessionLog;
+use zero_core::tools::{LoopGuard, ToolDef};
 
 /// Prefix drawn before continuation rows of a multiline input (aligns under the
 /// prompt). Same display width as the prompt.
@@ -42,6 +43,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/mcp", "connect MCP servers ( /mcp tools to list )"),
     ("/connect", "attach to a discovered model"),
     ("/model", "switch model on the current endpoint"),
+    (
+        "/tools",
+        "toggle the agentic tool loop (read/list/grep/write/edit)",
+    ),
     ("/clip", "copy last response, or code block n"),
     ("/quit", "leave Zero"),
     ("/exit", "leave Zero"),
@@ -273,6 +278,10 @@ pub struct App<I: Input, W: Write> {
     /// pinned input box each frame; complete lines are committed to scrollback.
     /// Empty when not streaming.
     pending: String,
+    /// When true, a submitted message runs the agentic tool loop (the model can
+    /// call built-in filesystem tools) instead of a plain streamed chat reply.
+    /// Toggled by `/tools`.
+    tools_enabled: bool,
 }
 
 impl<I: Input, W: Write> App<I, W> {
@@ -314,6 +323,7 @@ impl<I: Input, W: Write> App<I, W> {
             ctx_window: None,
             last_usage: None,
             pending: String::new(),
+            tools_enabled: false,
         }
     }
 
@@ -665,6 +675,23 @@ impl<I: Input, W: Write> App<I, W> {
             self.do_clip(rest.trim())?;
             return Ok(Flow::Continue);
         }
+        if trimmed == "/tools" {
+            self.echo_committed(&text)?;
+            self.tools_enabled = !self.tools_enabled;
+            let state = if self.tools_enabled { "on" } else { "off" };
+            self.write_text(&format!(
+                "\x1b[2mtools {state} — the model can {}use read/list/grep/write/edit\x1b[0m\n",
+                if self.tools_enabled { "" } else { "no longer " }
+            ))?;
+            return Ok(Flow::Continue);
+        }
+
+        // With tools enabled, run the agentic loop (the model can call built-in
+        // tools) instead of a plain streamed reply.
+        if self.tools_enabled {
+            self.echo_committed(&text)?;
+            return self.run_tool_turn(&text).map(|()| Flow::Continue);
+        }
 
         // A normal message: start a streaming turn (on a background thread, so
         // the loop stays free to queue more input or interrupt).
@@ -676,6 +703,84 @@ impl<I: Input, W: Write> App<I, W> {
             }
         }
         Ok(Flow::Continue)
+    }
+
+    // --- agentic tool loop (/tools) --------------------------------------
+
+    /// Run one agentic turn: the model may call built-in tools, each gated by the
+    /// current mode, until it answers with plain text. Synchronous and blocking
+    /// (no mid-turn queue/interrupt yet) — the threaded version is a follow-up.
+    fn run_tool_turn(&mut self, prompt: &str) -> io::Result<()> {
+        use std::cell::RefCell;
+        self.conv.push(Message::user(prompt));
+        if let Some(log) = self.log.as_mut() {
+            let _ = log.record_message(Role::User, prompt);
+        }
+        self.write_text(&format!("\x1b[2m{}›\x1b[0m\n", zero_core::brand::slug()))?;
+
+        let tools = zero_core::builtins::definitions();
+        let backend = Arc::clone(&self.backend);
+        let mode = self.mode;
+        let root = std::env::current_dir().ok();
+        let timeout = Duration::from_secs(120);
+        let mut guard = LoopGuard::new(25);
+        let mut conv = std::mem::take(&mut self.conv);
+
+        // A RefCell wrapper lets the three loop callbacks each write to the
+        // output without three simultaneous &mut borrows of `self.out`. The inner
+        // block scopes those borrows so `self` is free again after it returns.
+        let res = {
+            let out = RefCell::new(&mut self.out);
+            let mut completer = |c: &Conversation, t: &[ToolDef]| backend.complete(c, t, timeout);
+            let mut executor = |call: &ToolCall| {
+                let _ = write_raw(
+                    &mut **out.borrow_mut(),
+                    &format!("\x1b[2m  ⚙ {}({})\x1b[0m\n", call.name, call.arguments),
+                );
+                let result = gate_and_execute(mode, call, root.as_deref());
+                let _ = write_raw(
+                    &mut **out.borrow_mut(),
+                    &format!("\x1b[2m  ↳ {}\x1b[0m\n", first_line(&result)),
+                );
+                result
+            };
+            let mut on_text = |t: &str| {
+                let _ = write_raw(&mut **out.borrow_mut(), t);
+            };
+            zero_core::agent::run_turn(
+                &mut conv,
+                &tools,
+                &mut completer,
+                &mut executor,
+                &mut guard,
+                &mut on_text,
+            )
+        };
+        self.conv = conv;
+
+        match res {
+            Ok(outcome) => {
+                let note = match outcome.stop {
+                    zero_core::agent::AgentStop::Done => String::new(),
+                    zero_core::agent::AgentStop::MaxSteps => {
+                        "\n\x1b[33m[stopped: tool step cap reached]\x1b[0m".to_string()
+                    }
+                    zero_core::agent::AgentStop::DoomLoop => {
+                        "\n\x1b[33m[stopped: model repeated the same tool call]\x1b[0m".to_string()
+                    }
+                };
+                self.write_text(&format!("{note}\n"))?;
+                self.last_reply = outcome.final_text.clone();
+                self.last_blocks = crate::markdown::code_blocks(&outcome.final_text);
+                if let Some(log) = self.log.as_mut() {
+                    let _ = log.record_message(Role::Assistant, &outcome.final_text);
+                }
+            }
+            Err(e) => {
+                self.write_text(&format!("\x1b[31m[{e}]\x1b[0m\n"))?;
+            }
+        }
+        self.redraw_input()
     }
 
     // --- streaming turns (threaded) --------------------------------------
@@ -1691,6 +1796,33 @@ fn copy_with(candidates: &[(&str, &[&str])], text: &str) -> io::Result<()> {
 }
 
 /// Translate `\n` → `\r\n` (raw mode needs the carriage return) and write.
+/// Gate a tool call by the current mode, then run it. Read-only tools always
+/// run; tools that modify files run only in auto-accept mode (otherwise refused
+/// with a message the model can act on — safe by default, no interactive
+/// confirm needed for this synchronous slice). Returns the result text fed back
+/// to the model (an error string is fine — it self-corrects).
+fn gate_and_execute(mode: Mode, call: &ToolCall, root: Option<&std::path::Path>) -> String {
+    use zero_core::builtins;
+    if !builtins::is_builtin(&call.name) {
+        return format!("error: unknown tool {}", call.name);
+    }
+    let mutating = matches!(call.name.as_str(), "write_file" | "edit_file");
+    if mutating && mode != Mode::AutoAccept {
+        return "refused: this tool modifies files — switch to auto-accept mode \
+                (Shift+Tab) to allow file changes"
+            .to_string();
+    }
+    match builtins::execute(&call.name, &call.arguments, root) {
+        Ok(out) => out,
+        Err(e) => format!("error: {e}"),
+    }
+}
+
+/// First line of a string, for a compact one-line tool-result preview.
+fn first_line(s: &str) -> &str {
+    s.split('\n').next().unwrap_or("")
+}
+
 fn write_raw<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
     if s.contains('\n') {
         w.write_all(s.replace('\n', "\r\n").as_bytes())
@@ -2014,6 +2146,49 @@ mod tests {
         type_str(&mut a, "/mcp tools");
         a.dispatch(Key::Enter).unwrap();
         assert!(rendered(&a).contains("echo"));
+
+        // Re-connecting reports the already-connected server (no second spawn).
+        type_str(&mut a, "/mcp");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("already connected"));
+        assert_eq!(a.mcp.len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mcp_connect_reports_a_failed_server() {
+        use zero_core::json::Value;
+        // A server whose command doesn't exist → connect() errors, reported ✗.
+        let cfg = Value::Object(vec![(
+            "mcpServers".to_string(),
+            Value::Object(vec![(
+                "broken".to_string(),
+                Value::Object(vec![(
+                    "command".to_string(),
+                    Value::Str("zero-no-such-bin-xyz".to_string()),
+                )]),
+            )]),
+        )]);
+        let path = std::env::temp_dir().join(format!("zero-mcp-bad-{}.json", std::process::id()));
+        std::fs::write(&path, cfg.to_json()).unwrap();
+        let mut a = app(b"");
+        a.set_mcp_path(Some(path.clone()));
+        type_str(&mut a, "/mcp");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("✗"));
+        assert!(a.mcp.is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mcp_connect_surfaces_malformed_config() {
+        let path = std::env::temp_dir().join(format!("zero-mcp-mal-{}.json", std::process::id()));
+        std::fs::write(&path, "{not json").unwrap();
+        let mut a = app(b"");
+        a.set_mcp_path(Some(path.clone()));
+        type_str(&mut a, "/mcp");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("mcp config:"));
         std::fs::remove_file(&path).ok();
     }
 
@@ -2112,6 +2287,343 @@ mod tests {
     }
 
     #[test]
+    fn tools_toggle_flips_state_and_is_listed() {
+        let mut a = app(b"");
+        assert!(!a.tools_enabled);
+        type_str(&mut a, "/tools");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(a.tools_enabled);
+        assert!(rendered(&a).contains("tools on"));
+        type_str(&mut a, "/tools");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(!a.tools_enabled);
+    }
+
+    #[test]
+    fn gate_blocks_mutating_tools_unless_auto_accept() {
+        let write = ToolCall::new("c", "write_file", r#"{"path":"x","content":"y"}"#);
+        let refused = gate_and_execute(Mode::Normal, &write, None);
+        assert!(refused.contains("refused"));
+        // unknown tool reported, not executed
+        let unknown = gate_and_execute(Mode::AutoAccept, &ToolCall::new("c", "nope", "{}"), None);
+        assert!(unknown.contains("unknown tool"));
+    }
+
+    #[test]
+    fn first_line_takes_only_the_first_line() {
+        assert_eq!(first_line("a\nb\nc"), "a");
+        assert_eq!(first_line("solo"), "solo");
+    }
+
+    #[test]
+    fn tool_turn_runs_a_round_then_answers() {
+        use std::sync::Mutex;
+        // A backend that calls grep once, then answers with text.
+        #[derive(Clone)]
+        struct ToolBackend {
+            step: Arc<Mutex<u32>>,
+        }
+        impl Backend for ToolBackend {
+            fn name(&self) -> &str {
+                "toolback"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                sink(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+            fn complete(
+                &self,
+                _c: &Conversation,
+                _t: &[ToolDef],
+                _to: Duration,
+            ) -> Result<zero_core::backend::Completion, zero_core::backend::BackendError>
+            {
+                let mut step = self.step.lock().unwrap();
+                *step += 1;
+                Ok(if *step == 1 {
+                    zero_core::backend::Completion {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall::new("c1", "list_dir", r#"{"path":"."}"#)],
+                    }
+                } else {
+                    zero_core::backend::Completion {
+                        content: "all done".to_string(),
+                        tool_calls: Vec::new(),
+                    }
+                })
+            }
+        }
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(ToolBackend {
+                step: Arc::new(Mutex::new(0)),
+            }),
+            None,
+        );
+        a.tools_enabled = true;
+        a.run_tool_turn("what's here?").unwrap();
+        let _ = a.backend.stream(&Conversation::new(), &mut |_| {});
+        let out = rendered(&a);
+        assert!(out.contains("⚙ list_dir")); // tool call shown
+        assert!(out.contains("all done")); // final answer rendered
+        assert_eq!(a.last_reply, "all done");
+        // History: user, assistant(call), tool result, assistant(final).
+        assert!(a
+            .conv
+            .messages
+            .iter()
+            .any(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("c1")));
+    }
+
+    #[test]
+    fn tool_turn_surfaces_a_backend_error() {
+        struct ErrBackend;
+        impl Backend for ErrBackend {
+            fn name(&self) -> &str {
+                "err"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                _s: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                Ok(())
+            }
+            fn complete(
+                &self,
+                _c: &Conversation,
+                _t: &[ToolDef],
+                _to: Duration,
+            ) -> Result<zero_core::backend::Completion, zero_core::backend::BackendError>
+            {
+                Err(zero_core::backend::BackendError("kaput".to_string()))
+            }
+        }
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(ErrBackend),
+            None,
+        );
+        a.tools_enabled = true;
+        a.run_tool_turn("hi").unwrap();
+        let _ = a.backend.stream(&Conversation::new(), &mut |_| {});
+        assert!(rendered(&a).contains("kaput"));
+    }
+
+    /// A backend that returns a tool call every turn — varying args (never
+    /// settles → step cap) or identical (→ doom loop).
+    struct LoopBackend {
+        vary: bool,
+        n: std::sync::Mutex<u32>,
+    }
+    impl Backend for LoopBackend {
+        fn name(&self) -> &str {
+            "loop"
+        }
+        fn stream(
+            &self,
+            _c: &Conversation,
+            sink: &mut dyn FnMut(StreamEvent),
+        ) -> Result<(), zero_core::backend::BackendError> {
+            sink(StreamEvent::Done(StopReason::EndTurn));
+            Ok(())
+        }
+        fn complete(
+            &self,
+            _c: &Conversation,
+            _t: &[ToolDef],
+            _to: Duration,
+        ) -> Result<zero_core::backend::Completion, zero_core::backend::BackendError> {
+            let mut n = self.n.lock().unwrap();
+            *n += 1;
+            let args = if self.vary {
+                format!(r#"{{"path":".{n}"}}"#)
+            } else {
+                r#"{"path":"."}"#.to_string()
+            };
+            Ok(zero_core::backend::Completion {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(format!("c{n}"), "list_dir", args)],
+            })
+        }
+    }
+
+    fn loop_app(vary: bool) -> App<ScriptedInput, Vec<u8>> {
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(LoopBackend {
+                vary,
+                n: std::sync::Mutex::new(0),
+            }),
+            None,
+        );
+        a.tools_enabled = true;
+        a
+    }
+
+    #[test]
+    fn tool_turn_reports_step_cap() {
+        let mut a = loop_app(true); // varying args → never settles
+        a.run_tool_turn("loop forever").unwrap();
+        let _ = a.backend.stream(&Conversation::new(), &mut |_| {});
+        assert!(rendered(&a).contains("step cap reached"));
+    }
+
+    #[test]
+    fn tool_turn_reports_doom_loop() {
+        let mut a = loop_app(false); // identical call → doom-loop guard trips
+        a.run_tool_turn("same thing").unwrap();
+        let _ = a.backend.stream(&Conversation::new(), &mut |_| {});
+        assert!(rendered(&a).contains("repeated the same tool call"));
+    }
+
+    #[test]
+    fn tool_turn_auto_accept_allows_a_write_and_logs() {
+        // write_file (round 1) then answer (round 2); a session log captures both.
+        struct WriteBackend {
+            path: String,
+            n: std::sync::Mutex<u32>,
+        }
+        impl Backend for WriteBackend {
+            fn name(&self) -> &str {
+                "wb"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                sink(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+            fn complete(
+                &self,
+                _c: &Conversation,
+                _t: &[ToolDef],
+                _to: Duration,
+            ) -> Result<zero_core::backend::Completion, zero_core::backend::BackendError>
+            {
+                let mut n = self.n.lock().unwrap();
+                *n += 1;
+                Ok(if *n == 1 {
+                    zero_core::backend::Completion {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall::new(
+                            "w1",
+                            "write_file",
+                            format!(r#"{{"path":"{}","content":"hi"}}"#, self.path),
+                        )],
+                    }
+                } else {
+                    zero_core::backend::Completion {
+                        content: "saved it".to_string(),
+                        tool_calls: Vec::new(),
+                    }
+                })
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("zero-tw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("note.txt");
+        // A real session log so the assistant-record branch is exercised.
+        let (log, _p) = SessionLog::create_in(&dir).unwrap();
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(WriteBackend {
+                path: target.display().to_string(),
+                n: std::sync::Mutex::new(0),
+            }),
+            Some(log),
+        );
+        a.tools_enabled = true;
+        a.mode = Mode::AutoAccept; // write tools allowed only here
+        a.run_tool_turn("write a note").unwrap();
+        let _ = a.backend.stream(&Conversation::new(), &mut |_| {});
+        assert!(rendered(&a).contains("⚙ write_file"));
+        assert_eq!(a.last_reply, "saved it");
+        // The auto-accept gate let the write through to execution — the tool
+        // result is NOT the mode-refusal message (it executed, even if the
+        // absolute path was then rejected by the workspace confinement).
+        assert!(a
+            .conv
+            .messages
+            .iter()
+            .any(|m| m.role == Role::Tool && !m.content.contains("switch to auto-accept")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tool_turn_normal_mode_refuses_a_write() {
+        // edit_file (round 1) refused in normal mode; model then answers.
+        struct TryWriteBackend {
+            n: std::sync::Mutex<u32>,
+        }
+        impl Backend for TryWriteBackend {
+            fn name(&self) -> &str {
+                "tw"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                sink(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+            fn complete(
+                &self,
+                _c: &Conversation,
+                _t: &[ToolDef],
+                _to: Duration,
+            ) -> Result<zero_core::backend::Completion, zero_core::backend::BackendError>
+            {
+                let mut n = self.n.lock().unwrap();
+                *n += 1;
+                Ok(if *n == 1 {
+                    zero_core::backend::Completion {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall::new(
+                            "w1",
+                            "edit_file",
+                            r#"{"path":"x","old_string":"a","new_string":"b"}"#,
+                        )],
+                    }
+                } else {
+                    zero_core::backend::Completion {
+                        content: "ok, I won't".to_string(),
+                        tool_calls: Vec::new(),
+                    }
+                })
+            }
+        }
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(TryWriteBackend {
+                n: std::sync::Mutex::new(0),
+            }),
+            None,
+        );
+        a.tools_enabled = true; // mode stays Normal
+        a.run_tool_turn("edit it").unwrap();
+        let _ = a.backend.stream(&Conversation::new(), &mut |_| {});
+        // The refusal is fed back as the tool result.
+        assert!(a
+            .conv
+            .messages
+            .iter()
+            .any(|m| m.role == Role::Tool && m.content.contains("refused")));
+    }
+
+    #[test]
     fn auto_accept_runs_a_dangerous_command_without_confirm() {
         let mut a = app(b"");
         a.mode = Mode::AutoAccept;
@@ -2151,6 +2663,41 @@ mod tests {
         a.dispatch(Key::Up).unwrap(); // persist + move to "first"
         assert_eq!(a.queue[1], "second!");
         assert_eq!(a.editor.text(), "first");
+        a.dispatch(Key::Down).unwrap(); // back to "second!"
+        assert_eq!(a.editor.text(), "second!");
+    }
+
+    #[test]
+    fn queue_edit_supports_line_editing_keys() {
+        // Every editing key in handle_queue_edit_key runs without leaving the mode.
+        let mut a = app(b"");
+        a.queue.push_back("hello world".to_string());
+        a.dispatch(Key::Ctrl('q')).unwrap(); // edit "hello world"
+        for k in [
+            Key::Home,
+            Key::End,
+            Key::Left,
+            Key::Right,
+            Key::WordLeft,
+            Key::WordRight,
+            Key::Ctrl('b'),
+            Key::Ctrl('f'),
+            Key::Ctrl('a'),
+            Key::Ctrl('e'),
+            Key::Backspace,
+            Key::Delete,
+            Key::Ctrl('w'),
+            Key::Ctrl('u'),
+            Key::Ctrl('k'),
+            Key::ShiftEnter,
+            Key::Char('z'),
+            Key::Tab, // unmapped in this submode → no-op arm
+        ] {
+            a.dispatch(k).unwrap();
+        }
+        assert!(a.queue_edit.is_some()); // still editing
+        a.dispatch(Key::Esc).unwrap(); // exit
+        assert!(a.queue_edit.is_none());
     }
 
     #[test]

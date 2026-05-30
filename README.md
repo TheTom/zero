@@ -181,6 +181,24 @@ bottom, so the prompt is live the whole time:
   out an approach for review before acting (the live conversation isn't mutated;
   it's added to the request only).
 
+### Agentic tools
+
+`/tools` toggles the agentic tool loop. With it on, a submitted message runs a
+non-streaming loop: the model can call built-in tools — `read_file`, `list_dir`,
+`grep`, `write_file`, `edit_file` — and Zero feeds each result back until the
+model answers in plain text. Tool calls and results show inline (`⚙ name(args)`
+/ `↳ result`).
+
+Gating follows the mode (Shift+Tab): read-only tools always run; **file-modifying
+tools (`write_file`/`edit_file`) run only in auto-accept mode** — in normal mode
+they're refused with a message the model can act on. Paths are confined to the
+working directory. The loop is bounded (step cap + doom-loop guard) so a local
+model can't run away.
+
+> Non-streaming on purpose: local servers' *streaming* tool-call parsers are
+> buggy (calls split/lost across chunks), so the loop reads each turn whole. Zero
+> also recovers tool calls a quantized model emits as `<tool_call>`/```json text.
+
 ### MCP servers
 
 Zero speaks the [Model Context Protocol](https://modelcontextprotocol.io) over

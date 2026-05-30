@@ -636,6 +636,7 @@ mod tests {
             }
             let body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n\
                         data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n\
+                        data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n\
                         data: [DONE]\n\n";
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
@@ -657,13 +658,15 @@ mod tests {
 
         let mut text = String::new();
         let mut stop = None;
+        let mut usage = None;
         backend
             .stream(&conv, &mut |ev| match ev {
                 StreamEvent::Token(t) => text.push_str(&t),
-                StreamEvent::Usage(_) => {}
+                StreamEvent::Usage(u) => usage = Some(u),
                 StreamEvent::Done(r) => stop = Some(r),
             })
             .unwrap();
+        assert_eq!(usage.map(|u| u.total()), Some(7)); // usage SSE chunk parsed
         assert_eq!(text, "Hello world");
         assert_eq!(stop, Some(StopReason::EndTurn));
     }

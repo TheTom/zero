@@ -361,6 +361,23 @@ mod tests {
     }
 
     #[test]
+    fn session_skips_non_json_and_mismatched_id_lines() {
+        // A log banner, a blank line, and a notification (no/other id) all
+        // precede the real response — the request loop must skip them all.
+        let out = concat!(
+            "Listening on stdio…\n",
+            "\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"stale\":true}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n",
+        );
+        let mut written = Vec::new();
+        let mut s = Session::new(Cursor::new(out.as_bytes().to_vec()), &mut written);
+        let res = s.request("ping", Value::Object(vec![])).unwrap();
+        assert_eq!(res.get("ok").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
     fn session_surfaces_a_jsonrpc_error() {
         let out = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"message\":\"nope\"}}\n";
         let mut written = Vec::new();
