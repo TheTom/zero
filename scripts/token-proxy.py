@@ -110,6 +110,15 @@ class Proxy(BaseHTTPRequestHandler):
         except Exception:
             _log_usage(_extract_streaming_usage(body))
 
+        # Dump the matching response body next to the request (resp-NNN) so the
+        # full round-trip can be audited offline.
+        if DUMP_DIR and self.path.endswith("/chat/completions"):
+            try:
+                with open(os.path.join(DUMP_DIR, f"resp-{_dump_n[0]:03d}.json"), "wb") as f:
+                    f.write(body)
+            except Exception:
+                pass
+
         self.send_response(status)
         for k, v in headers:
             if k.lower() in ("transfer-encoding", "connection", "content-length"):
