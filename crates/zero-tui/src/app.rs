@@ -2812,6 +2812,65 @@ mod tests {
     }
 
     #[test]
+    fn shape_cmd_maps_tool_to_detection_hint() {
+        assert_eq!(shape_cmd(&ToolCall::new("c", "grep", "{}")), "grep");
+        assert_eq!(shape_cmd(&ToolCall::new("c", "list_dir", "{}")), "ls");
+        assert_eq!(shape_cmd(&ToolCall::new("c", "read_file", "{}")), ""); // sniff decides
+                                                                           // bash uses the real command so a log/grep shape can be detected.
+        assert_eq!(
+            shape_cmd(&ToolCall::new("c", "bash", r#"{"command":"cargo test"}"#)),
+            "cargo test"
+        );
+        // bash with unparseable args → empty (falls back to content sniff).
+        assert_eq!(shape_cmd(&ToolCall::new("c", "bash", "not json")), "");
+    }
+
+    #[test]
+    fn sanitize_id_keeps_filename_safe_chars() {
+        assert_eq!(sanitize_id("call-7f_2"), "call-7f_2");
+        assert_eq!(sanitize_id("a/b c:d"), "abcd"); // strips path/space/colon
+        assert_eq!(sanitize_id(""), "x"); // never empty
+        assert_eq!(sanitize_id("///"), "x");
+    }
+
+    #[test]
+    fn cap_tool_result_spills_full_output_and_is_recoverable() {
+        // The reassessment in action: capping OFFLOADS, never silently deletes.
+        // With an artifact dir, the full output is written byte-identical and the
+        // compressed view points back at it.
+        let dir = std::env::temp_dir().join(format!("zero-art-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = "y".repeat(20_000);
+        let out = cap_tool_result(
+            &ToolCall::new("call-7f", "read_file", "{}"),
+            big.clone(),
+            4096,
+            Some(dir.as_path()),
+        );
+        assert!(out.len() < big.len());
+        assert!(out.contains("elided"));
+        assert!(out.contains("full output:"));
+        // Byte-identical artifact at the call-id-named path.
+        let art = dir.join("out-call-7f.txt");
+        assert_eq!(std::fs::read_to_string(&art).unwrap(), big);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cap_tool_result_without_artifact_dir_still_compresses() {
+        // No session dir (tests / --no-log): compression still runs, just no
+        // re-fetch path in the marker.
+        let out = cap_tool_result(
+            &ToolCall::new("c", "read_file", "{}"),
+            "y".repeat(20_000),
+            4096,
+            None,
+        );
+        assert!(out.contains("elided"));
+        assert!(!out.contains("full output:"));
+    }
+
+    #[test]
     fn first_line_takes_only_the_first_line() {
         assert_eq!(first_line("a\nb\nc"), "a");
         assert_eq!(first_line("solo"), "solo");
