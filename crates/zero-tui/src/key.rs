@@ -13,6 +13,8 @@ pub enum Key {
     Char(char),
     Enter,
     Tab,
+    /// Shift+Tab — used to cycle input modes.
+    BackTab,
     Backspace,
     Delete,
     Esc,
@@ -148,6 +150,7 @@ fn decode_csi(buf: &[u8]) -> Step {
         b'D' => Key::Left,
         b'H' => Key::Home,
         b'F' => Key::End,
+        b'Z' => Key::BackTab, // Shift+Tab (legacy CSI Z)
         b'u' => {
             // CSI-u (kitty keyboard protocol): param0 = codepoint, param1 = mods
             // (1 + bitmask where shift=1, alt=2, ctrl=4). With the protocol on,
@@ -172,7 +175,14 @@ fn decode_csi(buf: &[u8]) -> Step {
                     total,
                 ),
                 27 => Step::Key(Key::Esc, total),
-                9 => Step::Key(Key::Tab, total),
+                9 => Step::Key(
+                    if modifier >= 2 {
+                        Key::BackTab // Shift+Tab
+                    } else {
+                        Key::Tab
+                    },
+                    total,
+                ),
                 127 | 8 => Step::Key(Key::Backspace, total),
                 // Plain printable reported as CSI-u by some terminals.
                 cp if (0x20..0x7f).contains(&cp) && modifier <= 1 => char::from_u32(cp)
@@ -440,6 +450,13 @@ mod tests {
         let (k, consumed) = decode_keys(b"\x1b[99;2u");
         assert!(k.is_empty());
         assert_eq!(consumed, 7);
+    }
+
+    #[test]
+    fn shift_tab_decodes_as_backtab() {
+        assert_eq!(keys(b"\x1b[Z"), vec![Key::BackTab]); // legacy CSI Z
+        assert_eq!(keys(b"\x1b[9;2u"), vec![Key::BackTab]); // CSI-u Shift+Tab
+        assert_eq!(keys(b"\x1b[9u"), vec![Key::Tab]); // plain Tab via CSI-u
     }
 
     #[test]

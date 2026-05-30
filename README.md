@@ -165,9 +165,21 @@ bottom, so the prompt is live the whole time:
 | `↑` / `↓` | move between input lines, else recall history |
 | `^R` | reverse history search (type to match, `^R` for older, `Enter` accept, `Esc` cancel) |
 | `^Q` | edit queued messages before they send (↑↓ move, `Enter`/`Esc` done) |
+| `⇧⇥` (Shift+Tab) | cycle input mode (normal → auto-accept → plan) |
 | `Esc Esc` | clear the line |
 | `^C` | clear the line; on an empty line, `^C` again to exit |
 | `^D` | exit on an empty line |
+
+### Modes
+
+`Shift+Tab` cycles the input mode (shown in the status footer, Claude-Code style):
+
+- **normal** — default; dangerous shell commands ask before running.
+- **auto-accept** — run flagged shell commands without the `y/N` prompt (it will
+  also auto-approve the agentic tool loop once that lands).
+- **plan** — injects a planning directive into each request so the model lays
+  out an approach for review before acting (the live conversation isn't mutated;
+  it's added to the request only).
 
 ### Shell mode & the safety guard
 

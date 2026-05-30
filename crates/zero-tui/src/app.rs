@@ -165,6 +165,54 @@ struct StreamState {
     usage: Option<Usage>,
 }
 
+/// Input mode, cycled with Shift+Tab (like Claude Code / opencode / pi). The set
+/// is deliberately small; the agentic tool loop will extend what each one gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Mode {
+    /// Default: dangerous shell commands ask before running.
+    #[default]
+    Normal,
+    /// Auto-accept: run dangerous shell commands without the y/N prompt (and,
+    /// once the tool loop lands, auto-approve its actions).
+    AutoAccept,
+    /// Plan: ask the model to think through an approach before acting; injects a
+    /// planning directive into each request.
+    Plan,
+}
+
+impl Mode {
+    /// Next mode in the Shift+Tab cycle.
+    fn next(self) -> Mode {
+        match self {
+            Mode::Normal => Mode::AutoAccept,
+            Mode::AutoAccept => Mode::Plan,
+            Mode::Plan => Mode::Normal,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Normal => "normal",
+            Mode::AutoAccept => "auto-accept",
+            Mode::Plan => "plan",
+        }
+    }
+
+    /// ANSI color for the footer chip (dim normal, yellow auto, cyan plan).
+    fn color(self) -> &'static str {
+        match self {
+            Mode::Normal => "\x1b[2m",
+            Mode::AutoAccept => "\x1b[33m",
+            Mode::Plan => "\x1b[36m",
+        }
+    }
+}
+
+/// Planning directive injected (as a system message) into requests in plan mode.
+const PLAN_DIRECTIVE: &str = "You are in PLAN MODE. Do not write final code or \
+take actions yet. Think through the approach and present a concise, reviewable \
+plan first; wait for the go-ahead before implementing.";
+
 /// The running terminal application.
 pub struct App<I: Input, W: Write> {
     input: I,
@@ -185,6 +233,8 @@ pub struct App<I: Input, W: Write> {
     search: Option<Search>,
     /// `Some` while in `^Q` queue-edit mode (sending is paused).
     queue_edit: Option<QueueEdit>,
+    /// Current input mode (Shift+Tab cycles it).
+    mode: Mode,
     /// A dangerous shell command awaiting `y/N` confirmation.
     pending_shell: Option<String>,
     /// Human-readable backend/config summary, shown by `/config`.
@@ -240,6 +290,7 @@ impl<I: Input, W: Write> App<I, W> {
             esc_pending: false,
             search: None,
             queue_edit: None,
+            mode: Mode::default(),
             pending_shell: None,
             info: String::new(),
             config: Config::default(),
@@ -442,6 +493,7 @@ impl<I: Input, W: Write> App<I, W> {
             Key::Tab => {
                 self.try_complete_slash();
             }
+            Key::BackTab => self.mode = self.mode.next(), // Shift+Tab cycles modes
             // Scrollback is the terminal's own (native); we don't intercept it.
             Key::PageUp | Key::PageDown => {}
             Key::Ctrl(_) => {} // unmapped; ignore
@@ -532,6 +584,14 @@ impl<I: Input, W: Write> App<I, W> {
             let verdict = zero_core::safety::classify(&cmd);
             if verdict.is_dangerous() {
                 let reason = verdict.reason.unwrap_or("destructive command");
+                if self.mode == Mode::AutoAccept {
+                    // Auto-accept mode: skip the y/N gate, but still flag it.
+                    self.write_text(&format!(
+                        "\x1b[33m⚠ {reason}\x1b[0m \x1b[2m(auto-accepted)\x1b[0m\n"
+                    ))?;
+                    self.run_shell(&cmd)?;
+                    return Ok(Flow::Continue);
+                }
                 self.write_text(&format!(
                     "\x1b[33m⚠ {reason}\x1b[0m — run anyway? \x1b[2m[y/N]\x1b[0m "
                 ))?;
@@ -615,7 +675,13 @@ impl<I: Input, W: Write> App<I, W> {
 
         let (tx, rx) = mpsc::channel();
         let backend = Arc::clone(&self.backend);
-        let conv = self.conv.clone();
+        // Plan mode: prepend a planning directive (system) to *this request only*
+        // — self.conv is untouched, so it doesn't persist across turns/modes.
+        let mut conv = self.conv.clone();
+        if self.mode == Mode::Plan {
+            conv.messages
+                .insert(0, Message::new(Role::System, PLAN_DIRECTIVE.to_string()));
+        }
         let run = move || {
             // Catch panics so a misbehaving backend can't take down the whole
             // process; surface errors/panics as a visible token + Done so the
@@ -769,6 +835,7 @@ impl<I: Input, W: Write> App<I, W> {
                     // on the next repaint.
                 }
             }
+            Key::BackTab => self.mode = self.mode.next(), // cycle modes mid-stream
             Key::Backspace => self.editor.backspace(),
             Key::Char(c) => self.editor.insert(c),
             _ => {} // other editing keys: no live echo while streaming
@@ -1198,7 +1265,14 @@ impl<I: Input, W: Write> App<I, W> {
                 self.queue.len()
             );
         }
-        let mut footer = self.status_line();
+        // Mode chip first (its own color), then the dim status line. The footer
+        // is rendered inside a dim wrapper, so reset back to dim after the chip.
+        let mut footer = format!(
+            "{}{}\x1b[0m\x1b[2m  ·  {}",
+            self.mode.color(),
+            self.mode.label(),
+            self.status_line()
+        );
         if let Some(s) = &self.streaming {
             footer.push_str(&format!(
                 "  ·  {} · esc to interrupt",
@@ -1209,6 +1283,8 @@ impl<I: Input, W: Write> App<I, W> {
         if !self.queue.is_empty() {
             footer.push_str("  ·  ^Q edit queue");
         }
+        // Hint how to change mode (Shift+Tab), like Claude Code.
+        footer.push_str("  ·  ⇧⇥ mode");
         footer
     }
 
@@ -1437,6 +1513,12 @@ impl<I: Input, W: Write> App<I, W> {
             ('K', "⏎", "submit"),
             ('K', "↑  ↓", "move between input lines, else recall history"),
             ('K', "^R", "reverse history search"),
+            ('H', "Modes", ""),
+            (
+                'K',
+                "⇧⇥",
+                "cycle mode: normal · auto-accept (run risky shell) · plan",
+            ),
             ('H', "While a reply is generating", ""),
             (
                 'K',
@@ -1775,6 +1857,82 @@ mod tests {
         let big = "x".repeat(5000);
         let p = queue_preview(&big, 60);
         assert_eq!(p.chars().count(), 61); // 60 + the ellipsis
+    }
+
+    #[test]
+    fn shift_tab_cycles_modes() {
+        let mut a = app(b"");
+        assert_eq!(a.mode, Mode::Normal);
+        a.dispatch(Key::BackTab).unwrap();
+        assert_eq!(a.mode, Mode::AutoAccept);
+        a.dispatch(Key::BackTab).unwrap();
+        assert_eq!(a.mode, Mode::Plan);
+        a.dispatch(Key::BackTab).unwrap();
+        assert_eq!(a.mode, Mode::Normal); // wraps
+    }
+
+    #[test]
+    fn footer_shows_mode_and_change_hint() {
+        let mut a = app(b"");
+        a.mode = Mode::Plan;
+        let f = a.footer_text();
+        assert!(f.contains("plan"));
+        assert!(f.contains("mode")); // ⇧⇥ mode hint
+    }
+
+    #[test]
+    fn plan_mode_injects_directive_for_the_request_only() {
+        use std::sync::Mutex;
+        #[derive(Clone)]
+        struct Rec {
+            seen: Arc<Mutex<Vec<Message>>>,
+        }
+        impl Backend for Rec {
+            fn name(&self) -> &str {
+                "rec"
+            }
+            fn stream(
+                &self,
+                conv: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                *self.seen.lock().unwrap() = conv.messages.clone();
+                sink(StreamEvent::Token("ok".into()));
+                sink(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(Rec { seen: seen.clone() }),
+            None,
+        );
+        a.synchronous = true;
+        a.mode = Mode::Plan;
+        a.start_turn("do the thing").unwrap();
+        while a.streaming.is_some() {
+            a.pump_stream().unwrap();
+        }
+        let msgs = seen.lock().unwrap();
+        assert!(msgs
+            .iter()
+            .any(|m| m.role == Role::System && m.content.contains("PLAN MODE")));
+        assert!(msgs.iter().any(|m| m.content == "do the thing"));
+        // Not persisted: the live conversation has no injected system message.
+        assert!(a.conv.messages.iter().all(|m| m.role != Role::System));
+    }
+
+    #[test]
+    fn auto_accept_runs_a_dangerous_command_without_confirm() {
+        let mut a = app(b"");
+        a.mode = Mode::AutoAccept;
+        // `chmod -r` is flagged dangerous; a nonexistent path makes it harmless.
+        type_str(&mut a, "!chmod -R 755 /tmp/zero-does-not-exist-zzz");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(a.pending_shell.is_none()); // no y/N gate
+        assert!(rendered(&a).contains("auto-accepted"));
     }
 
     #[test]
