@@ -95,6 +95,7 @@ fn run(args: &Args) -> std::io::Result<()> {
         app.set_config(cfg.clone(), Some(cfg_path.clone()), servers_path());
         app.set_artifact_dir(outputs_dir());
         app.set_tools_enabled(args.tools);
+        app.set_auto_accept(args.accept_edits);
         let reply = app.run_once(prompt.trim())?;
         // Real, server-reported token usage for the turn (summed across agentic
         // rounds) — to stderr so stdout stays just the reply. Machine-greppable
@@ -186,6 +187,9 @@ struct Args {
     print: Option<String>,
     /// Enable the agentic tool loop in a headless run (`--tools`).
     tools: bool,
+    /// Auto-accept write/edit in a headless run (`--accept-edits`). Without it a
+    /// headless `--tools` run is stuck in Normal mode, which refuses every write.
+    accept_edits: bool,
 }
 
 impl Args {
@@ -202,6 +206,7 @@ impl Args {
                 "--no-log" => out.no_log = true,
                 "--stub" => out.stub = true,
                 "--tools" => out.tools = true,
+                "--accept-edits" => out.accept_edits = true,
                 "-p" | "--print" => out.print = Some(take("-p")?),
                 "--url" => out.url = Some(take("--url")?),
                 "--model" => out.model = Some(take("--model")?),
@@ -238,6 +243,7 @@ fn print_usage() {
          \x20 --config <path>  use a specific config file\n\
          \x20 -p, --print <s>  headless: run one prompt, print the reply, exit ('-' = stdin)\n\
          \x20 --tools          enable the agentic tool loop in a headless run\n\
+         \x20 --accept-edits   auto-accept write/edit in a headless --tools run\n\
          \x20 --stub           force the built-in stub backend\n\
          \x20 --instant        stub streams with no pacing delay\n\
          \x20 --no-log         do not write a session transcript\n\
@@ -269,6 +275,13 @@ mod tests {
         let b = Args::parse(["--print", "-"].map(String::from)).unwrap();
         assert_eq!(b.print.as_deref(), Some("-"));
         assert!(!b.tools);
+        assert!(!b.accept_edits);
+    }
+
+    #[test]
+    fn parses_accept_edits() {
+        let a = Args::parse(["-p", "go", "--tools", "--accept-edits"].map(String::from)).unwrap();
+        assert!(a.tools && a.accept_edits);
     }
 
     #[test]
