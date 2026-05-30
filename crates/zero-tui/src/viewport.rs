@@ -72,7 +72,11 @@ impl Scrollback {
         }
         let mut parts = text.split('\n');
         if let Some(first) = parts.next() {
-            self.lines.last_mut().unwrap().push_str(first);
+            // `lines` is non-empty: either it already was, or we just pushed above.
+            self.lines
+                .last_mut()
+                .expect("lines is non-empty here")
+                .push_str(first);
         }
         for part in parts {
             self.lines.push(part.to_string());
