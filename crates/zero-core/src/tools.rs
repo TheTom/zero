@@ -203,23 +203,22 @@ pub enum LoopVerdict {
 }
 
 /// How much context a reset preserves when rebuilding the conversation. Drives the
-/// reset-summary ablation. Research (docs §0j) says the THIN style fails because it
-/// drops the two high-value fields — what FAILED and the recent raw tail — that a
-/// fresh model needs to avoid re-wandering.
+/// reset-summary ablation. RETEST VERDICT (docs §0j): a richer summary did NOT
+/// rescue reset — all styles cost ~2.5× nudge's tokens (each restart re-reads +
+/// re-derives) for a noisy completion bump. Reset is opt-in only; Nudge is the
+/// default. Kept because the reset arms do score slightly HIGHER quality, so
+/// reset-thin is a cheap quality-lifter if a task ever values quality over tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetStyle {
     /// Original tested arm: task + a structural note (files touched, tools used).
-    /// Carries the cheap-to-reconstruct fields, drops the expensive ones. The 0i
-    /// loser.
+    /// The 0i loser. In 0j: 16% completed, 53k tok, q43.5.
     Thin,
-    /// Deterministic-but-rich: task + files/state + VERBATIM-QUOTED failed results
-    /// (negative constraints) + the last few raw turns as a tail. No model call, no
-    /// faithfulness risk — quoting can't hallucinate. The research's recommended
-    /// build.
+    /// Deterministic + VERBATIM-QUOTED failed results (negative constraints) + last
+    /// few raw turns. Research's pick — but in 0j it was 0% completed, 58k tok,
+    /// q41.8: the better summary did NOT make it converge on this model/task.
     Rich,
-    /// Like Rich, but the model also fills bounded "what failed / next action"
-    /// fields (the caller makes the extra call). Closer to the research ideal but
-    /// costs a round-trip and risks weak-model faithfulness.
+    /// Rich + one model-filled "next action" line (extra call). 0j: best completion
+    /// (33%) but 62k tok / q43.3 — not worth 2.7× nudge's tokens.
     Hybrid,
 }
 
