@@ -871,25 +871,10 @@ impl<I: Input, W: Write> App<I, W> {
         // Progress-based guard: stuck detection (not a step cap) ends runaways via a
         // soft nudge then a same-way-twice stop. 50 is only the catastrophe backstop
         // for a loop that keeps emitting novel calls — legitimately long tasks run free.
-        // ZERO_NUDGE overrides the nudge wording; ZERO_RECOVERY selects the
-        // stuck-recovery policy (stop|nudge|reset) — both for the ablation harnesses.
+        // ZERO_NUDGE overrides the nudge wording (used by the ablation harness).
         let mut guard = LoopGuard::new(50);
         if let Ok(t) = std::env::var("ZERO_NUDGE") {
             guard = guard.with_nudge(&t);
-        }
-        if let Ok(r) = std::env::var("ZERO_RECOVERY") {
-            use zero_core::tools::{Recovery, ResetStyle};
-            let pol = match r.as_str() {
-                "stop" => Some(Recovery::StopOnly),
-                "nudge" => Some(Recovery::Nudge),
-                "reset" | "reset-rich" => Some(Recovery::Reset(ResetStyle::Rich)),
-                "reset-thin" => Some(Recovery::Reset(ResetStyle::Thin)),
-                "reset-hybrid" => Some(Recovery::Reset(ResetStyle::Hybrid)),
-                _ => None,
-            };
-            if let Some(p) = pol {
-                guard = guard.with_recovery(p);
-            }
         }
         let mut conv = std::mem::take(&mut self.conv);
 

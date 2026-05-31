@@ -187,6 +187,12 @@ pub fn parse_arguments(call: &ToolCall) -> Result<Value, String> {
 }
 
 /// What the loop guard advises after a round.
+///
+/// On stuck-detection: one soft [`LoopVerdict::Nudge`], then [`LoopVerdict::Stop`]
+/// if it doesn't recover. (A context-RESET recovery policy was built + ablated
+/// across three summary styles and dropped — it cost ~2.5× the tokens for no
+/// reliable completion gain; nudge→stop is the proven-cheapest behavior. The lever
+/// for wander is prevention, not mid-loop recovery. See the Obsidian research note.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoopVerdict {
     /// Keep going — the turn is making progress.
@@ -194,49 +200,8 @@ pub enum LoopVerdict {
     /// The model appears stuck (repeating work without progress). Inject this
     /// guidance as a message and give it ONE more round to converge.
     Nudge(String),
-    /// Stuck — discard the polluted history and RESTART the loop from a clean
-    /// context. Carries the [`ResetStyle`] so the caller knows how rich a summary to
-    /// rebuild `conv` with. A fresh context doesn't carry the repetition attractor.
-    Reset(ResetStyle),
-    /// Still stuck after recovery (or a catastrophe backstop tripped). End the turn.
+    /// Still stuck after a nudge (or the catastrophe backstop tripped). End the turn.
     Stop(String),
-}
-
-/// How much context a reset preserves when rebuilding the conversation. Drives the
-/// reset-summary ablation. RETEST VERDICT (docs §0j): a richer summary did NOT
-/// rescue reset — all styles cost ~2.5× nudge's tokens (each restart re-reads +
-/// re-derives) for a noisy completion bump. Reset is opt-in only; Nudge is the
-/// default. Kept because the reset arms do score slightly HIGHER quality, so
-/// reset-thin is a cheap quality-lifter if a task ever values quality over tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResetStyle {
-    /// Original tested arm: task + a structural note (files touched, tools used).
-    /// The 0i loser. In 0j: 16% completed, 53k tok, q43.5.
-    Thin,
-    /// Deterministic + VERBATIM-QUOTED failed results (negative constraints) + last
-    /// few raw turns. Research's pick — but in 0j it was 0% completed, 58k tok,
-    /// q41.8: the better summary did NOT make it converge on this model/task.
-    Rich,
-    /// Rich + one model-filled "next action" line (extra call). 0j: best completion
-    /// (33%) but 62k tok / q43.3 — not worth 2.7× nudge's tokens.
-    Hybrid,
-}
-
-/// What the guard does the FIRST time it detects a stuck pattern. Lets the
-/// escalation policy be A/B-ablated without touching the detection logic. (A repeat
-/// of the same stuck pattern always escalates to Stop.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Recovery {
-    /// Stop immediately on first detection. Simplest; abandons the task. Cheapest,
-    /// near-best quality in the 0i ablation (when you can't rescue, stop fast).
-    StopOnly,
-    /// Inject a corrective message, give one more round. THE DEFAULT — best quality
-    /// in the 0i ablation at moderate cost.
-    Nudge,
-    /// Discard history and restart with a summary of the given style. The THIN style
-    /// was ablation-refuted (0i); Rich/Hybrid are under test (docs §0j) to see if a
-    /// better summary (failed-constraints + raw tail) makes reset converge.
-    Reset(ResetStyle),
 }
 
 /// A guard against runaway tool loops driven by **lack of progress, not step
@@ -289,12 +254,6 @@ pub struct LoopGuard {
     /// repeated tool name and how many times it appears in the window (so the nudge
     /// can name what's stuck). Overridable so the wording can be A/B-ablated.
     nudge_template: String,
-    /// What to do on FIRST detection (ablatable: stop / nudge / reset).
-    recovery: Recovery,
-    /// Resets used this turn, and the cap. A fresh context that ALSO wanders the
-    /// same way would otherwise reset forever — after `max_resets` we Stop.
-    reset_count: usize,
-    max_resets: usize,
 }
 
 /// The default nudge: firm diagnosis + an explicit positive redirect (the
@@ -330,25 +289,7 @@ impl LoopGuard {
             nudge_count: 0,
             max_nudges: 1,
             nudge_template: DEFAULT_NUDGE.to_string(),
-            recovery: Recovery::Nudge,
-            reset_count: 0,
-            max_resets: 2,
         }
-    }
-
-    /// Set the first-detection recovery policy (stop / nudge / reset). Ablatable.
-    pub fn with_recovery(mut self, r: Recovery) -> Self {
-        self.recovery = r;
-        self
-    }
-
-    /// Clear the stuck-detection window. The caller invokes this after acting on a
-    /// [`LoopVerdict::Reset`] (rebuilding the conversation) so the fresh loop starts
-    /// with no repetition history priming another immediate trip.
-    pub fn reset_window(&mut self) {
-        self.window.clear();
-        self.nudged_sig = None;
-        self.clean_streak = 0;
     }
 
     /// Raise the nudge ceiling — how many times the guard will nudge before it
@@ -491,44 +432,31 @@ impl LoopGuard {
     /// `stuck_key` identifies the KIND of stuckness (so a repeat the same way can
     /// escalate); `calls`/`count` fill the nudge template.
     fn on_stuck(&mut self, stuck_key: String, calls: &[ToolCall], count: usize) -> LoopVerdict {
-        // A repeat of the SAME stuck pattern always escalates to Stop, whatever the
-        // policy — we already tried to recover from this exact thing and it recurred.
+        // One soft nudge, then Stop. Stop if (a) we already nudged about THIS same
+        // kind of stuckness and it recurred ("twice the same way"), or (b) we've
+        // spent the nudge budget. (Ablations showed nudge wording is noise and a
+        // context-reset recovery only burns tokens — so the value here is the
+        // structural stop, with a single nudge as a cheap "maybe it helps" rider.)
         let same_way = self.nudged_sig.as_deref() == Some(stuck_key.as_str());
-        match self.recovery {
-            Recovery::StopOnly => LoopVerdict::Stop("stuck — no progress".into()),
-            Recovery::Reset(style) => {
-                if same_way || self.reset_count >= self.max_resets {
-                    return LoopVerdict::Stop(
-                        "still stuck after a fresh-context reset — not converging".into(),
-                    );
-                }
-                self.nudged_sig = Some(stuck_key);
-                self.reset_count += 1;
-                LoopVerdict::Reset(style)
-            }
-            Recovery::Nudge => {
-                // Stop if same-way-again, or we've spent the nudge budget.
-                if same_way || self.nudge_count >= self.max_nudges {
-                    let why = if same_way {
-                        "stuck the same way after a nudge — repeating tool calls without converging"
-                    } else {
-                        "kept thrashing across several nudges without finishing"
-                    };
-                    return LoopVerdict::Stop(why.into());
-                }
-                self.nudged_sig = Some(stuck_key);
-                self.nudge_count += 1;
-                let tool = calls
-                    .first()
-                    .map(|c| c.name.as_str())
-                    .unwrap_or("that tool");
-                let msg = self
-                    .nudge_template
-                    .replace("{tool}", tool)
-                    .replace("{count}", &count.to_string());
-                LoopVerdict::Nudge(msg)
-            }
+        if same_way || self.nudge_count >= self.max_nudges {
+            let why = if same_way {
+                "stuck the same way after a nudge — repeating tool calls without converging"
+            } else {
+                "kept thrashing across several nudges without finishing"
+            };
+            return LoopVerdict::Stop(why.into());
         }
+        self.nudged_sig = Some(stuck_key);
+        self.nudge_count += 1;
+        let tool = calls
+            .first()
+            .map(|c| c.name.as_str())
+            .unwrap_or("that tool");
+        let msg = self
+            .nudge_template
+            .replace("{tool}", tool)
+            .replace("{count}", &count.to_string());
+        LoopVerdict::Nudge(msg)
     }
 }
 
@@ -728,57 +656,6 @@ mod tests {
             LoopVerdict::Nudge(_)
         )); // 2nd: pair repeats
         assert!(matches!(g.record_round(&calls, &res), LoopVerdict::Stop(_))); // same way again → stop
-    }
-
-    // Recovery::Reset → first detection RESETS (clean-context restart); a fresh
-    // DIFFERENT stuck pattern resets again up to max_resets, then Stops.
-    #[test]
-    fn loop_guard_reset_policy_resets_then_stops() {
-        let mut g = LoopGuard::new(100).with_recovery(Recovery::Reset(ResetStyle::Rich)); // max_resets=2
-                                                                                          // identical action 3× → action_repeats hits repeat_limit(3) → reset #1.
-        let a = vec![ToolCall::new(
-            "c",
-            "write_file",
-            "{\"path\":\"g.py\",\"content\":\"v1\"}",
-        )];
-        assert_eq!(g.record_round(&a, &["w1".into()]), LoopVerdict::Continue);
-        assert_eq!(g.record_round(&a, &["w2".into()]), LoopVerdict::Continue);
-        assert!(matches!(
-            g.record_round(&a, &["w3".into()]),
-            LoopVerdict::Reset(_)
-        ));
-        g.reset_window(); // caller clears after acting on Reset
-                          // a DIFFERENT churn after reset → reset #2
-        let b = vec![ToolCall::new("c", "bash", "{\"command\":\"x\"}")];
-        for i in 0..4 {
-            if matches!(
-                g.record_round(&b, &[format!("r{i}")]),
-                LoopVerdict::Reset(_)
-            ) {
-                g.reset_window();
-                break;
-            }
-        }
-        // a THIRD churn → max_resets exhausted → Stop
-        let c = vec![ToolCall::new("c", "grep", "{\"q\":\"y\"}")];
-        let mut stopped = false;
-        for i in 0..6 {
-            if matches!(g.record_round(&c, &[format!("g{i}")]), LoopVerdict::Stop(_)) {
-                stopped = true;
-                break;
-            }
-        }
-        assert!(stopped, "after max_resets the reset policy must Stop");
-    }
-
-    // Recovery::StopOnly → stop on the very first detection (no nudge, no reset).
-    #[test]
-    fn loop_guard_stop_only_policy_stops_immediately() {
-        let mut g = LoopGuard::new(100).with_recovery(Recovery::StopOnly);
-        let a = vec![ToolCall::new("c", "read_file", "{\"path\":\"x\"}")];
-        let same = vec!["same".to_string()];
-        assert_eq!(g.record_round(&a, &same), LoopVerdict::Continue);
-        assert!(matches!(g.record_round(&a, &same), LoopVerdict::Stop(_))); // first stuck → stop
     }
 
     // FORGIVING: nudge, then the model makes progress → it runs free again; a later
