@@ -350,10 +350,16 @@ pub fn compress(cmd: &str, raw: &str, budget: usize, artifact: Option<&Path>) ->
     }
 
     let text = match shape {
-        OutputShape::Log => compress_log(raw, budget, artifact),
+        // Log and Diff are signal-driven and deliberately ignore `budget` (a log
+        // keeps every error line, a diff every change line) — so a pathological
+        // input (all-distinct errors, an all-changes diff) can return hundreds of
+        // KB. The per-result cap is a product non-negotiable (paid on every call),
+        // so a final backstop bounds those two. (Grep ≤100 hits and Dir ≤200
+        // entries are already bounded upstream; Json/generic are byte-driven.)
+        OutputShape::Log => enforce_budget(compress_log(raw, budget, artifact), budget, artifact),
+        OutputShape::Diff => enforce_budget(compress_diff(raw, budget, artifact), budget, artifact),
         OutputShape::Grep => compress_grep(raw, budget, artifact),
         OutputShape::Json => compress_json(raw, budget, artifact),
-        OutputShape::Diff => compress_diff(raw, budget, artifact),
         OutputShape::Dir => compress_dir(raw, budget, artifact),
         _ => compress_generic(raw, budget, artifact),
     };
@@ -823,6 +829,35 @@ fn compress_generic(raw: &str, budget: usize, artifact: Option<&Path>) -> String
         tail_start - head_end,
         &raw[tail_start..]
     )
+}
+
+/// Strictly bound `text` to `budget` bytes, keeping a head + tail (a log's exit
+/// line / a diff's final hunk lives at the tail) split by a recoverable marker.
+/// A no-op when `text` already fits. Guarantees `result.len() <= budget` whenever
+/// `budget` exceeds the marker length (the only escape is an absurdly small budget,
+/// where the bare marker is the smallest recoverable thing we can emit).
+fn enforce_budget(text: String, budget: usize, artifact: Option<&Path>) -> String {
+    if text.len() <= budget {
+        return text;
+    }
+    let hint = artifact_hint(artifact);
+    let marker = format!(
+        "\n… [{} bytes; capped to the per-result budget.{hint}] …\n",
+        text.len()
+    );
+    if budget <= marker.len() {
+        return marker;
+    }
+    let body = budget - marker.len();
+    let head_budget = body * 55 / 100;
+    let tail_budget = body - head_budget;
+    let head_end = floor_boundary(&text, head_budget);
+    let tail_start = ceil_boundary(&text, text.len() - tail_budget);
+    if tail_start <= head_end {
+        let end = floor_boundary(&text, body);
+        return format!("{}{marker}", &text[..end]);
+    }
+    format!("{}{marker}{}", &text[..head_end], &text[tail_start..])
 }
 
 fn floor_boundary(s: &str, i: usize) -> usize {
@@ -1318,6 +1353,54 @@ mod tests {
         );
         assert!(c.text.contains("context lines elided"));
         assert!(c.kept_bytes < c.raw_bytes);
+    }
+
+    #[test]
+    fn shape_compressors_never_exceed_the_byte_budget() {
+        // The signal-driven shape compressors (diff/log) ignore `budget`, so a
+        // pathological all-distinct input could blow the per-result cap. The final
+        // backstop must bound every shape to the budget while staying recoverable.
+        const BUDGET: usize = 4096;
+
+        // A diff that is ALL distinct change lines (fold can't help — every line is
+        // unique), 8000 of them → raw is ~150 KB before the backstop.
+        let mut diff = String::from("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,1 +1,8000 @@\n");
+        for i in 0..8000 {
+            diff.push_str(&format!("+distinct added line number {i} with some text\n"));
+        }
+        let c = compress("git diff", &diff, BUDGET, art());
+        assert_eq!(c.shape, OutputShape::Diff);
+        assert!(
+            c.kept_bytes <= BUDGET,
+            "diff backstop failed: {} > {BUDGET}",
+            c.kept_bytes
+        );
+        assert!(c.kept_bytes < c.raw_bytes);
+        assert!(c.text.contains("per-result budget") || c.text.contains("full output"));
+
+        // A log that is ALL distinct error lines (each unique → no fold), so
+        // compress_log keeps far more than the budget without the backstop.
+        let mut log = String::new();
+        for i in 0..3000 {
+            log.push_str(&format!("error[E{i:04}]: distinct failure at site {i}\n"));
+        }
+        log.push_str("error: build failed\n[exit 1]\n");
+        let c = compress("cargo build", &log, BUDGET, art());
+        assert_eq!(c.shape, OutputShape::Log);
+        assert!(
+            c.kept_bytes <= BUDGET,
+            "log backstop failed: {} > {BUDGET}",
+            c.kept_bytes
+        );
+        // Tail (the exit line) survives the head+tail split.
+        assert!(c.text.contains("[exit 1]"), "log tail dropped by backstop");
+    }
+
+    #[test]
+    fn enforce_budget_is_a_noop_when_already_within_budget() {
+        let small = String::from("short output\n[exit 0]\n");
+        let out = enforce_budget(small.clone(), 4096, art());
+        assert_eq!(out, small, "in-budget text must pass through untouched");
     }
 
     #[test]
