@@ -716,6 +716,11 @@ impl<I: Input, W: Write> App<I, W> {
         // protocol). On terminals that support it, Shift+Enter then arrives as
         // `ESC [ 13 ; 2 u`; on others this is silently ignored. Popped in finish.
         self.out.write_all(b"\x1b[>1u")?;
+        // Enable bracketed paste: the terminal wraps pasted text in `ESC[200~`…
+        // `ESC[201~` so a multi-line paste arrives as one literal blob instead of
+        // submitting line-by-line (and pasted escape sequences aren't run as keys).
+        // Disabled in finish.
+        self.out.write_all(b"\x1b[?2004h")?;
         // NOTE: we deliberately do NOT enable SGR mouse reporting. It would catch
         // clicks for click-to-copy, but it also steals the scroll wheel, killing
         // native scrollback — a core feature. Copy with `/clip`.
@@ -769,8 +774,9 @@ impl<I: Input, W: Write> App<I, W> {
     }
 
     fn finish(&mut self) -> io::Result<()> {
-        // Pop the kitty keyboard-protocol flags we pushed in run().
+        // Pop the kitty keyboard-protocol flags + bracketed paste we set in run().
         self.out.write_all(b"\x1b[<u")?;
+        self.out.write_all(b"\x1b[?2004l")?;
         self.write_text("\n")?;
         Ok(())
     }
@@ -851,6 +857,7 @@ impl<I: Input, W: Write> App<I, W> {
                 }
             }
             Key::Char(c) => self.editor.insert(c),
+            Key::Paste(s) => self.editor.insert_str(&s),
         }
         Ok(Flow::Continue)
     }
@@ -1406,6 +1413,7 @@ impl<I: Input, W: Write> App<I, W> {
             Key::BackTab => self.mode = self.mode.next(), // cycle modes mid-stream
             Key::Backspace => self.editor.backspace(),
             Key::Char(c) => self.editor.insert(c),
+            Key::Paste(s) => self.editor.insert_str(&s),
             _ => {} // other editing keys: no live echo while streaming
         }
         Ok(Flow::Continue)
@@ -1824,6 +1832,7 @@ impl<I: Input, W: Write> App<I, W> {
             Key::Ctrl('w') => self.editor.kill_word(),
             Key::ShiftEnter => self.editor.insert_newline(),
             Key::Char(c) => self.editor.insert(c),
+            Key::Paste(s) => self.editor.insert_str(&s),
             _ => {}
         }
         Ok(Flow::Continue)
@@ -1890,6 +1899,11 @@ impl<I: Input, W: Write> App<I, W> {
             Key::Ctrl('r') => s.idx = self.search_from(&s.query, s.idx),
             Key::Char(c) => {
                 s.query.push(c);
+                s.idx = self.search_from(&s.query, None);
+            }
+            Key::Paste(text) => {
+                // Search is single-line: take the pasted text minus control chars.
+                s.query.extend(text.chars().filter(|c| !c.is_control()));
                 s.idx = self.search_from(&s.query, None);
             }
             Key::Backspace => {
@@ -2767,6 +2781,35 @@ mod tests {
         // "line one" committed (newline seen); only "line two" stays live.
         assert_eq!(a.pending, "line two");
         assert!(rendered(&a).contains("line one"));
+    }
+
+    #[test]
+    fn pasting_multiline_text_inserts_without_submitting() {
+        // A bracketed paste with embedded newlines lands in the editor as one
+        // multi-line blob — it must NOT submit line-by-line (no turn, no queue).
+        let mut a = app(b"");
+        a.dispatch(Key::Paste("first line\nsecond line\nthird".to_string()))
+            .unwrap();
+        assert_eq!(a.editor.text(), "first line\nsecond line\nthird");
+        assert!(a.streaming.is_none(), "paste must not start a turn");
+        assert!(a.queue.is_empty(), "paste must not queue anything");
+        assert!(a.last_reply.is_empty(), "no reply: nothing was submitted");
+    }
+
+    #[test]
+    fn paste_decoded_from_raw_bytes_through_the_run_loop() {
+        // End to end: raw paste bytes (split across two reads) decode to inserted
+        // text, then a normal Enter submits the whole blob as one prompt.
+        let mut a = multi_app(&[b"\x1b[200~echo ", b"hi there\x1b[201~", b"\r", b"/quit\r"]);
+        a.run().unwrap();
+        // The stub echoes the prompt; the submitted prompt was the pasted line.
+        assert!(
+            a.conversation()
+                .messages
+                .iter()
+                .any(|m| m.content.contains("echo hi there")),
+            "pasted multi-read text should submit as one prompt"
+        );
     }
 
     #[test]

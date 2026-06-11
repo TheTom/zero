@@ -7,10 +7,18 @@
 //! reads.
 
 /// A decoded key press.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: the `Paste` variant owns a `String` (a bracketed-paste blob). All
+/// other variants are trivially cloneable.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Key {
     /// A printable character (already UTF-8 decoded).
     Char(char),
+    /// A bracketed paste: the literal text between the terminal's paste markers,
+    /// inserted verbatim (newlines included) and never interpreted as keys, so a
+    /// pasted multi-line blob doesn't submit line-by-line or trigger arrow/Enter
+    /// handling. Carries the raw content; the editor sanitizes it on insert.
+    Paste(String),
     Enter,
     Tab,
     /// Shift+Tab — used to cycle input modes.
@@ -191,6 +199,11 @@ fn decode_csi(buf: &[u8]) -> Step {
             };
         }
         b'~' => match params[0] {
+            // Bracketed paste: `ESC [ 200 ~ <content> ESC [ 201 ~`. `total` is the
+            // byte just past the start marker; the content (which may span reads
+            // and contain newlines / escape sequences) is taken literally up to the
+            // end marker. If the end marker hasn't arrived yet, wait for more.
+            200 => return decode_paste(buf, total),
             1 | 7 => Key::Home,
             4 | 8 => Key::End,
             3 => Key::Delete,
@@ -202,6 +215,29 @@ fn decode_csi(buf: &[u8]) -> Step {
         _ => return Step::Consume(total),
     };
     Step::Key(key, total)
+}
+
+/// Decode a bracketed-paste body. `buf` starts at `ESC [ 200 ~`; `after_start` is
+/// the offset just past that marker. Scans for the `ESC [ 201 ~` end marker and
+/// emits the content between as one [`Key::Paste`]; returns [`Step::NeedMore`] if
+/// the end marker hasn't arrived yet so the caller buffers the rest of the paste.
+fn decode_paste(buf: &[u8], after_start: usize) -> Step {
+    const END: &[u8] = b"\x1b[201~";
+    let body = &buf[after_start..];
+    match find_subslice(body, END) {
+        Some(idx) => {
+            // Lossy UTF-8: a paste is arbitrary bytes; never panic on invalid input.
+            let content = String::from_utf8_lossy(&body[..idx]).into_owned();
+            Step::Key(Key::Paste(content), after_start + idx + END.len())
+        }
+        None => Step::NeedMore,
+    }
+}
+
+/// First index of `needle` within `hay`, or `None`. (`needle` is always the fixed,
+/// non-empty paste-end marker.)
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 fn decode_utf8(buf: &[u8]) -> Step {
@@ -478,5 +514,64 @@ mod tests {
         let (k, consumed) = decode_keys(b"\x1b[1;");
         assert!(k.is_empty());
         assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn bracketed_paste_is_one_literal_blob() {
+        // The whole envelope decodes to a single Paste carrying the raw content.
+        let (k, consumed) = decode_keys(b"\x1b[200~hello world\x1b[201~");
+        assert_eq!(k, vec![Key::Paste("hello world".to_string())]);
+        assert_eq!(consumed, b"\x1b[200~hello world\x1b[201~".len());
+    }
+
+    #[test]
+    fn paste_content_with_newlines_and_escapes_stays_literal() {
+        // Newlines, a CR, and what looks like an arrow-key escape inside the paste
+        // are content — NOT submit/Enter/arrow keys.
+        let raw = b"\x1b[200~line1\nline2\r\x1b[A done\x1b[201~";
+        let (k, _) = decode_keys(raw);
+        assert_eq!(k, vec![Key::Paste("line1\nline2\r\x1b[A done".to_string())]);
+        // Critically: no Enter / Up among the decoded keys.
+        assert!(!k.iter().any(|x| matches!(x, Key::Enter | Key::Up)));
+    }
+
+    #[test]
+    fn unterminated_paste_waits_for_the_end_marker() {
+        // Start marker + body but no end marker yet → buffer, emit nothing.
+        let (k, consumed) = decode_keys(b"\x1b[200~partial content so far");
+        assert!(k.is_empty());
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn paste_split_across_reads_resumes() {
+        // A large paste arrives in two reads; the decoder buffers until the end
+        // marker completes it, then emits the whole blob.
+        let part1 = b"\x1b[200~the quick brown ";
+        let (k, consumed) = decode_keys(part1);
+        assert!(k.is_empty() && consumed == 0, "first half must wait");
+        let full = b"\x1b[200~the quick brown fox jumps\x1b[201~";
+        assert_eq!(
+            decode_keys(full).0,
+            vec![Key::Paste("the quick brown fox jumps".to_string())]
+        );
+    }
+
+    #[test]
+    fn empty_paste_decodes_to_empty_blob() {
+        let (k, consumed) = decode_keys(b"\x1b[200~\x1b[201~");
+        assert_eq!(k, vec![Key::Paste(String::new())]);
+        assert_eq!(consumed, b"\x1b[200~\x1b[201~".len());
+    }
+
+    #[test]
+    fn keys_around_a_paste_decode_normally() {
+        // A char, then a paste, then Enter — the paste doesn't swallow its
+        // neighbours and the trailing Enter still submits.
+        let (k, _) = decode_keys(b"x\x1b[200~pasted\x1b[201~\r");
+        assert_eq!(
+            k,
+            vec![Key::Char('x'), Key::Paste("pasted".to_string()), Key::Enter]
+        );
     }
 }

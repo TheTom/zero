@@ -43,6 +43,27 @@ impl LineEditor {
         self.cursor += 1;
     }
 
+    /// Insert a string at the cursor (a bracketed paste). Carriage returns are
+    /// normalized to newlines (`\r\n` and lone `\r` → `\n`) so pasted text neither
+    /// submits nor leaves stray CRs; other control characters (except `\t`) are
+    /// dropped so a pasted escape/NUL can't corrupt the buffer or the render.
+    pub fn insert_str(&mut self, s: &str) {
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\r' => {
+                    self.insert('\n');
+                    if chars.peek() == Some(&'\n') {
+                        chars.next(); // collapse a CRLF pair into the one newline
+                    }
+                }
+                '\n' | '\t' => self.insert(c),
+                c if !c.is_control() => self.insert(c),
+                _ => {} // drop other controls (ESC, NUL, …)
+            }
+        }
+    }
+
     /// Delete the character before the cursor (Backspace).
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
@@ -278,6 +299,33 @@ mod tests {
         let e = typed("hello");
         assert_eq!(e.text(), "hello");
         assert_eq!(e.cursor(), 5);
+    }
+
+    #[test]
+    fn insert_str_pastes_multiline_normalizing_crlf() {
+        let mut e = LineEditor::new();
+        // CRLF, lone CR, and LF all become a single '\n'; tabs survive.
+        e.insert_str("line1\r\nline2\rline3\n\tindented");
+        assert_eq!(e.text(), "line1\nline2\nline3\n\tindented");
+        assert_eq!(e.cursor(), e.text().chars().count());
+    }
+
+    #[test]
+    fn insert_str_drops_stray_control_chars() {
+        let mut e = LineEditor::new();
+        // A pasted ESC and NUL must not land in the buffer; printables/newlines do.
+        e.insert_str("a\x1b[Db\0c\n");
+        assert_eq!(e.text(), "a[Dbc\n"); // ESC byte dropped, its '[D' remain as text
+        assert!(!e.text().contains('\u{1b}') && !e.text().contains('\0'));
+    }
+
+    #[test]
+    fn insert_str_at_cursor_keeps_surrounding_text() {
+        let mut e = typed("ac");
+        e.left(); // between a and c
+        e.insert_str("XY");
+        assert_eq!(e.text(), "aXYc");
+        assert_eq!(e.cursor(), 3);
     }
 
     #[test]
