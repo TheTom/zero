@@ -324,13 +324,37 @@ fn resolve(path: &str, root: Option<&Path>) -> Result<std::path::PathBuf, String
             if p.is_absolute() {
                 return Err("absolute paths are not allowed".to_string());
             }
-            // Reject any `..` component — simple and strict (no symlink games).
+            // Reject any `..` component — strict against textual escapes.
             if p.components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
             {
                 return Err("path escapes the workspace root".to_string());
             }
-            Ok(root.join(p))
+            let joined = root.join(p);
+            // Symlink guard: the `..` check stops textual escapes, but a symlink
+            // *inside* the root can still point outside it (e.g. a prior `ln -s /
+            // esc` then `read_file esc/etc/passwd`). Canonicalize the existing
+            // portion of the target and require it to stay within the canonical
+            // root. A not-yet-created write target is checked via its nearest
+            // existing ancestor (the directory the write lands in).
+            if let Ok(canon_root) = root.canonicalize() {
+                let mut probe: &Path = joined.as_path();
+                let existing = loop {
+                    match probe.canonicalize() {
+                        Ok(c) => break Some(c),
+                        Err(_) => match probe.parent() {
+                            Some(par) => probe = par,
+                            None => break None,
+                        },
+                    }
+                };
+                if let Some(existing) = existing {
+                    if !existing.starts_with(&canon_root) {
+                        return Err("path escapes the workspace root".to_string());
+                    }
+                }
+            }
+            Ok(joined)
         }
     }
 }
@@ -594,6 +618,45 @@ mod tests {
         let abs = execute("read_file", r#"{"path":"/etc/hosts"}"#, Some(&dir));
         assert!(abs.unwrap_err().contains("absolute"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_confinement_rejects_symlink_escape() {
+        // A symlink INSIDE the root pointing outside it must not become a read/write
+        // escape hatch — the textual `..` check can't catch this; canonicalization
+        // does. (Repro of the audited hole: `ln -s / esc` then read `esc/...`.)
+        let dir = tmp();
+        let outside = tmp();
+        std::fs::write(outside.join("secret"), "classified").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("esc")).unwrap();
+
+        // Read through the symlink → rejected.
+        let r = execute("read_file", r#"{"path":"esc/secret"}"#, Some(&dir));
+        assert!(
+            r.unwrap_err().contains("escapes"),
+            "symlink read escape not blocked"
+        );
+        // Write through the symlink (target dir exists via the link) → rejected.
+        let w = execute(
+            "write_file",
+            r#"{"path":"esc/pwned","content":"x"}"#,
+            Some(&dir),
+        );
+        assert!(
+            w.unwrap_err().contains("escapes"),
+            "symlink write escape not blocked"
+        );
+        // A normal in-root write still works (guard is not over-broad).
+        let ok = execute(
+            "write_file",
+            r#"{"path":"sub/normal.txt","content":"hi"}"#,
+            Some(&dir),
+        );
+        assert!(ok.is_ok(), "in-root write wrongly blocked: {ok:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
