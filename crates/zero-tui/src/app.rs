@@ -317,6 +317,12 @@ pub struct App<I: Input, W: Write> {
     /// `None` (tests/no session) → compression still runs, just without a
     /// re-fetch path. Set from the session dir by the binary.
     artifact_dir: Option<PathBuf>,
+    /// Project rules + soft prose + warnings, discovered at config time. The rules
+    /// drive the Gate at the tool boundary; the soft prose feeds the Projector.
+    registry: zero_core::rules::Registry,
+    /// The projected `<{slug}_rules>` block, recomputed at config time and appended
+    /// to the system prompt every turn (re-send fights decay). Empty → nothing to say.
+    rules_block: String,
 }
 
 // Canonical context-cap defaults live in zero_core::context (shared with Config);
@@ -370,6 +376,8 @@ impl<I: Input, W: Write> App<I, W> {
             read_cache: zero_core::context::ReadCache::new(),
             context_stats: zero_core::context::ContextStats::new(),
             artifact_dir: None,
+            registry: zero_core::rules::Registry::default(),
+            rules_block: String::new(),
         }
     }
 
@@ -398,6 +406,19 @@ impl<I: Input, W: Write> App<I, W> {
         self.max_turn_output = self.config.max_turn_output;
         self.config_path = config_path;
         self.servers_path = servers_path;
+        // Discover enforceable project rules for this session (cwd→git-root +
+        // global ~/.{slug}/). A missing file is not an error → empty rule set.
+        if let Ok(cwd) = std::env::current_dir() {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            self.registry = zero_core::rules::load(&cwd, home.as_deref());
+        }
+        // The lean projected block (~400-token soft budget, PRD default).
+        self.rules_block = zero_core::rules::project(
+            &self.registry.soft,
+            self.registry.rules.len(),
+            &zero_core::brand::slug(),
+            400,
+        );
     }
 
     /// Where to read Zero's own MCP server definitions (`~/.zero/mcp.json`).
@@ -444,6 +465,153 @@ impl<I: Input, W: Write> App<I, W> {
         }
     }
 
+    /// The system prompt actually sent: the base prompt plus the projected
+    /// `<{slug}_rules>` block (re-sent every turn so rules don't decay). With no
+    /// rules to project the block is empty and this equals [`Self::system_prompt`],
+    /// keeping the baseline byte-identical.
+    fn projected_system(&self) -> String {
+        if self.rules_block.is_empty() {
+            self.system_prompt().to_string()
+        } else {
+            format!("{}\n\n{}", self.system_prompt(), self.rules_block)
+        }
+    }
+
+    /// `/rules [status|doctor]` — inspect what was loaded, projected, and enforced.
+    /// Reload rules + recompute the projected block (after an in-session edit, so
+    /// `/rules add` takes effect immediately — hot reload).
+    fn reload_rules(&mut self) {
+        if let Ok(cwd) = std::env::current_dir() {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            self.registry = zero_core::rules::load(&cwd, home.as_deref());
+        }
+        self.rules_block = zero_core::rules::project(
+            &self.registry.soft,
+            self.registry.rules.len(),
+            &zero_core::brand::slug(),
+            400,
+        );
+    }
+
+    fn rules_command(&mut self, arg: &str) -> io::Result<()> {
+        use zero_core::rules::On;
+        let (cmd, rest) = match arg.split_once(char::is_whitespace) {
+            Some((c, r)) => (c, r.trim()),
+            None => (arg, ""),
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let mut out = String::new();
+        match cmd {
+            "" | "status" => {
+                let reg = &self.registry;
+                let projected = if self.rules_block.is_empty() {
+                    0
+                } else {
+                    self.rules_block.lines().count().saturating_sub(2)
+                };
+                out.push_str(&format!(
+                    "rules: {} enforced · {} soft source(s) · {} projected line(s) · {} warning(s)\n",
+                    reg.rules.len(),
+                    reg.soft.len(),
+                    projected,
+                    reg.warnings.len(),
+                ));
+                for r in &reg.rules {
+                    out.push_str(&format!(
+                        "  · {} [{}] [{}/{}] {}\n",
+                        r.id,
+                        reg.source_of(&r.id).label(),
+                        r.on.label(),
+                        r.action.label(),
+                        r.mat,
+                    ));
+                }
+            }
+            "doctor" => {
+                let issues = zero_core::rules::doctor(&self.registry);
+                if issues.is_empty() {
+                    out.push_str("rules doctor: no issues\n");
+                } else {
+                    out.push_str(&format!("rules doctor: {} issue(s)\n", issues.len()));
+                    for i in issues {
+                        out.push_str(&format!("  ! {i}\n"));
+                    }
+                }
+            }
+            "active" => {
+                let on = match rest {
+                    "pre_command" | "command" => Some(On::Command),
+                    "pre_edit" | "edit" => Some(On::Edit),
+                    _ => None,
+                };
+                match on {
+                    Some(o) => {
+                        out.push_str(&format!("active rules for {rest}:\n"));
+                        for r in self.registry.rules.iter().filter(|r| r.on == o) {
+                            out.push_str(&format!(
+                                "  · {} [{}] {}\n",
+                                r.id,
+                                r.action.label(),
+                                r.mat
+                            ));
+                        }
+                    }
+                    None => out.push_str("usage: /rules active <pre_command|pre_edit>\n"),
+                }
+            }
+            "why" => match self.registry.rules.iter().find(|r| r.id == rest) {
+                Some(r) => {
+                    out.push_str(&format!("rule '{}':\n", r.id));
+                    out.push_str(&format!(
+                        "  source:   {}\n",
+                        self.registry.source_of(&r.id).label()
+                    ));
+                    out.push_str(&format!("  on:       {}\n", r.on.label()));
+                    out.push_str(&format!("  action:   {}\n", r.action.label()));
+                    out.push_str(&format!("  match:    {}\n", r.mat));
+                    if let Some(reason) = &r.reason {
+                        out.push_str(&format!("  reason:   {reason}\n"));
+                    }
+                    out.push_str("  enforced: yes (Gate, at the tool boundary)\n");
+                }
+                None => out.push_str(&format!("no rule with id '{rest}'\n")),
+            },
+            "init" => {
+                let global = rest.contains("--global");
+                match zero_core::rules::apply_init(&cwd, home.as_deref(), global) {
+                    Ok(m) => out.push_str(&m),
+                    Err(e) => out.push_str(&format!("error: {e}\n")),
+                }
+                self.reload_rules();
+            }
+            "add" => {
+                let (global, text) = match rest.strip_prefix("--global") {
+                    Some(t) => (true, t.trim()),
+                    None => (false, rest),
+                };
+                if text.is_empty() {
+                    out.push_str("usage: /rules add [--global] <text>\n");
+                } else {
+                    match zero_core::rules::apply_add(&cwd, home.as_deref(), global, text) {
+                        Ok(m) => {
+                            out.push_str(&m);
+                            out.push('\n');
+                            self.reload_rules();
+                        }
+                        Err(e) => out.push_str(&format!("error: {e}\n")),
+                    }
+                }
+            }
+            other => {
+                out.push_str(&format!(
+                    "unknown /rules subcommand '{other}' — status, doctor, active, why, init, add\n"
+                ));
+            }
+        }
+        self.write_text(&format!("\x1b[2m{out}\x1b[0m"))
+    }
+
     /// Read-only view of the live conversation (for headless callers and
     /// integration tests that assert on what was fed back to the model).
     pub fn conversation(&self) -> &Conversation {
@@ -473,7 +641,7 @@ impl<I: Input, W: Write> App<I, W> {
         } else {
             self.conv.push(Message::user(prompt));
             let timeout = Duration::from_secs(120);
-            let req = with_system(&self.conv, self.system_prompt());
+            let req = with_system(&self.conv, &self.projected_system());
             match self.backend.complete(&req, &[], timeout) {
                 Ok(c) => {
                     self.write_text(&c.content)?;
@@ -820,6 +988,12 @@ impl<I: Input, W: Write> App<I, W> {
             self.do_clip(rest.trim())?;
             return Ok(Flow::Continue);
         }
+        if trimmed == "/rules" || trimmed.starts_with("/rules ") {
+            self.echo_committed(&text)?;
+            let arg = trimmed.strip_prefix("/rules").unwrap_or("").trim();
+            self.rules_command(arg)?;
+            return Ok(Flow::Continue);
+        }
         if trimmed == "/tools" {
             self.echo_committed(&text)?;
             self.tools_enabled = !self.tools_enabled;
@@ -883,11 +1057,15 @@ impl<I: Input, W: Write> App<I, W> {
         // block scopes those borrows so `self` is free again after it returns.
         let cap = self.max_tool_output;
         let turn_budget = self.max_turn_output;
-        let system = self.system_prompt().to_string();
+        let rules = self.registry.rules.clone();
+        let system = self.projected_system();
         let artifact_dir = self.artifact_dir.clone();
         let spent = RefCell::new(0usize); // cumulative result bytes this turn
         let read_cache = RefCell::new(std::mem::take(&mut self.read_cache));
         let stats = RefCell::new(std::mem::take(&mut self.context_stats));
+        // Evidence for the post-turn Checker: which commands ran (and passed) and
+        // whether anything was edited — used to flag unsupported completion claims.
+        let evidence = RefCell::new(zero_core::rules::EvidenceLog::new());
         let res = {
             let out = RefCell::new(&mut self.out);
             // Prepend the system prompt per completion call so it leads every round
@@ -921,7 +1099,7 @@ impl<I: Input, W: Write> App<I, W> {
                         }
                     }
                 }
-                let raw = gate_and_execute(mode, call, root.as_deref());
+                let raw = gate_and_execute(mode, call, root.as_deref(), &rules);
                 // Context cap: bound what goes back into the window. The effective
                 // cap also shrinks as the per-turn budget depletes (always keeping
                 // a floor), so a turn firing many calls can't blow the window by
@@ -941,6 +1119,22 @@ impl<I: Input, W: Write> App<I, W> {
                         "write_file" | "edit_file" if ok => read_cache.borrow_mut().invalidate(p),
                         _ => {}
                     }
+                }
+                // Post-turn evidence: bash commands (with exit status) + edits.
+                if call.name == "bash" {
+                    if let Some(cmd) = zero_core::tools::parse_arguments(call)
+                        .ok()
+                        .and_then(|a| a.get("command").and_then(|v| v.as_str().map(String::from)))
+                    {
+                        evidence
+                            .borrow_mut()
+                            .record_command(&cmd, result.contains("[exit 0]"));
+                    }
+                } else if matches!(call.name.as_str(), "write_file" | "edit_file")
+                    && !result.starts_with("error:")
+                    && !result.starts_with("refused:")
+                {
+                    evidence.borrow_mut().record_edit();
                 }
                 let _ = write_raw(
                     &mut **out.borrow_mut(),
@@ -963,6 +1157,7 @@ impl<I: Input, W: Write> App<I, W> {
         self.conv = conv;
         self.read_cache = read_cache.into_inner();
         self.context_stats = stats.into_inner();
+        let evidence = evidence.into_inner();
         // Applied write/edit payloads are now compacted IN-LOOP by run_turn (each
         // round, so a long turn doesn't re-send a just-written file's body). The
         // measured savings ride back on the outcome and are recorded below.
@@ -981,6 +1176,11 @@ impl<I: Input, W: Write> App<I, W> {
                 };
                 self.write_text(&format!("{note}\n"))?;
                 self.last_reply = outcome.final_text.clone();
+                // Post-turn Checker: flag completion claims unsupported by evidence
+                // (e.g. "tests pass" with no successful test command this turn).
+                for v in zero_core::rules::check_final(&outcome.final_text, &evidence) {
+                    self.write_text(&format!("\x1b[33m[rule: {}] {}\x1b[0m\n", v.rule, v.detail))?;
+                }
                 // Measured in-loop write-payload compaction (each round of the turn).
                 let (cb, ca) = outcome.compacted;
                 if cb > ca {
@@ -1022,7 +1222,7 @@ impl<I: Input, W: Write> App<I, W> {
         // Prepend the system prompt (and, in plan mode, the plan directive) to
         // *this request only* — self.conv is untouched, so nothing persists across
         // turns/modes. System leads; the plan directive sits just after it.
-        let mut conv = with_system(&self.conv, self.system_prompt());
+        let mut conv = with_system(&self.conv, &self.projected_system());
         if self.mode == Mode::Plan {
             conv.messages
                 .insert(1, Message::new(Role::System, PLAN_DIRECTIVE.to_string()));
@@ -2101,16 +2301,27 @@ fn copy_with(candidates: &[(&str, &[&str])], text: &str) -> io::Result<()> {
 /// with a message the model can act on — safe by default, no interactive
 /// confirm needed for this synchronous slice). Returns the result text fed back
 /// to the model (an error string is fine — it self-corrects).
-fn gate_and_execute(mode: Mode, call: &ToolCall, root: Option<&std::path::Path>) -> String {
+fn gate_and_execute(
+    mode: Mode,
+    call: &ToolCall,
+    root: Option<&std::path::Path>,
+    rules: &[zero_core::rules::Rule],
+) -> String {
     use zero_core::builtins;
+    use zero_core::rules::GateDecision;
     // bash is advertised by builtins::definitions() but executed here, because
     // shell exec needs the mode + safety gate (like the `!` shell mode) — it is
     // intentionally NOT a builtins::execute() tool.
     if call.name == "bash" {
-        return gate_and_run_bash(mode, call);
+        return gate_and_run_bash(mode, call, rules);
     }
     if !builtins::is_builtin(&call.name) {
         return format!("error: unknown tool {}", call.name);
+    }
+    // Rule gate (edit Block) fires BEFORE the mode check, so an enforced rule
+    // holds even in auto-accept — auto-accept must never bypass the Gate.
+    if let GateDecision::Block(reason) = zero_core::rules::gate(call, rules) {
+        return format!("refused: {reason} (blocked by a project rule)");
     }
     let mutating = matches!(call.name.as_str(), "write_file" | "edit_file");
     if mutating && mode != Mode::AutoAccept {
@@ -2129,7 +2340,8 @@ fn gate_and_execute(mode: Mode, call: &ToolCall, root: Option<&std::path::Path>)
 /// mode (the synchronous loop can't pause for an interactive y/N, and we never
 /// auto-run `rm -rf`); otherwise the command runs and its combined output + exit
 /// code come back (capping happens upstream in cap_tool_result).
-fn gate_and_run_bash(mode: Mode, call: &ToolCall) -> String {
+fn gate_and_run_bash(mode: Mode, call: &ToolCall, rules: &[zero_core::rules::Rule]) -> String {
+    use zero_core::rules::GateDecision;
     let Some(cmd) = zero_core::tools::parse_arguments(call)
         .ok()
         .and_then(|a| a.get("command").and_then(|v| v.as_str().map(String::from)))
@@ -2149,7 +2361,19 @@ fn gate_and_run_bash(mode: Mode, call: &ToolCall) -> String {
             verdict.reason.unwrap_or("flagged by the safety guard")
         );
     }
-    run_bash_capture(&cmd)
+    // Project rules over the (safe) command: a rewrite swaps it in place (and is
+    // itself re-classified by safety, two-pass); a block/confirm refuses in the
+    // synchronous loop (we never auto-run a flagged command).
+    match zero_core::rules::gate(call, rules) {
+        GateDecision::Rewrite(rewritten) => run_bash_capture(&rewritten),
+        GateDecision::Block(reason) => {
+            format!("refused: {reason} (blocked by a project rule)")
+        }
+        GateDecision::Confirm(reason) => format!(
+            "refused: a project rule needs confirmation ({reason}); run it yourself if intended"
+        ),
+        GateDecision::Allow => run_bash_capture(&cmd),
+    }
 }
 
 /// Run `cmd` via `sh -c`, returning combined stdout + stderr + an exit-code line.
@@ -2915,17 +3139,22 @@ mod tests {
     #[test]
     fn gate_blocks_mutating_tools_unless_auto_accept() {
         let write = ToolCall::new("c", "write_file", r#"{"path":"x","content":"y"}"#);
-        let refused = gate_and_execute(Mode::Normal, &write, None);
+        let refused = gate_and_execute(Mode::Normal, &write, None, &[]);
         assert!(refused.contains("refused"));
         // unknown tool reported, not executed
-        let unknown = gate_and_execute(Mode::AutoAccept, &ToolCall::new("c", "nope", "{}"), None);
+        let unknown = gate_and_execute(
+            Mode::AutoAccept,
+            &ToolCall::new("c", "nope", "{}"),
+            None,
+            &[],
+        );
         assert!(unknown.contains("unknown tool"));
     }
 
     #[test]
     fn bash_runs_a_safe_command_and_returns_output_and_exit() {
         let call = ToolCall::new("c", "bash", r#"{"command":"echo hello-bash"}"#);
-        let out = gate_and_execute(Mode::Normal, &call, None);
+        let out = gate_and_execute(Mode::Normal, &call, None, &[]);
         assert!(out.contains("hello-bash"));
         assert!(out.contains("[exit 0]"));
     }
@@ -2933,7 +3162,7 @@ mod tests {
     #[test]
     fn bash_reports_nonzero_exit_and_stderr() {
         let call = ToolCall::new("c", "bash", r#"{"command":"echo oops >&2; exit 3"}"#);
-        let out = gate_and_execute(Mode::AutoAccept, &call, None);
+        let out = gate_and_execute(Mode::AutoAccept, &call, None, &[]);
         assert!(out.contains("oops")); // stderr captured
         assert!(out.contains("[exit 3]"));
     }
@@ -2942,7 +3171,7 @@ mod tests {
     fn bash_refuses_dangerous_commands_in_every_mode() {
         let call = ToolCall::new("c", "bash", r#"{"command":"rm -rf /"}"#);
         for mode in [Mode::Normal, Mode::AutoAccept] {
-            let out = gate_and_execute(mode, &call, None);
+            let out = gate_and_execute(mode, &call, None, &[]);
             assert!(out.contains("refused"), "danger not blocked in {mode:?}");
             assert!(out.contains("destructive"));
         }
@@ -2951,7 +3180,7 @@ mod tests {
     #[test]
     fn bash_refuses_in_plan_mode() {
         let call = ToolCall::new("c", "bash", r#"{"command":"echo hi"}"#);
-        let out = gate_and_execute(Mode::Plan, &call, None);
+        let out = gate_and_execute(Mode::Plan, &call, None, &[]);
         assert!(out.contains("refused"));
         assert!(out.contains("plan mode"));
     }
@@ -2959,8 +3188,71 @@ mod tests {
     #[test]
     fn bash_without_command_arg_errors() {
         let call = ToolCall::new("c", "bash", r#"{"wrong":"x"}"#);
-        let out = gate_and_execute(Mode::Normal, &call, None);
+        let out = gate_and_execute(Mode::Normal, &call, None, &[]);
         assert!(out.contains("requires a 'command'"));
+    }
+
+    // --- rules Gate wired into the executor (Slice 1) -------------------
+    use zero_core::rules::{Action, On, Rule};
+    fn rule_py3() -> Rule {
+        Rule {
+            id: "py3".into(),
+            on: On::Command,
+            mat: "python *".into(),
+            action: Action::Rewrite,
+            rewrite: Some(("python".into(), "python3".into())),
+            reason: None,
+        }
+    }
+    fn rule_no_gen() -> Rule {
+        Rule {
+            id: "no-gen".into(),
+            on: On::Edit,
+            mat: "**/*.gen.*".into(),
+            action: Action::Block,
+            rewrite: None,
+            reason: Some("generated file".into()),
+        }
+    }
+
+    #[test]
+    fn gate_rewrites_python_to_python3_through_bash() {
+        // python3 -c is universal; a `python` invocation must be rewritten to
+        // python3 before running, so the rewritten command succeeds.
+        let pcall = ToolCall::new("c", "bash", r#"{"command":"python -c \"print(7*6)\""}"#);
+        let out = gate_and_run_bash(Mode::Normal, &pcall, &[rule_py3()]);
+        assert!(
+            out.contains("42"),
+            "python rewritten to python3 and ran: {out}"
+        );
+    }
+
+    #[test]
+    fn gate_gen_edit_blocks_even_in_autoaccept() {
+        // THE headline composition case: an enforced edit-block holds even in
+        // auto-accept — auto-accept must not bypass the Gate.
+        let call = ToolCall::new(
+            "c",
+            "write_file",
+            r#"{"path":"src/api.gen.ts","content":"x"}"#,
+        );
+        let out = gate_and_execute(Mode::AutoAccept, &call, None, &[rule_no_gen()]);
+        assert!(
+            out.contains("refused"),
+            "gen edit allowed in auto-accept: {out}"
+        );
+        assert!(out.contains("project rule"));
+    }
+
+    #[test]
+    fn gate_nongen_edit_gated_by_mode_not_rule() {
+        // No matching block rule → behaviour unchanged (mode gate still applies).
+        let call = ToolCall::new("c", "write_file", r#"{"path":"src/ok.ts","content":"x"}"#);
+        let out = gate_and_execute(Mode::Normal, &call, None, &[rule_no_gen()]);
+        assert!(
+            out.contains("auto-accept"),
+            "non-gen file gated by mode, not rule: {out}"
+        );
     }
 
     #[test]
@@ -3046,6 +3338,200 @@ mod tests {
         type_str(&mut a, "/context");
         a.dispatch(Key::Enter).unwrap();
         assert!(rendered(&a).contains("no tool output yet"));
+    }
+
+    #[test]
+    fn rules_status_lists_enforced_rules() {
+        let mut a = app(b"");
+        a.registry = zero_core::rules::Registry {
+            rules: vec![rule_py3(), rule_no_gen()],
+            soft: Vec::new(),
+            warnings: Vec::new(),
+            sources: vec![
+                ("py3".into(), zero_core::rules::Source::User),
+                ("no-gen".into(), zero_core::rules::Source::Project),
+            ],
+        };
+        a.rules_block = zero_core::rules::project(&[], 2, "zero", 400);
+        type_str(&mut a, "/rules");
+        a.dispatch(Key::Enter).unwrap();
+        let o = rendered(&a);
+        assert!(o.contains("2 enforced"), "{o}");
+        assert!(o.contains("py3") && o.contains("no-gen"), "{o}");
+    }
+
+    #[test]
+    fn rules_doctor_surfaces_warnings() {
+        let mut a = app(b"");
+        a.registry.warnings = vec!["rule 'x': dropped — bad 'on'".to_string()];
+        type_str(&mut a, "/rules doctor");
+        a.dispatch(Key::Enter).unwrap();
+        let o = rendered(&a);
+        assert!(o.contains("1 issue"), "{o}");
+        assert!(o.contains("bad 'on'"), "{o}");
+    }
+
+    #[test]
+    fn projected_system_appends_block_else_baseline() {
+        let mut a = app(b"");
+        // No rules → system prompt is byte-identical to the baseline.
+        assert_eq!(a.projected_system(), a.system_prompt());
+        a.rules_block = "<zero_rules>\n- be concise\n</zero_rules>".to_string();
+        let p = a.projected_system();
+        assert!(p.starts_with(a.system_prompt()), "base leads");
+        assert!(p.contains("<zero_rules>"), "block appended");
+    }
+
+    #[test]
+    fn rules_why_and_active_report() {
+        let mut a = app(b"");
+        a.registry = zero_core::rules::Registry {
+            rules: vec![rule_py3(), rule_no_gen()],
+            soft: Vec::new(),
+            warnings: Vec::new(),
+            sources: vec![
+                ("py3".into(), zero_core::rules::Source::User),
+                ("no-gen".into(), zero_core::rules::Source::Project),
+            ],
+        };
+        type_str(&mut a, "/rules why py3");
+        a.dispatch(Key::Enter).unwrap();
+        let o = rendered(&a);
+        assert!(
+            o.contains("rule 'py3'") && o.contains("user") && o.contains("rewrite"),
+            "{o}"
+        );
+        type_str(&mut a, "/rules active pre_edit");
+        a.dispatch(Key::Enter).unwrap();
+        let o2 = rendered(&a);
+        assert!(o2.contains("no-gen"), "{o2}");
+    }
+
+    #[test]
+    fn checker_flags_unsupported_test_claim_in_loop() {
+        // A backend that answers "tests pass" while running nothing → the Checker
+        // surfaces the unsupported-claim violation after the turn.
+        struct Claim;
+        impl Backend for Claim {
+            fn name(&self) -> &str {
+                "claim"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                sink(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+            fn complete(
+                &self,
+                _c: &Conversation,
+                _t: &[ToolDef],
+                _to: Duration,
+            ) -> Result<zero_core::backend::Completion, zero_core::backend::BackendError>
+            {
+                Ok(zero_core::backend::Completion {
+                    content: "Done — all tests pass.".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                })
+            }
+        }
+        let mut a = App::new(ScriptedInput::new(b""), Vec::new(), Arc::new(Claim), None);
+        a.synchronous = true;
+        a.tools_enabled = true;
+        a.run_tool_turn("check the build").unwrap();
+        let o = rendered(&a);
+        assert!(o.contains("tests-before-done"), "checker should flag: {o}");
+    }
+
+    #[test]
+    fn checker_quiet_when_test_actually_ran() {
+        // NEGATIVE: a test command ran and passed → claiming "tests pass" is
+        // supported → no violation (no false positive through the loop).
+        use std::sync::Mutex;
+        struct TestThenClaim {
+            step: Arc<Mutex<u32>>,
+        }
+        impl Backend for TestThenClaim {
+            fn name(&self) -> &str {
+                "ttc"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                sink(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+            fn complete(
+                &self,
+                _c: &Conversation,
+                _t: &[ToolDef],
+                _to: Duration,
+            ) -> Result<zero_core::backend::Completion, zero_core::backend::BackendError>
+            {
+                let mut s = self.step.lock().unwrap();
+                *s += 1;
+                Ok(if *s == 1 {
+                    zero_core::backend::Completion {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall::new(
+                            "c1",
+                            "bash",
+                            r#"{"command":"true # cargo test"}"#,
+                        )],
+                        usage: None,
+                    }
+                } else {
+                    zero_core::backend::Completion {
+                        content: "All tests pass.".to_string(),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    }
+                })
+            }
+        }
+        let backend = Arc::new(TestThenClaim {
+            step: Arc::new(Mutex::new(0)),
+        });
+        let mut a = App::new(ScriptedInput::new(b""), Vec::new(), backend, None);
+        a.synchronous = true;
+        a.tools_enabled = true;
+        a.run_tool_turn("run the tests").unwrap();
+        let o = rendered(&a);
+        assert!(
+            !o.contains("tests-before-done"),
+            "false positive — a test DID run: {o}"
+        );
+    }
+
+    #[test]
+    fn rules_add_hot_reloads_registry() {
+        // INTENT: `/rules add` mid-session takes effect immediately (hot reload).
+        let _lock = CWD_LOCK.lock().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "zero-hotreload-{}-{}",
+            std::process::id(),
+            zero_core::clock::unix_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let mut a = app(b"");
+        a.reload_rules();
+        let before = a.registry.rules.len();
+        type_str(&mut a, "/rules add use python3 not python");
+        a.dispatch(Key::Enter).unwrap();
+        let added = a.registry.rules.iter().any(|r| r.id == "python-to-python3");
+
+        std::env::set_current_dir(&prev).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(before, 0, "temp cwd starts ruleless");
+        assert!(added, "registry did not hot-reload the added rule");
     }
 
     #[test]

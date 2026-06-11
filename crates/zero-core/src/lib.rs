@@ -26,6 +26,7 @@ pub mod json;
 pub mod mcp;
 pub mod message;
 pub mod openai;
+pub mod rules;
 pub mod safety;
 pub mod servers;
 pub mod session;
