@@ -275,7 +275,15 @@ impl Args {
                         .next()
                         .ok_or("rules needs a subcommand: init|add|status")?;
                     let text = if sub == "add" {
-                        Some(it.next().ok_or("rules add needs text (quote it)")?)
+                        // `--global` may appear before the text (matches the TUI's
+                        // `/rules add --global <text>`); consume it as the flag, not
+                        // as the rule body, so the text never becomes "--global".
+                        let mut next = it.next().ok_or("rules add needs text (quote it)")?;
+                        if next == "--global" {
+                            out.rules_global = true;
+                            next = it.next().ok_or("rules add needs text (quote it)")?;
+                        }
+                        Some(next)
                     } else {
                         None
                     };

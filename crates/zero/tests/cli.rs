@@ -741,7 +741,7 @@ fn rules_add_global_writes_to_home_not_cwd() {
     let proj = base.join("proj");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&proj).unwrap();
-    // `rules add "<text>" --global` → text before the flag.
+    // `rules add "<text>" --global` → flag after the text.
     let (out, err, code) = run_rules_in(
         &home,
         &proj,
@@ -755,6 +755,40 @@ fn rules_add_global_writes_to_home_not_cwd() {
     assert!(
         !proj.join(".zero/rules.json").exists(),
         "must not write cwd"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn rules_add_global_flag_before_text() {
+    // `rules add --global "<text>"` (flag BEFORE text) must behave identically to
+    // flag-after — matching the TUI's `/rules add --global …`. Regression: the flag
+    // was previously swallowed as the rule body and written to the project file.
+    let base = temp_repo("global-pre");
+    let home = base.join("home");
+    let proj = base.join("proj");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+    let (out, err, code) = run_rules_in(
+        &home,
+        &proj,
+        &["rules", "add", "--global", "never touch the lockfile"],
+    );
+    assert_eq!(code, 0, "stderr={err}");
+    // Wrote under home (the output path confirms the global target); nothing under
+    // the project dir.
+    assert!(
+        out.contains(home.to_str().unwrap()),
+        "flag-before-text must target home: {out}"
+    );
+    assert!(
+        !proj.join("Zero.md").exists() && !proj.join(".zero/rules.json").exists(),
+        "must not write the project dir: {out}"
+    );
+    // The literal "--global" must NOT have leaked into any written rule file.
+    assert!(
+        !out.contains("--global"),
+        "the flag leaked into the rule text"
     );
     std::fs::remove_dir_all(&base).ok();
 }
