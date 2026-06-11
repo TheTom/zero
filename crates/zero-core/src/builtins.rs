@@ -194,7 +194,10 @@ fn grep(args: &Value, root: Option<&Path>) -> Result<String, String> {
                     // pointer list — the model reads the span via read_file if it
                     // needs more than this snippet.
                     let preview = grep_preview(line.trim());
-                    hits.push(format!("{}:{}: {}", file.display(), n + 1, preview));
+                    // Pointer paths are root-relative: leaner per-hit, and still
+                    // valid read_file input (which resolves against the same root).
+                    let shown = root.and_then(|r| file.strip_prefix(r).ok()).unwrap_or(file);
+                    hits.push(format!("{}:{}: {}", shown.display(), n + 1, preview));
                     if hits.len() >= MAX_GREP_HITS {
                         truncated = true;
                         break;
