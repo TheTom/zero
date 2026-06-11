@@ -1105,6 +1105,12 @@ impl<I: Input, W: Write> App<I, W> {
                 // a floor), so a turn firing many calls can't blow the window by
                 // attrition. Nothing is lost — a re-fetch hint rides along.
                 let raw_len = raw.len();
+                // Bash success read from the UNCAPPED output, anchored to the final
+                // appended `[exit N]` marker — not a substring of the capped/minified
+                // result. A command that prints "[exit 0]" to stdout then fails can't
+                // spoof it (the harness marker follows stdout), and JSON-minify can't
+                // mangle the marker out of an anchored check on raw.
+                let bash_ok = raw.trim_end().ends_with("[exit 0]");
                 let remaining = turn_budget.saturating_sub(*spent.borrow());
                 let eff_cap = cap.min(remaining.max(TURN_OUTPUT_FLOOR));
                 let result = cap_tool_result(call, raw, eff_cap, artifact_dir.as_deref());
@@ -1126,9 +1132,7 @@ impl<I: Input, W: Write> App<I, W> {
                         .ok()
                         .and_then(|a| a.get("command").and_then(|v| v.as_str().map(String::from)))
                     {
-                        evidence
-                            .borrow_mut()
-                            .record_command(&cmd, result.contains("[exit 0]"));
+                        evidence.borrow_mut().record_command(&cmd, bash_ok);
                     }
                 } else if matches!(call.name.as_str(), "write_file" | "edit_file")
                     && !result.starts_with("error:")
@@ -1198,6 +1202,10 @@ impl<I: Input, W: Write> App<I, W> {
             }
             Err(e) => {
                 self.write_text(&format!("\x1b[31m[{e}]\x1b[0m\n"))?;
+                // Mirror the non-tools path: record the error as the reply so a
+                // headless `zero -p … --tools` against a dead backend returns the
+                // error on stdout instead of silently echoing the previous turn.
+                self.last_reply = format!("[error: {e}]");
             }
         }
         self.redraw_input()
@@ -1242,7 +1250,10 @@ impl<I: Input, W: Write> App<I, W> {
                 Err(_) => Some("\n\x1b[31m[internal error: stream panicked]\x1b[0m".to_string()),
             };
             if let Some(note) = note {
-                let _ = tx.send(StreamEvent::Token(note));
+                // Display-only: an Error event renders to the screen but never
+                // enters `reply`/conv, so a backend failure can't poison the
+                // history with an ANSI-laced assistant message re-sent every turn.
+                let _ = tx.send(StreamEvent::Error(note));
                 let _ = tx.send(StreamEvent::Done(StopReason::EndTurn));
             }
         };
@@ -1267,11 +1278,13 @@ impl<I: Input, W: Write> App<I, W> {
         let mut tokens = Vec::new();
         let mut done = false;
         let mut usage = None;
+        let mut err_note: Option<String> = None;
         if let Some(s) = &self.streaming {
             loop {
                 match s.rx.try_recv() {
                     Ok(StreamEvent::Token(t)) => tokens.push(t),
                     Ok(StreamEvent::Usage(u)) => usage = Some(u),
+                    Ok(StreamEvent::Error(note)) => err_note = Some(note),
                     Ok(StreamEvent::Done(_)) => {
                         done = true;
                         break;
@@ -1283,6 +1296,11 @@ impl<I: Input, W: Write> App<I, W> {
                     }
                 }
             }
+        }
+        // A display-only error note: paint it to scrollback now, but keep it out of
+        // `reply` (and therefore out of conv / the session log).
+        if let Some(note) = err_note {
+            self.pending.push_str(&note);
         }
         if let (Some(u), Some(s)) = (usage, self.streaming.as_mut()) {
             s.usage = Some(u);
@@ -1329,10 +1347,15 @@ impl<I: Input, W: Write> App<I, W> {
             self.last_usage = s.usage;
         }
         let reply = std::mem::take(&mut s.reply);
-        self.conv.push(Message::assistant(&reply));
-        if let Some(log) = self.log.as_mut() {
-            let _ = log.record_message(Role::Assistant, &reply);
-            let _ = log.record_turn_done(elapsed.as_millis());
+        // Only commit a non-empty reply to history (matches `interrupt_stream`): a
+        // Done-with-no-tokens turn (e.g. a backend error surfaced via Error) must
+        // not push an empty assistant message that's paid on every later turn.
+        if !reply.trim().is_empty() {
+            self.conv.push(Message::assistant(&reply));
+            if let Some(log) = self.log.as_mut() {
+                let _ = log.record_message(Role::Assistant, &reply);
+                let _ = log.record_turn_done(elapsed.as_millis());
+            }
         }
         self.last_reply = reply.clone();
         self.last_blocks = crate::markdown::code_blocks(&reply);
@@ -4443,6 +4466,23 @@ mod tests {
         a.run().unwrap();
         std::panic::set_hook(prev);
         assert!(rendered(&a).contains("internal error"));
+        // The error note is display-only: it must NOT have been committed to the
+        // conversation as an assistant message (it would be re-sent every turn,
+        // with raw ANSI). The turn produced no real reply → no assistant message.
+        assert!(
+            !a.conv
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.content.contains("internal error")),
+            "error note leaked into the conversation history"
+        );
+        assert!(
+            !a.conv
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.content.is_empty()),
+            "empty assistant message pushed for a no-token turn"
+        );
     }
 
     #[test]
@@ -4455,7 +4495,14 @@ mod tests {
         );
         a.synchronous = true;
         a.run().unwrap();
-        assert!(rendered(&a).contains("boom")); // error shown as a token
+        assert!(rendered(&a).contains("boom")); // error shown on screen
+        assert!(
+            !a.conv
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.content.contains("boom")),
+            "backend error leaked into the conversation history"
+        );
     }
 
     #[test]
