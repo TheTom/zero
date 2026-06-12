@@ -19,6 +19,8 @@ zero/
     │   ├── json.rs           hand-rolled JSON: parse + serialize
     │   ├── message.rs        Role / Message / Conversation
     │   ├── backend.rs        Backend trait + StubBackend
+    │   ├── safety.rs         destructive-command classifier (the gate)
+    │   ├── rules.rs          project rules: Gate + Projector + Registry
     │   ├── clock.rs          honest elapsed timing (measure, never estimate)
     │   └── session.rs        append-only JSONL transcript log
     ├── zero-tui/           the terminal frontend — std only
@@ -166,6 +168,7 @@ bottom, so the prompt is live the whole time:
 | `^L` | clear screen |
 | `^J` | insert newline — multiline input (works in every terminal) |
 | `Shift+Enter` / `⌥+Enter` | insert newline (on terminals that send a distinct code) |
+| paste | multi-line pastes land whole (bracketed paste) — no line-by-line submit |
 | `Tab` | complete the slash command you're typing |
 | `Enter` | submit — or complete an in-progress slash command (`/he`→`/help`) |
 | `↑` / `↓` | move between input lines, else recall history |
@@ -181,8 +184,9 @@ bottom, so the prompt is live the whole time:
 `Shift+Tab` cycles the input mode (shown in the status footer, Claude-Code style):
 
 - **normal** — default; dangerous shell commands ask before running.
-- **auto-accept** — run flagged shell commands without the `y/N` prompt (it will
-  also auto-approve the agentic tool loop once that lands).
+- **auto-accept** — run flagged shell commands without the `y/N` prompt, and
+  auto-approve file-modifying tools in the agentic loop (a project rule's `Block`
+  still fires first — auto-accept can't bypass it).
 - **plan** — injects a planning directive into each request so the model lays
   out an approach for review before acting (the live conversation isn't mutated;
   it's added to the request only).
@@ -198,8 +202,11 @@ the model answers in plain text. Tool calls and results show inline
 Gating follows the mode (Shift+Tab): read-only tools always run; **file-modifying
 tools (`write_file`/`edit_file`) run only in auto-accept mode** — in normal mode
 they're refused with a message the model can act on. Paths are confined to the
-working directory. The loop is bounded (step cap + doom-loop guard) so a local
-model can't run away.
+working directory (symlinks that point outside it are rejected, not just `..`).
+The loop is bounded by a **progress-based guard** — stuck detection (a repeated
+action, a short A→B→A→B cycle) triggers one soft nudge, then stops; it is *not* a
+step cap, so a legitimately long task runs free (a high round count is only a
+catastrophe backstop).
 
 **`bash`** runs a shell command via the same destructive-command guard as `!`
 shell mode: dangerous commands (`rm -rf`, `dd`, fork bombs, …) are **hard-refused
@@ -297,8 +304,9 @@ HTTP/SSE servers (a `url` instead of a `command`) are skipped — Zero is
 stdio-only for now.
 
 > **Discovery only for now.** `/mcp` connects and lists the tools a server
-> exposes, but the model can't *call* them yet — that needs the agentic
-> tool-call loop, which is the next slice. MCP tools will plug into it then.
+> exposes, but the model can't *call* them yet: the agentic loop (`/tools`)
+> advertises only the built-ins. Wiring MCP tools into that loop is the next
+> slice.
 
 ### Shell mode & the safety guard
 
@@ -318,6 +326,53 @@ the execution boundary does.
 > Ghostty, recent iTerm2). On terminals that don't, **`^J` is the universal
 > newline key** (Return sends CR = submit, `^J` sends LF = newline). Word-wise
 > moves (`⌥`/`^` + arrows) likewise depend on the terminal sending the sequence.
+>
+> **Pasting:** Zero turns on bracketed paste, so pasting a multi-line snippet
+> drops it into the input as one block instead of submitting at the first
+> newline — and pasted escape sequences are inserted as text, never run as keys.
+
+### Project rules — instructions enforced in code
+
+The safety guard above is the in-code floor; **project rules** let you extend it
+with your own instructions that are enforced the same way — not "hoped for" in a
+prompt a small model forgets by turn 80. Two inputs, two mechanisms; everything
+else is just a file the agent reads on demand.
+
+- **`.zero/rules.json` → the Gate.** A pure classifier on every tool call:
+  `Allow` / `Rewrite` (fix the command) / `Confirm` (ask first) / `Block`. It
+  generalizes `safety.rs`, resolving **confinement → safety → rules → mode**, and
+  it's **two-pass** — a rewrite's output is re-checked by safety, so a rule can't
+  smuggle a dangerous command through. Because the Gate never reads model output,
+  it keeps firing no matter how long the conversation runs (no decay), and an
+  edit-`Block` fires *before* the mode check, so auto-accept can't bypass it.
+- **`Zero.md` → the Projector.** One small, budgeted `<zero_rules>` block appended
+  to the system prompt **every turn** (re-sending fights decay). It projects only
+  the voice/project-notes prose; runbooks and maps stay as files. Projected text
+  is sanitized (ANSI / bidi / zero-width stripped) and inert — it's never merged
+  into the instructions it sits beside.
+- **Discovery & precedence:** `cwd → git-root`, plus global `~/.zero/`. A **user
+  (global) rule always wins** over a project rule of the same id (the shadowed
+  project rule is dropped with a warning, never silently).
+
+Author and inspect them headlessly or in the app:
+
+```bash
+zero rules init                       # scaffold .zero/rules.json + Zero.md
+zero rules add "never touch the lockfile"   # classifier routes enforce→json, soft→md
+zero rules add --global "use python3, never python"   # → ~/.zero/
+zero rules status                     # what's loaded, projected, enforced
+zero rules doctor                     # flag scope-bleed (e.g. an op rule parked globally)
+```
+
+```
+/rules status | doctor                inspect what's loaded (hot-reloads after an edit)
+/rules why <id>                       explain one rule (source, match, action, reason)
+/rules add [--global] <text>          add a rule live
+```
+
+After a turn, a **post-turn checker** flags a completion claim the evidence
+doesn't support — e.g. the model says "tests pass" but no test command actually
+ran and exited 0 this turn.
 
 ### Output rendering & clipboard
 
@@ -339,7 +394,7 @@ cargo fmt --all -- --check
 ./scripts/coverage.sh                  # enforces >=95% (fails the build below)
 ```
 
-**Line coverage is held at ≥95%** (currently ~98%) and enforced by
+**Line coverage is held at ≥95%** (currently ~97%) and enforced by
 `scripts/coverage.sh`. The only excluded files are `term.rs` (libc FFI — can't
 run without a real tty) and `main.rs` (process bootstrap); all engine and TUI
 logic is covered, including the HTTP/SSE client (tested against an in-process
