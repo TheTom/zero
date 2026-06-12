@@ -43,6 +43,51 @@ pub fn parse_url(url: &str) -> Result<Url, String> {
     })
 }
 
+/// Max connect attempts before giving up — a local model server that's still
+/// loading (or just restarted) gets a couple of retries before the error surfaces.
+const CONNECT_ATTEMPTS: u32 = 3;
+/// Per-attempt connect timeout. Short on purpose: a refused connection returns
+/// instantly, and a genuinely unreachable host shouldn't block for the (long) read
+/// timeout × every attempt.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Connection-level failures worth retrying — the server may be starting up or
+/// momentarily unavailable. (HTTP error *responses* and mid-stream read failures
+/// are NOT retried; only the initial connect, before any bytes are exchanged.)
+fn is_retryable_connect(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::TimedOut
+    )
+}
+
+/// Resolve `host:port` and connect with a bounded timeout, retrying connection-
+/// level errors up to [`CONNECT_ATTEMPTS`] times with a short increasing backoff.
+/// Returns before any request is sent, so retrying is always safe (no duplicated
+/// output). The final error is the last connect failure.
+fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
+    let addr = (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::other("could not resolve host"))?;
+    let mut last: Option<io::Error> = None;
+    for attempt in 0..CONNECT_ATTEMPTS {
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(s) => return Ok(s),
+            Err(e) if attempt + 1 < CONNECT_ATTEMPTS && is_retryable_connect(&e) => {
+                // 500ms, then 1000ms — give a loading server a moment to come up.
+                std::thread::sleep(Duration::from_millis(500 * (attempt as u64 + 1)));
+                last = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::other("connect failed")))
+}
+
 /// POST `body` to `url` and invoke `on_line` for each line of the response body
 /// (CRLF stripped), de-chunking a `Transfer-Encoding: chunked` stream on the fly.
 /// `headers` are extra request headers (e.g. Authorization).
@@ -53,7 +98,7 @@ pub fn post_stream(
     on_line: &mut dyn FnMut(&str),
 ) -> io::Result<()> {
     let u = parse_url(url).map_err(io::Error::other)?;
-    let mut stream = TcpStream::connect((u.host.as_str(), u.port))?;
+    let mut stream = connect(&u.host, u.port)?;
 
     let mut req = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
@@ -105,11 +150,7 @@ pub fn post(
     timeout: Duration,
 ) -> io::Result<(u16, String)> {
     let u = parse_url(url).map_err(io::Error::other)?;
-    let addr = (u.host.as_str(), u.port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::other("could not resolve host"))?;
-    let stream = TcpStream::connect_timeout(&addr, timeout)?;
+    let stream = connect(&u.host, u.port)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let mut stream = stream;
@@ -461,5 +502,33 @@ mod tests {
         // Nothing listening on this port.
         let err = post_stream("http://127.0.0.1:1/x", &[], "{}", &mut |_| {}).unwrap_err();
         assert!(err.kind() != io::ErrorKind::Other || !err.to_string().is_empty());
+    }
+
+    #[test]
+    fn connect_retries_refused_before_giving_up() {
+        use std::time::Instant;
+        // Nothing listening → connection refused, retried CONNECT_ATTEMPTS times
+        // with backoff (500ms + 1000ms). The elapsed time proves the retries ran;
+        // the error still surfaces once they're exhausted.
+        let t = Instant::now();
+        let err = post("http://127.0.0.1:1/v1", &[], "{}", Duration::from_secs(5)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(
+            t.elapsed() >= Duration::from_millis(1400),
+            "connect did not retry (elapsed {:?})",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn is_retryable_connect_classifies_kinds() {
+        assert!(is_retryable_connect(&io::Error::from(
+            io::ErrorKind::ConnectionRefused
+        )));
+        assert!(is_retryable_connect(&io::Error::from(
+            io::ErrorKind::TimedOut
+        )));
+        // A protocol/HTTP-shaped error is not a connect retry.
+        assert!(!is_retryable_connect(&io::Error::other("HTTP 500")));
     }
 }
