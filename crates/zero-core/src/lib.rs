@@ -25,6 +25,7 @@ pub mod config;
 pub mod context;
 pub mod discovery;
 pub mod gate;
+pub mod history;
 pub mod http;
 pub mod json;
 pub mod loop_config;
@@ -41,6 +42,7 @@ pub mod sched;
 pub mod servers;
 pub mod session;
 pub mod tools;
+pub mod wins;
 
 pub use backend::{Backend, BackendError, StopReason, StreamEvent, StubBackend};
 pub use clock::{format_duration, Stopwatch};
