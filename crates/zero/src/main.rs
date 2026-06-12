@@ -491,7 +491,7 @@ fn run_loop(
                         deadline_ms,
                         paused: false,
                         event: Event::DoneClaim {
-                            exit_gate_passed: out.gates_all_passed,
+                            exit_gate: out.exit_gate,
                         },
                     });
                     match done {
@@ -805,10 +805,15 @@ mod tests {
         if let Some(p) = config_path() {
             assert!(p.ends_with("config.json"));
         }
-        if let Some(d) = session_dir() {
-            // Now nests a per-project subdir under `sessions/`.
-            assert!(d.to_string_lossy().contains("sessions"));
-            assert!(d.parent().is_some_and(|p| p.ends_with("sessions")));
+        // `session_dir` honors $ZERO_SESSION_DIR; skip the default-layout assertion
+        // when another (parallel) test has it set, so this can't flake on the
+        // process-global env var.
+        if std::env::var_os("ZERO_SESSION_DIR").is_none() {
+            if let Some(d) = session_dir() {
+                // Now nests a per-project subdir under `sessions/`.
+                assert!(d.to_string_lossy().contains("sessions"));
+                assert!(d.parent().is_some_and(|p| p.ends_with("sessions")));
+            }
         }
     }
 

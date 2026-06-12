@@ -25,14 +25,33 @@ use crate::loop_ledger::LedgerSummary;
 /// escalation). Tunable; the structural stop is what matters, not the exact N.
 pub const REPEAT_STOP_ESCALATE: u64 = 3;
 
+/// After this many consecutive wakes that banked the **same** NEXT ACTION, the
+/// loop is present-but-not-progressing — pause and flag rather than spin to the
+/// deadline. High + resumable: a real loop varies its next step; only pure
+/// spinning trips this.
+pub const NO_PROGRESS_PAUSE: u64 = 8;
+
+/// The harness's verdict on a done-claim's exit gate — the crucial distinction
+/// between "measured and failed" and "could not be measured at all".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitGateVerdict {
+    /// A scoreable gate ran and the bar is met.
+    Passed,
+    /// A scoreable gate ran and the bar is NOT met (a false stop).
+    Failed,
+    /// There is no scoreable command gate (e.g. a rubric-only loop) — the harness
+    /// cannot auto-verify, so a done-claim must go to the operator, not be nagged.
+    Unverifiable,
+}
+
 /// What prompted a decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     /// The scheduler is deciding whether to fire the next wake.
     Schedule,
     /// A wake ended with the model claiming the loop is done; the harness ran the
-    /// target/exit gate and reports whether it passed.
-    DoneClaim { exit_gate_passed: bool },
+    /// target/exit gate and reports its verdict.
+    DoneClaim { exit_gate: ExitGateVerdict },
 }
 
 /// Everything the decision needs — all of it pure data.
@@ -77,6 +96,9 @@ pub enum PauseReason {
     MissedStateWrite,
     /// A measured budget (wakes or tokens) was exhausted.
     BudgetExhausted,
+    /// Many consecutive wakes banked the same NEXT ACTION — present, not
+    /// progressing. Pause and flag rather than spin to the deadline.
+    NoProgress,
 }
 
 /// Why a loop stopped.
@@ -94,7 +116,7 @@ pub enum StopReason {
 pub fn decide(input: &TickInput) -> Action {
     match input.event {
         Event::Schedule => decide_schedule(input),
-        Event::DoneClaim { exit_gate_passed } => decide_done(input, exit_gate_passed),
+        Event::DoneClaim { exit_gate } => decide_done(input, exit_gate),
     }
 }
 
@@ -121,6 +143,12 @@ fn decide_schedule(input: &TickInput) -> Action {
     if input.config.contract.require_state_append && !input.summary.last_state_written {
         return Action::Pause(PauseReason::MissedStateWrite);
     }
+    // Present, not progressing: the same next step banked many wakes running. The
+    // contract's NEXT ACTION is satisfied, but nothing is moving — pause and flag
+    // instead of spinning to the deadline.
+    if input.summary.consecutive_repeat_next_action >= NO_PROGRESS_PAUSE {
+        return Action::Pause(PauseReason::NoProgress);
+    }
     Action::Wake
 }
 
@@ -132,18 +160,35 @@ fn budget_exhausted(input: &TickInput) -> bool {
         || matches!(b.max_tokens, Some(m) if s.tokens_spent >= m)
 }
 
-/// Handle a done-claim: a passed exit gate stops; a false stop revitalizes, then
-/// escalates once it repeats.
-fn decide_done(input: &TickInput, exit_gate_passed: bool) -> Action {
-    if exit_gate_passed {
-        return Action::Stop(StopReason::GoalMet);
+/// Handle a done-claim by the harness's exit-gate verdict:
+/// - `Passed` → stop, the goal is met.
+/// - `Unverifiable` → no scoreable gate exists, so the harness can't confirm or
+///   refute — escalate to the operator *immediately* (don't nag a loop whose
+///   completion is by construction un-auto-checkable, e.g. rubric-only).
+/// - `Failed` → a false stop: revitalize with the unmet criterion, escalating to
+///   the operator once it repeats.
+fn decide_done(input: &TickInput, exit_gate: ExitGateVerdict) -> Action {
+    match exit_gate {
+        ExitGateVerdict::Passed => Action::Stop(StopReason::GoalMet),
+        ExitGateVerdict::Unverifiable => Action::EscalateToHuman(format!(
+            "loop claims done but has no scoreable gate to verify it{} — confirm?",
+            input
+                .config
+                .bar
+                .as_ref()
+                .map(|b| format!(" (bar: {})", b.value))
+                .unwrap_or_default()
+        )),
+        ExitGateVerdict::Failed => {
+            // This claim plus the trailing run already on the ledger.
+            let total_claims = input.summary.consecutive_done_claims + 1;
+            if total_claims >= REPEAT_STOP_ESCALATE {
+                Action::EscalateToHuman(escalation_message(input, total_claims))
+            } else {
+                Action::Revitalize(revitalize_message(input))
+            }
+        }
     }
-    // This claim plus the trailing run already on the ledger.
-    let total_claims = input.summary.consecutive_done_claims + 1;
-    if total_claims >= REPEAT_STOP_ESCALATE {
-        return Action::EscalateToHuman(escalation_message(input, total_claims));
-    }
-    Action::Revitalize(revitalize_message(input))
 }
 
 /// "exit gate not satisfied: <failing gates>; bar: <value>" — the specific unmet
@@ -336,7 +381,7 @@ mod tests {
             &c,
             &s,
             Event::DoneClaim {
-                exit_gate_passed: true,
+                exit_gate: ExitGateVerdict::Passed,
             },
         );
         assert_eq!(decide(&i), Action::Stop(StopReason::GoalMet));
@@ -364,7 +409,7 @@ mod tests {
             &c,
             &s,
             Event::DoneClaim {
-                exit_gate_passed: false,
+                exit_gate: ExitGateVerdict::Failed,
             },
         )) {
             Action::Revitalize(msg) => {
@@ -387,7 +432,7 @@ mod tests {
             &c,
             &s,
             Event::DoneClaim {
-                exit_gate_passed: false,
+                exit_gate: ExitGateVerdict::Failed,
             },
         )) {
             Action::EscalateToHuman(msg) => assert!(msg.contains("operator")),
@@ -403,7 +448,7 @@ mod tests {
                 &c,
                 &s2,
                 Event::DoneClaim {
-                    exit_gate_passed: false
+                    exit_gate: ExitGateVerdict::Failed
                 }
             )),
             Action::Revitalize(_)
@@ -423,10 +468,50 @@ mod tests {
                 &c,
                 &s,
                 Event::DoneClaim {
-                    exit_gate_passed: true
+                    exit_gate: ExitGateVerdict::Passed
                 }
             )),
             Action::Stop(StopReason::GoalMet)
         );
+    }
+
+    #[test]
+    fn unverifiable_done_claim_escalates_immediately_not_nag() {
+        // A rubric-only / no-gate loop can't be auto-verified, so a done-claim goes
+        // straight to the operator — never the revitalize-forever nag.
+        let c = cfg();
+        let s = LedgerSummary::default(); // no prior claims
+        match decide(&input(
+            &c,
+            &s,
+            Event::DoneClaim {
+                exit_gate: ExitGateVerdict::Unverifiable,
+            },
+        )) {
+            Action::EscalateToHuman(msg) => assert!(msg.contains("no scoreable gate"), "{msg}"),
+            other => panic!("expected escalation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_progress_pauses_a_spinning_loop() {
+        let c = cfg();
+        // Many wakes banking the same NEXT ACTION = present, not progressing.
+        let s = LedgerSummary {
+            last_state_written: true,
+            consecutive_repeat_next_action: NO_PROGRESS_PAUSE,
+            ..Default::default()
+        };
+        assert_eq!(
+            decide(&input(&c, &s, Event::Schedule)),
+            Action::Pause(PauseReason::NoProgress)
+        );
+        // One short of the threshold still makes progress-of-the-doubt and wakes.
+        let s2 = LedgerSummary {
+            last_state_written: true,
+            consecutive_repeat_next_action: NO_PROGRESS_PAUSE - 1,
+            ..Default::default()
+        };
+        assert_eq!(decide(&input(&c, &s2, Event::Schedule)), Action::Wake);
     }
 }

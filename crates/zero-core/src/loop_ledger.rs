@@ -40,7 +40,10 @@ pub struct TickRow {
     pub state_written: bool,
     /// Did the model claim the loop is done this wake?
     pub done_claimed: bool,
-    /// Freeform note (revitalized / escalated / compacted …).
+    /// The NEXT ACTION the wake banked (empty if none) — used to detect a loop
+    /// that is *present but not progressing* (the same next step every wake).
+    pub next_action: String,
+    /// Freeform note (revitalized / escalated / compacted / backend error …).
     pub note: String,
 }
 
@@ -65,6 +68,7 @@ impl TickRow {
             ("gates".into(), Value::Array(gates)),
             ("state_written".into(), Value::Bool(self.state_written)),
             ("done_claimed".into(), Value::Bool(self.done_claimed)),
+            ("next_action".into(), Value::Str(self.next_action.clone())),
             ("note".into(), Value::Str(self.note.clone())),
         ])
     }
@@ -99,6 +103,11 @@ impl TickRow {
             gates,
             state_written: boolean("state_written"),
             done_claimed: boolean("done_claimed"),
+            next_action: v
+                .get("next_action")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
             note: v
                 .get("note")
                 .and_then(Value::as_str)
@@ -179,6 +188,9 @@ pub struct LedgerSummary {
     pub last_state_written: bool,
     /// Trailing run of consecutive done-claims (drives repeated-stop escalation).
     pub consecutive_done_claims: u64,
+    /// Trailing run of wakes that banked the **same** non-empty NEXT ACTION —
+    /// "present but not progressing". Drives a no-progress pause.
+    pub consecutive_repeat_next_action: u64,
     /// The most recent wake's gate results (empty if none).
     pub last_gates: Vec<GateRecord>,
 }
@@ -195,12 +207,22 @@ pub fn summarize(rows: &[TickRow]) -> LedgerSummary {
     let tokens_spent = rows.iter().map(|r| r.tokens).sum();
     let last_state_written = rows.last().map(|r| r.state_written).unwrap_or(true);
     let consecutive_done_claims = rows.iter().rev().take_while(|r| r.done_claimed).count() as u64;
+    // Trailing run of identical, non-empty next actions = present but not progressing.
+    let consecutive_repeat_next_action = match rows.last() {
+        Some(last) if !last.next_action.trim().is_empty() => rows
+            .iter()
+            .rev()
+            .take_while(|r| r.next_action == last.next_action)
+            .count() as u64,
+        _ => 0,
+    };
     let last_gates = rows.last().map(|r| r.gates.clone()).unwrap_or_default();
     LedgerSummary {
         wakes: rows.len() as u64,
         tokens_spent,
         last_state_written,
         consecutive_done_claims,
+        consecutive_repeat_next_action,
         last_gates,
     }
 }
@@ -283,6 +305,21 @@ mod tests {
         assert_eq!(s.tokens_spent, 400);
         assert!(s.last_state_written);
         assert_eq!(s.consecutive_done_claims, 0);
+    }
+
+    #[test]
+    fn summary_counts_repeated_next_action_as_no_progress() {
+        let mut rows = vec![row(1, 10), row(2, 10), row(3, 10), row(4, 10)];
+        rows[0].next_action = "different".into();
+        for r in &mut rows[1..] {
+            r.next_action = "instrument the qkv bucket".into(); // same 3 wakes running
+        }
+        let s = summarize(&rows);
+        assert_eq!(s.consecutive_repeat_next_action, 3);
+        // An empty next action doesn't count as a stall.
+        let mut blank = vec![row(1, 10)];
+        blank[0].next_action = String::new();
+        assert_eq!(summarize(&blank).consecutive_repeat_next_action, 0);
     }
 
     #[test]

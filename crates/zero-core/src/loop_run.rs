@@ -16,6 +16,7 @@ use crate::backend::Backend;
 use crate::gate::{self, GateKind};
 use crate::loop_config::LoopConfig;
 use crate::loop_ledger::{GateRecord, TickRow};
+use crate::loop_runner::ExitGateVerdict;
 use crate::loop_store::{LoopStore, StateRow};
 use crate::message::{Conversation, Message};
 use std::io;
@@ -45,6 +46,11 @@ impl<F: FnMut(&str) -> (String, i32)> GateRunner for F {
     }
 }
 
+/// Max bytes of a state row's first line carried into the next wake's prompt, so
+/// an unbounded `body` can't blow the context (the state tail is capped by *size*,
+/// not just row count).
+const STATE_LINE_CAP: usize = 240;
+
 /// The result of one wake — what the caller (scheduler) reasons over next.
 #[derive(Debug, Clone)]
 pub struct WakeOutcome {
@@ -53,9 +59,10 @@ pub struct WakeOutcome {
     pub reply: String,
     /// Did the model claim the loop is done this wake?
     pub done_claimed: bool,
-    /// Did **every** command gate pass (and was there at least one)? This is the
-    /// exit-gate signal for a done-claim — an unmeasured loop can never be "done".
-    pub gates_all_passed: bool,
+    /// The harness's exit-gate verdict — `Passed` (a scoreable gate met the bar),
+    /// `Failed` (it didn't), or `Unverifiable` (no scoreable command gate, so a
+    /// done-claim can't be auto-checked and must go to the operator).
+    pub exit_gate: ExitGateVerdict,
     /// The tick row the harness banked.
     pub tick: TickRow,
 }
@@ -85,8 +92,8 @@ pub fn assemble_wake_prompt(
             p.push_str(&format!(
                 "- wake {}: {} → NEXT: {}\n",
                 r.wake,
-                first_line(&r.body),
-                r.next_action
+                cap_line(first_line(&r.body)),
+                cap_line(r.next_action.trim())
             ));
         }
     }
@@ -97,6 +104,17 @@ pub fn assemble_wake_prompt(
 
 fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("").trim()
+}
+
+/// Truncate to [`STATE_LINE_CAP`] chars (char-safe) so one bloated state row can't
+/// dominate the wake prompt.
+fn cap_line(s: &str) -> String {
+    if s.chars().count() <= STATE_LINE_CAP {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(STATE_LINE_CAP).collect();
+        format!("{cut}…")
+    }
 }
 
 /// Run one wake: assemble the prompt, call the model, run the command gates, bank a
@@ -123,17 +141,34 @@ pub fn run_wake(
     let mut conv = Conversation::new();
     conv.push(Message::user(prompt));
 
-    // 2. One model call.
-    let completion = backend
-        .complete(&conv, &[], WAKE_TIMEOUT)
-        .map_err(|e| io::Error::other(format!("backend: {e}")))?;
+    // 2. One model call. A backend error/timeout still **banks a tick** before it
+    //    surfaces, so a hung model counts against the wake/token budget and the
+    //    deadline — the meter can never read zero while wall-clock burns.
+    let completion = match backend.complete(&conv, &[], WAKE_TIMEOUT) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = store.ledger().and_then(|mut l| {
+                l.append(TickRow {
+                    ts_ms: now_ms,
+                    wake,
+                    elapsed_ms: sw.elapsed().as_millis() as u64,
+                    state_written: false,
+                    note: format!("backend error: {e}"),
+                    ..Default::default()
+                })
+            });
+            return Err(io::Error::other(format!("backend: {e}")));
+        }
+    };
     let reply = completion.content;
     let tokens = completion.usage.map(|u| u.total()).unwrap_or(0);
 
     // 3. The harness runs the command gates (rubric gates are judged elsewhere).
     let mut gate_records = Vec::new();
+    let mut has_command_gate = false;
     for g in &config.gates {
         if g.kind == GateKind::Command && !g.run.trim().is_empty() {
+            has_command_gate = true;
             let (out, code) = gates.run(&g.run);
             let o = gate::evaluate(g, &out, code);
             gate_records.push(GateRecord {
@@ -143,20 +178,30 @@ pub fn run_wake(
             });
         }
     }
-    let gates_all_passed = !gate_records.is_empty() && gate_records.iter().all(|g| g.passed);
+    // The exit-gate verdict: no scoreable gate ⇒ Unverifiable (a done-claim can't
+    // be auto-confirmed); else Passed iff every command gate met its bar.
+    let exit_gate = if !has_command_gate {
+        ExitGateVerdict::Unverifiable
+    } else if gate_records.iter().all(|g| g.passed) {
+        ExitGateVerdict::Passed
+    } else {
+        ExitGateVerdict::Failed
+    };
 
     // 4. Extract the model's state row + done-claim from its reply.
     let parsed = parse_wake_reply(&reply);
+    let next_action = parsed.next_action.clone().unwrap_or_default();
     let state_written = parsed.next_action.is_some();
     if state_written || !parsed.body.trim().is_empty() {
         let _ = store.append_state(&StateRow {
             wake,
             body: parsed.body.clone(),
-            next_action: parsed.next_action.clone().unwrap_or_default(),
+            next_action: next_action.clone(),
         });
     }
 
-    // 5. Bank the tick.
+    // 5. Bank the tick (records the NEXT ACTION so the harness can spot a loop that
+    //    keeps banking the same step — present but not progressing).
     let tick = TickRow {
         ts_ms: now_ms,
         wake,
@@ -165,6 +210,7 @@ pub fn run_wake(
         gates: gate_records,
         state_written,
         done_claimed: parsed.done_claimed,
+        next_action,
         note: String::new(),
     };
     store.ledger()?.append(tick.clone())?;
@@ -173,7 +219,7 @@ pub fn run_wake(
         wake,
         reply,
         done_claimed: parsed.done_claimed,
-        gates_all_passed,
+        exit_gate,
         tick,
     })
 }
@@ -190,9 +236,11 @@ struct ParsedReply {
 /// (in which case `next_action` is `None` → the harness records a missed state
 /// write and pauses, rather than barrelling on).
 fn parse_wake_reply(reply: &str) -> ParsedReply {
-    let done_claimed = reply
-        .lines()
-        .any(|l| l.trim().to_ascii_uppercase().starts_with("LOOP DONE"));
+    // Done-claim is fenced: a line that, trimmed and uppercased, is **exactly**
+    // `LOOP DONE`. So "LOOP DONE until the bar is met" or a quoted/recalled mention
+    // is not a claim — only the bare marker on its own line is.
+    let is_done = |l: &str| l.trim().eq_ignore_ascii_case("LOOP DONE");
+    let done_claimed = reply.lines().any(is_done);
 
     let mut next_action = None;
     let mut body_lines = Vec::new();
@@ -205,7 +253,7 @@ fn parse_wake_reply(reply: &str) -> ParsedReply {
             next_action = Some(val.to_string());
         } else if upper.starts_with("STATE:") {
             body_lines.push(t["STATE:".len()..].trim());
-        } else if !upper.starts_with("LOOP DONE") {
+        } else if !is_done(t) {
             body_lines.push(t);
         }
     }
@@ -313,7 +361,11 @@ mod tests {
         let out = run_wake(&store, &backend, &mut runner, 1, 1000).unwrap();
 
         assert!(out.done_claimed);
-        assert!(out.gates_all_passed, "gate should pass at 0.995");
+        assert_eq!(
+            out.exit_gate,
+            ExitGateVerdict::Passed,
+            "gate should pass at 0.995"
+        );
         assert_eq!(out.tick.gates[0].actual, "0.995");
         // The done-claim with a passing exit gate → GoalMet.
         let cfg = store.config().unwrap();
@@ -325,7 +377,7 @@ mod tests {
             deadline_ms: None,
             paused: false,
             event: Event::DoneClaim {
-                exit_gate_passed: out.gates_all_passed,
+                exit_gate: out.exit_gate,
             },
         });
         assert_eq!(action, Action::Stop(RunStop::GoalMet));
@@ -344,7 +396,11 @@ mod tests {
         let mut runner = |_cmd: &str| (r#"{"cosine": 0.91}"#.to_string(), 0);
         let out = run_wake(&store, &backend, &mut runner, 1, 1000).unwrap();
         assert!(out.done_claimed);
-        assert!(!out.gates_all_passed, "0.91 < 0.99 must fail the gate");
+        assert_eq!(
+            out.exit_gate,
+            ExitGateVerdict::Failed,
+            "0.91 < 0.99 must fail the gate"
+        );
 
         let cfg = store.config().unwrap();
         let summary = store.ledger().unwrap().summary();
@@ -355,7 +411,7 @@ mod tests {
             deadline_ms: None,
             paused: false,
             event: Event::DoneClaim {
-                exit_gate_passed: out.gates_all_passed,
+                exit_gate: out.exit_gate,
             },
         });
         // Not a stop — a revitalize carrying the unmet criterion.
@@ -422,5 +478,90 @@ mod tests {
         let none = parse_wake_reply("no markers at all");
         assert!(!none.done_claimed);
         assert!(none.next_action.is_none());
+    }
+
+    #[test]
+    fn loop_done_is_fenced_to_an_exact_line() {
+        // A marker embedded in prose / with trailing words is NOT a done-claim.
+        assert!(!parse_wake_reply("I will write LOOP DONE until the bar is met").done_claimed);
+        assert!(!parse_wake_reply("the spec says to emit `LOOP DONE`").done_claimed);
+        // Only the bare marker on its own line counts.
+        assert!(parse_wake_reply("STATE: done\nNEXT ACTION: x\nLOOP DONE").done_claimed);
+        assert!(parse_wake_reply("  loop done  ").done_claimed); // trim + case ok
+    }
+
+    #[test]
+    fn backend_error_still_banks_a_wake() {
+        // A hung/erroring model must still count against budget/deadline — the tick
+        // is banked before the error surfaces, so wakes can't read zero forever.
+        struct FailBackend;
+        impl Backend for FailBackend {
+            fn name(&self) -> &str {
+                "fail"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                s: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), BackendError> {
+                s(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+            fn complete(
+                &self,
+                _c: &Conversation,
+                _t: &[crate::tools::ToolDef],
+                _to: Duration,
+            ) -> Result<Completion, BackendError> {
+                Err(BackendError("connection refused".to_string()))
+            }
+        }
+        let root = tmp("err");
+        let store = LoopStore::at(&root, "x");
+        store.create("mission", TOML, "").unwrap();
+        let mut runner = |_cmd: &str| ("{}".to_string(), 0);
+        let res = run_wake(&store, &FailBackend, &mut runner, 1, 1000);
+        assert!(res.is_err(), "backend error should surface");
+        // …but a tick was banked so the budget meter moved.
+        let led = store.ledger().unwrap();
+        assert_eq!(led.rows().len(), 1, "the failed wake was still counted");
+        assert!(led.rows()[0].note.contains("backend error"));
+        assert_eq!(led.summary().wakes, 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_rubric_only_loop_is_unverifiable() {
+        // No command gate ⇒ the harness can't auto-verify a done-claim.
+        let root = tmp("rubric");
+        let store = LoopStore::at(&root, "topical");
+        store
+            .create(
+                "track a subject",
+                "[[gate]]\nname=\"writeup\"\nkind=\"rubric\"\nrubric=\"criteria.md\"\n",
+                "",
+            )
+            .unwrap();
+        let backend = ScriptBackend::new(&["STATE: tracked it\nNEXT ACTION: report\nLOOP DONE"]);
+        let mut runner = |_cmd: &str| (String::new(), 0);
+        let out = run_wake(&store, &backend, &mut runner, 1, 1000).unwrap();
+        assert_eq!(out.exit_gate, ExitGateVerdict::Unverifiable);
+        // A done-claim on an unverifiable loop escalates to the operator, not a nag.
+        let cfg = store.config().unwrap();
+        let summary = store.ledger().unwrap().summary();
+        assert!(matches!(
+            decide(&TickInput {
+                config: &cfg,
+                summary: &summary,
+                now_ms: 1000,
+                deadline_ms: None,
+                paused: false,
+                event: Event::DoneClaim {
+                    exit_gate: out.exit_gate
+                },
+            }),
+            Action::EscalateToHuman(_)
+        ));
+        std::fs::remove_dir_all(&root).ok();
     }
 }

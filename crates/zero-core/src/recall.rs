@@ -150,17 +150,27 @@ pub fn hamming(a: &[u64], b: &[u64]) -> u32 {
         + (a.len().abs_diff(b.len()) as u32 * 64)
 }
 
-/// A binary-quantized semantic index: external id → packed sign-vector. Search is
-/// Hamming-nearest, optionally restricted to an allowlist (the lexical stage's
-/// candidates) — the filter is honored *inside* the scan, not applied after.
+/// A binary-quantized semantic index, **tagged with the embedding model that built
+/// it**. Vectors are only comparable within one embedding space, so the index
+/// records `model_id` + `dim` and refuses to score a query from a different model
+/// or dimension — old 1-bit vectors against new-space queries return confident
+/// garbage (the worst failure: looks like it works). A mismatch is loud-stale, not
+/// silently wrong; the caller falls back to lexical recall until rehydrated.
 #[derive(Debug, Default)]
 pub struct Semantic {
+    model_id: String,
+    dim: usize,
     vecs: Vec<(u64, Vec<u64>)>,
 }
 
 impl Semantic {
-    pub fn new() -> Semantic {
-        Semantic::default()
+    /// A new index for embeddings from `model_id` of dimension `dim`.
+    pub fn new(model_id: &str, dim: usize) -> Semantic {
+        Semantic {
+            model_id: model_id.to_string(),
+            dim,
+            vecs: Vec::new(),
+        }
     }
     pub fn len(&self) -> usize {
         self.vecs.len()
@@ -168,21 +178,43 @@ impl Semantic {
     pub fn is_empty(&self) -> bool {
         self.vecs.is_empty()
     }
-
-    /// Index `id`'s embedding (quantized on the way in).
-    pub fn add(&mut self, id: u64, embedding: &[f32]) {
-        self.vecs.push((id, quantize_sign(embedding)));
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+    pub fn dim(&self) -> usize {
+        self.dim
     }
 
-    /// The `k` nearest ids to `query_embedding` by Hamming distance (closest
-    /// first). If `allowlist` is `Some`, only those ids are scored — the two-stage
-    /// pre-filter (lexical narrows, dense reranks within).
+    /// Is this index usable for a query from `(model_id, dim)`? A mismatch means the
+    /// embedding model was swapped — the index is **stale** and must not be scored.
+    pub fn is_compatible(&self, model_id: &str, dim: usize) -> bool {
+        self.model_id == model_id && self.dim == dim
+    }
+
+    /// Index `id`'s embedding (quantized on the way in). Embeddings of the wrong
+    /// dimension are rejected (returns `false`) rather than silently mis-packed.
+    pub fn add(&mut self, id: u64, embedding: &[f32]) -> bool {
+        if embedding.len() != self.dim {
+            return false;
+        }
+        self.vecs.push((id, quantize_sign(embedding)));
+        true
+    }
+
+    /// The `k` nearest ids to a query from `(query_model, query_dim)`, closest
+    /// first. **Returns empty (never wrong results) if the index is stale** — built
+    /// by a different embedding model or dimension than the query. If `allowlist`
+    /// is `Some`, only those ids are scored (lexical narrows, dense reranks within).
     pub fn search(
         &self,
         query_embedding: &[f32],
+        query_model: &str,
         k: usize,
         allowlist: Option<&HashSet<u64>>,
     ) -> Vec<(u64, u32)> {
+        if !self.is_compatible(query_model, query_embedding.len()) {
+            return Vec::new(); // stale: refuse to score across embedding spaces
+        }
         let q = quantize_sign(query_embedding);
         let mut hits: Vec<(u64, u32)> = self
             .vecs
@@ -280,11 +312,11 @@ mod tests {
 
     #[test]
     fn semantic_search_returns_nearest_first() {
-        let mut s = Semantic::new();
+        let mut s = Semantic::new("emb-v1", 4);
         s.add(1, &[1.0, 1.0, 1.0, 1.0]);
         s.add(2, &[1.0, 1.0, 1.0, -1.0]); // 1 bit off the query
         s.add(3, &[-1.0, -1.0, -1.0, -1.0]); // far
-        let hits = s.search(&[1.0, 1.0, 1.0, 1.0], 3, None);
+        let hits = s.search(&[1.0, 1.0, 1.0, 1.0], "emb-v1", 3, None);
         assert_eq!(hits[0].0, 1);
         assert_eq!(hits[0].1, 0);
         assert_eq!(hits[1].0, 2);
@@ -293,13 +325,32 @@ mod tests {
 
     #[test]
     fn semantic_search_honors_the_allowlist() {
-        let mut s = Semantic::new();
+        let mut s = Semantic::new("emb-v1", 4);
         s.add(1, &[1.0, 1.0, 1.0, 1.0]); // the closest
         s.add(2, &[1.0, 1.0, 1.0, -1.0]);
         // Restrict to {2}: even though 1 is closer, it's filtered out.
-        let hits = s.search(&[1.0, 1.0, 1.0, 1.0], 5, Some(&set(&[2])));
+        let hits = s.search(&[1.0, 1.0, 1.0, 1.0], "emb-v1", 5, Some(&set(&[2])));
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, 2);
+    }
+
+    #[test]
+    fn semantic_refuses_a_stale_index_after_model_swap() {
+        // The model-swap silent-wrong failure: old-space vectors must NOT be scored
+        // against a new-space query. A mismatch returns empty (loud-stale).
+        let mut s = Semantic::new("emb-v1", 4);
+        s.add(1, &[1.0, 1.0, 1.0, 1.0]);
+        // Same dim, DIFFERENT model → refused.
+        assert!(s
+            .search(&[1.0, 1.0, 1.0, 1.0], "emb-v2", 5, None)
+            .is_empty());
+        // Different dim → refused.
+        assert!(s.search(&[1.0, 1.0, 1.0], "emb-v1", 5, None).is_empty());
+        // Same model + dim → works.
+        assert_eq!(s.search(&[1.0, 1.0, 1.0, 1.0], "emb-v1", 5, None).len(), 1);
+        // A wrong-dim embedding is rejected at add time, not silently mis-packed.
+        assert!(!s.add(9, &[1.0, 1.0]));
+        assert_eq!(s.len(), 1);
     }
 
     #[test]
@@ -316,11 +367,11 @@ mod tests {
             .collect();
         assert!(cands.contains(&1) && cands.contains(&2) && !cands.contains(&3));
 
-        let mut sem = Semantic::new();
+        let mut sem = Semantic::new("emb-v1", 3);
         sem.add(1, &[1.0, 1.0, -1.0]);
         sem.add(2, &[1.0, -1.0, -1.0]);
         sem.add(3, &[-1.0, -1.0, -1.0]);
-        let reranked = sem.search(&[1.0, 1.0, -1.0], 5, Some(&cands));
+        let reranked = sem.search(&[1.0, 1.0, -1.0], "emb-v1", 5, Some(&cands));
         assert_eq!(reranked[0].0, 1); // closest within the allowlist
         assert!(reranked.iter().all(|(id, _)| *id != 3)); // 3 was filtered out
     }

@@ -14,6 +14,9 @@
 use crate::loop_config::parse_duration;
 
 const MS_PER_DAY: u64 = 86_400_000;
+/// Floor on a recurring `every <dur>` interval — a `0s`/`1ms` spec must not become
+/// a wake storm. The shortest a trigger can recur is one second.
+pub const MIN_INTERVAL_MS: u64 = 1000;
 
 /// Days from 1970-01-01 to the civil date `y-m-d` (proleptic Gregorian). Negative
 /// before the epoch. Hinnant's algorithm — exact, branch-light, no leap tables.
@@ -127,7 +130,9 @@ pub fn next_fire(when: &str, after_ms: u64) -> Option<u64> {
     let when = when.trim();
     if let Some(dur) = when.strip_prefix("every ") {
         let d = parse_duration(dur.trim())?;
-        return after_ms.checked_add(d.as_millis() as u64);
+        // Clamp to the floor so `every 0s` / `every 1ms` can't storm the scheduler.
+        let interval = (d.as_millis() as u64).max(MIN_INTERVAL_MS);
+        return after_ms.checked_add(interval);
     }
     if let Some(ts) = when.strip_prefix("at ") {
         let fire = parse_rfc3339(ts.trim())?;
@@ -222,6 +227,14 @@ mod tests {
         assert_eq!(next_fire("every 6h", base), Some(base + 6 * 3600 * 1000));
         assert_eq!(next_fire("every 30m", base), Some(base + 1800 * 1000));
         assert_eq!(next_fire("every nonsense", base), None);
+    }
+
+    #[test]
+    fn next_fire_every_clamps_to_a_minimum_interval() {
+        let base = 1_000_000_000_000;
+        // `every 0s` / `every 1ms` must not storm — clamped to the 1s floor.
+        assert_eq!(next_fire("every 0s", base), Some(base + MIN_INTERVAL_MS));
+        assert_eq!(next_fire("every 0", base), Some(base + MIN_INTERVAL_MS));
     }
 
     #[test]
