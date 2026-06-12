@@ -36,6 +36,7 @@ pub mod loop_store;
 pub mod mcp;
 pub mod message;
 pub mod openai;
+pub mod recall;
 pub mod rules;
 pub mod safety;
 pub mod sched;
