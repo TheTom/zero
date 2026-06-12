@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! The agentic tool-call layer: tool definitions, robust parsing of a model's
 //! tool calls (structured OR text-fallback), and the request-building + result
 //! plumbing for the loop. Pure and std-only; the actual execution of a tool and

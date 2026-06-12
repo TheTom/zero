@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! A tiny, std-only HTTP/1.1 client — just enough to POST a JSON body and read
 //! a streaming (chunked) Server-Sent-Events response. No TLS: Zero is local-first
 //! and talks to a model server on the LAN over plain `http://`.

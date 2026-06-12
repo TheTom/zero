@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Chat message types, modeled on the OpenAI-compatible chat schema since that
 //! is Zero's first backend target (local qwen via llama.cpp / vLLM / Ollama
 //! shim). Kept backend-agnostic enough that an Ollama-native adapter can map

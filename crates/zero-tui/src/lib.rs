@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! `zero-tui` — Zero's terminal frontend, dependency-free.
 //!
 //! Layered as functional-core / imperative-shell:

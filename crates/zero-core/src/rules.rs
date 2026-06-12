@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Project-instruction **rules** — the enforce layer (Slice 1: Registry + Gate).
 //!
 //! Two inputs, two mechanisms (see `docs/design/rules-prd.md`):

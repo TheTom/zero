@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Live-model integration: drive the REAL model through the headless harness and
 //! verify it can use the `bash` tool and relay deterministic output.
 //!

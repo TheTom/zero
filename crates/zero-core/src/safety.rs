@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Destructive-command guard.
 //!
 //! The hard lesson from every other harness is that *soft* rules in a prompt or

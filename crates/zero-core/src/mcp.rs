@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! MCP (Model Context Protocol) client over the stdio transport — zero-dep.
 //!
 //! An MCP server is a subprocess that speaks JSON-RPC 2.0 over its stdin/stdout,

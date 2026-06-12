@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Deterministic bash replay suite — drives the **real** agentic executor through
 //! the public headless API ([`App::run_once`]) with a scripted backend that emits
 //! bash tool calls, then asserts the no-useful-information-lost contract on what

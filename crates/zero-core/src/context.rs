@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Context-efficiency primitives for the agentic tool loop.
 //!
 //! Local models have small windows (8–32K), and measurement of real agentic

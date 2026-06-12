@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! The locally-saved list of known model servers (`~/.zero/servers.json`).
 //!
 //! Discovery writes here; the app reads it to let you re-attach without

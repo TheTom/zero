@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! `zero-core` — the dependency-free engine behind Zero.
 //!
 //! Zero is a local-first AI coding harness. The *core* holds everything that is

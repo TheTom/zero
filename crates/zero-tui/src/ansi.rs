@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! ANSI-aware text measurement and wrapping for the full-screen renderer.
 //!
 //! The inline renderer never needed this — it let the terminal wrap. The

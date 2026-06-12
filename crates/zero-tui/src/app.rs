@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! The interactive REPL: wires an input source, key decoder, line editor, and a
 //! [`Backend`] into Claude-Code-style inline rendering.
 //!

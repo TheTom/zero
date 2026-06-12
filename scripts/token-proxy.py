@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 """Tiny pass-through proxy that records server-reported token usage.
 
 Why this exists: the Zero-vs-Hermes bench needs *apples-to-apples* token counts

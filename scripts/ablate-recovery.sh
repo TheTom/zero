@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 # Recovery-policy ablation: when the guard detects a stuck loop, what works best —
 # STOP (abandon), NUDGE (inject guidance, current default), or RESET (discard the
 # polluted history and restart from task + concrete progress summary)?

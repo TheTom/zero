@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 # Pre-context mimicry test: does feeding ZERO'S model the relevant parts of
 # HERMES'S 21.6KB system prompt move code quality? Hypothesis from the teardown:
 # Hermes's prompt is 65% skills-catalog + 30% memory/persona/CLI-format — almost

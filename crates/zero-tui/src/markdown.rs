@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! A tiny streaming Markdown → ANSI renderer for assistant output, plus a
 //! fenced-code-block extractor for per-section copy (`/clip <n>`).
 //!

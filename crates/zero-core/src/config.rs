@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! User configuration — the `~/.zero/config.json` file, like pi/hermes use,
 //! plus the merge with command-line overrides. Stored as JSON (parsed by our
 //! own [`crate::json`]) so there are still zero dependencies.

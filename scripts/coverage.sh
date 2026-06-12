@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 # Coverage gate for Zero. Fails if line/function/region coverage drops below 95%.
 #
 # The imperative I/O shell is excluded because it cannot run without a real tty

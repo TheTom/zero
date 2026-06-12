@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! LAN discovery of OpenAI-compatible model servers.
 //!
 //! Scans the local `/24` subnet on a handful of common LLM-server ports, GETs

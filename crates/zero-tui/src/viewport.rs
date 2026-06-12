@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Scrollback buffer + word wrapping — the pure model behind the output pane.
 //!
 //! Width is measured in `char`s (one column per scalar). That is correct for

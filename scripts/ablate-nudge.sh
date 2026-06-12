@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 # Nudge ablation: when the guard fires, which WORDING makes the model converge
 # fastest? Two axes — tone (soft / firm-negative+redirect) × specificity (generic /
 # names-the-stuck-action) — so 4 variants, plus the shipped default as a control.

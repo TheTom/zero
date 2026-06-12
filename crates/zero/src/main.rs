@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! `zero` — entry point for the local-first AI terminal.
 //!
 //! Loads `~/.zero/config.json` (creating an example on first run), lets CLI

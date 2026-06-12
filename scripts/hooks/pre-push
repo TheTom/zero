@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 # Zero pre-push gate. Blocks the push unless ALL hold:
 #   1. No Claude / AI authorship in any pushed commit (author, committer, or
 #      Co-Authored-By trailer).

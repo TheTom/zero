@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 """Soft-rule decay eval: does a *projected* rule survive N turns on a local model?
 
 Zero enforces hard rules in code (the Gate, deterministic). Soft rules are only

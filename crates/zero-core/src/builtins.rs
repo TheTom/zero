@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Built-in tools the model can call: the filesystem + search primitives every
 //! coding agent needs. Each is defined ([`ToolDef`]) and executed here, so the
 //! capability lives in the engine (terminal and a future app share it).

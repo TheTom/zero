@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! The imperative shell around the pure input/output models: raw-mode terminal
 //! control via libc, with zero crates. We declare the handful of `termios` /
 //! `ioctl` symbols ourselves rather than pulling in the `libc` crate — they are

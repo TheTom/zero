@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Terminal input decoding: raw byte stream → [`Key`] events.
 //!
 //! This is the pure heart of input handling — no I/O, no terminal state — so it

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Single source of truth for the product name.
 //!
 //! The name "Zero" is **not final**. Everything user-facing — the banner, the

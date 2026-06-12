@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! The agentic tool-call loop driver.
 //!
 //! Pure orchestration: it owns the send → detect-calls → execute → feed-back →

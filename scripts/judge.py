@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 """Blind, position-debiased LLM judge for comparing two deliverables on quality.
 
 The point: token efficiency is meaningless without a quality comparison. This

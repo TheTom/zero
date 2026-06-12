@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Minimal, std-only JSON. Enough for OpenAI-compatible chat payloads and
 //! JSONL session logs — not a general-purpose library.
 //!

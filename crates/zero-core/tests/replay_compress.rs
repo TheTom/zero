@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Replay harness: run tool outputs shaped like the ones in real session logs
 //! through the compressor and assert the before/after contract.
 //!

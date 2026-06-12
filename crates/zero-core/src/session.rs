@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Append-only JSONL session transcripts. Every line is one self-contained
 //! JSON object stamped with a **real** wall-clock millisecond timestamp — the
 //! logging north star: rich, honest, replayable, no invented numbers.

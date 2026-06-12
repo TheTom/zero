@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 # System-prompt ablation: which minimal prompt delta recovers code QUALITY, and
 # what does it cost in tokens? One independent variable (the system prompt),
 # additive arms, same gx10 model, blind same-model judge (scripts/judge.py).

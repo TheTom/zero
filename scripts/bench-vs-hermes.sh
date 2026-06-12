@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 # Compare Zero vs Hermes on identical prompts over N iterations against the SAME
 # model endpoint (gx10), to measure whether Zero's tool-output compression saves
 # tokens on agentic tasks. On-demand benchmark — NOT a gate test (a real model is

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! An OpenAI-compatible streaming chat backend (llama.cpp / vLLM / Ollama shim).
 //! Builds the `/v1/chat/completions` request from a [`Conversation`], POSTs it
 //! with `stream: true` via [`crate::http`], and turns the SSE `data:` deltas

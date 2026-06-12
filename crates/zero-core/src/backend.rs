@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! The model-backend abstraction. Everything the TUI needs from "a model" is
 //! behind the [`Backend`] trait, so the terminal and (future) app frontends are
 //! identical from the engine's side, and the real OpenAI-compatible HTTP client

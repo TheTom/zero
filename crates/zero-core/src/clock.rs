@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Honest time. Zero's north star on timestamps: **measure, never estimate.**
 //! Nothing here predicts how long anything "will take" — it only reports real
 //! elapsed durations from a monotonic source, formatted for humans.

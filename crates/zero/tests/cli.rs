@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Black-box integration tests for the `zero` binary.
 //!
 //! These spawn the *actual compiled binary* (`CARGO_BIN_EXE_zero`) as a

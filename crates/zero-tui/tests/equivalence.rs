@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! Equivalence proof: SAME model behaviour, SAME final answer, FEWER tokens.
 //!
 //! The project goal is to show Zero gets *equivalent data* from a model while

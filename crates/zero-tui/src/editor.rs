@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+
 //! A single-line input editor with readline-style editing and history.
 //!
 //! Pure model: it owns a character buffer and a cursor and exposes operations
