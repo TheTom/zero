@@ -58,6 +58,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/logs", "show where this session's logs + artifacts live"),
     ("/sessions", "list saved sessions for this project"),
     ("/resume", "resume a saved session: /resume <id>"),
+    (
+        "/loops",
+        "list agent loops (run them: zero loop run <name>)",
+    ),
     ("/quit", "leave Zero"),
     ("/exit", "leave Zero"),
 ];
@@ -339,6 +343,9 @@ pub struct App<I: Input, W: Write> {
     /// Path to this session's transcript, so `/logs` can show the user exactly
     /// where it is. `None` when logging is off (`--no-log`) or in tests.
     log_path: Option<PathBuf>,
+    /// Where loops live (`~/.{slug}/loops`), so `/loops` and `/loop tail` can
+    /// inspect them from the chat. Set by the binary.
+    loops_dir: Option<PathBuf>,
     /// Project rules + soft prose + warnings, discovered at config time. The rules
     /// drive the Gate at the tool boundary; the soft prose feeds the Projector.
     registry: zero_core::rules::Registry,
@@ -399,6 +406,7 @@ impl<I: Input, W: Write> App<I, W> {
             context_stats: zero_core::context::ContextStats::new(),
             artifact_dir: None,
             log_path: None,
+            loops_dir: None,
             registry: zero_core::rules::Registry::default(),
             rules_block: String::new(),
         }
@@ -465,6 +473,11 @@ impl<I: Input, W: Write> App<I, W> {
     /// Tell the app where its transcript lives, so `/logs` can surface it.
     pub fn set_log_path(&mut self, path: Option<PathBuf>) {
         self.log_path = path;
+    }
+
+    /// Tell the app where loops live, so `/loops` and `/loop tail` can inspect them.
+    pub fn set_loops_dir(&mut self, dir: Option<PathBuf>) {
+        self.loops_dir = dir;
     }
 
     /// Preload a conversation (used by `resume` to continue a prior session).
@@ -659,6 +672,72 @@ impl<I: Input, W: Write> App<I, W> {
                 d.display()
             )),
             None => out.push_str("artifacts:  (none this session)\n"),
+        }
+        self.write_text(&format!("\x1b[2m{out}\x1b[0m"))
+    }
+
+    /// `/loops` — list loops and their progress (read-only; running a loop is the
+    /// headless `zero loop run`, which doesn't block the chat UI).
+    fn loops_command(&mut self) -> io::Result<()> {
+        let Some(dir) = self.loops_dir.clone() else {
+            return self.write_text("\x1b[2mloops unavailable\x1b[0m\n");
+        };
+        let names = zero_core::loop_store::list_loops(&dir);
+        if names.is_empty() {
+            return self.write_text(&format!(
+                "\x1b[2mno loops yet — create one with `zero loop new <name>` (under {})\x1b[0m\n",
+                dir.display()
+            ));
+        }
+        let mut out = String::from("loops:\n");
+        for n in &names {
+            let store = zero_core::loop_store::LoopStore::at(&dir, n);
+            let s = store.ledger().map(|l| l.summary()).unwrap_or_default();
+            let next = store
+                .state_tail(1)
+                .first()
+                .map(|r| r.next_action.clone())
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  {n}  · {} wake(s) · {} tok · NEXT: {next}\n",
+                s.wakes, s.tokens_spent
+            ));
+        }
+        out.push_str("run headless: zero loop run <name>\n");
+        self.write_text(&format!("\x1b[2m{out}\x1b[0m"))
+    }
+
+    /// `/loop tail <name> [n]` — the last N state rows of a loop (read-only).
+    fn loop_command(&mut self, arg: &str) -> io::Result<()> {
+        let mut parts = arg.split_whitespace();
+        let sub = parts.next().unwrap_or("");
+        if sub != "tail" {
+            return self.write_text(
+                "\x1b[2musage: /loops (list) · /loop tail <name> [n]. Run loops headless: zero loop run <name>\x1b[0m\n",
+            );
+        }
+        let Some(name) = parts.next() else {
+            return self.write_text("\x1b[2musage: /loop tail <name> [n]\x1b[0m\n");
+        };
+        let n: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(5);
+        let Some(dir) = self.loops_dir.clone() else {
+            return self.write_text("\x1b[2mloops unavailable\x1b[0m\n");
+        };
+        let store = zero_core::loop_store::LoopStore::at(&dir, name);
+        if !store.exists() {
+            return self.write_text(&format!(
+                "\x1b[2mno loop named '{name}' (see /loops)\x1b[0m\n"
+            ));
+        }
+        let mut out = String::new();
+        for row in store.state_tail(n) {
+            out.push_str(&format!(
+                "── wake {} ──\n{}\nNEXT ACTION: {}\n",
+                row.wake, row.body, row.next_action
+            ));
+        }
+        if out.is_empty() {
+            out.push_str("(no state rows yet)\n");
         }
         self.write_text(&format!("\x1b[2m{out}\x1b[0m"))
     }
@@ -1133,6 +1212,16 @@ impl<I: Input, W: Write> App<I, W> {
         if trimmed == "/sessions" {
             self.echo_committed(&text)?;
             self.sessions_command()?;
+            return Ok(Flow::Continue);
+        }
+        if trimmed == "/loops" {
+            self.echo_committed(&text)?;
+            self.loops_command()?;
+            return Ok(Flow::Continue);
+        }
+        if let Some(rest) = trimmed.strip_prefix("/loop ") {
+            self.echo_committed(&text)?;
+            self.loop_command(rest.trim())?;
             return Ok(Flow::Continue);
         }
         if let Some(id) = trimmed.strip_prefix("/resume ") {
@@ -3723,6 +3812,58 @@ mod tests {
         assert_eq!(sys.role, Role::System);
         assert_eq!(sys.content, "custom sys prompt");
         assert!(!sys.content.contains("terminal coding assistant"));
+    }
+
+    #[test]
+    fn loops_command_lists_and_tails() {
+        let dir =
+            std::env::temp_dir().join(format!("zero-tui-loops-{}-{}", std::process::id(), line!()));
+        // Scaffold a loop with one banked state row via the core store.
+        let store = zero_core::loop_store::LoopStore::at(&dir, "perf");
+        store
+            .create("mission", "[budget]\nmax_wakes = 5\n", "")
+            .unwrap();
+        store
+            .append_state(&zero_core::loop_store::StateRow {
+                wake: 1,
+                body: "tried the qkv bucket".into(),
+                next_action: "attack the mlp bucket".into(),
+            })
+            .unwrap();
+
+        let mut a = app(b"");
+        a.set_loops_dir(Some(dir.clone()));
+        // /loops lists it.
+        type_str(&mut a, "/loops");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("perf"), "loop not listed");
+
+        // /loop tail shows the state row.
+        type_str(&mut a, "/loop tail perf");
+        a.dispatch(Key::Enter).unwrap();
+        let out = rendered(&a);
+        assert!(
+            out.contains("attack the mlp bucket"),
+            "tail missing NEXT: {out}"
+        );
+
+        // /loop tail of a missing loop is graceful.
+        type_str(&mut a, "/loop tail ghost");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("no loop named 'ghost'"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn loops_command_with_none_configured_hints() {
+        let dir = std::env::temp_dir().join(format!("zero-tui-noloops-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app(b"");
+        a.set_loops_dir(Some(dir.clone()));
+        type_str(&mut a, "/loops");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("no loops yet"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
