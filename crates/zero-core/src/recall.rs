@@ -366,6 +366,28 @@ mod tests {
     }
 
     #[test]
+    fn hamming_penalizes_a_length_mismatch_never_silent_prefix_scores() {
+        // Red-team #1 claimed `hamming` zips two slices and "silently scores on a
+        // prefix" for a different-dimension vector — so a wrong-dim vector could
+        // look similar. FALSE: the overlapping words here are IDENTICAL (a pure zip
+        // would return 0), but the length term penalizes the mismatch to 64. A
+        // wrong-dim vector can never rank as similar.
+        let a = quantize_sign(&[1.0; 64]); // 1 word, all bits set
+        let longer = quantize_sign(&[1.0; 128]); // 2 words, all bits set — same prefix
+        assert_eq!(
+            hamming(&a, &longer),
+            64,
+            "a pure prefix-zip would wrongly return 0; the penalty must apply"
+        );
+        // (And the dim guard means a mismatched vector never even reaches scoring.)
+        let mut s = Semantic::new("m", 64);
+        assert!(
+            !s.add(1, &[1.0; 128]),
+            "wrong-dim add is rejected, not mis-packed"
+        );
+    }
+
+    #[test]
     fn hamming_is_zero_for_identical_and_grows_with_difference() {
         let a = quantize_sign(&[1.0, 1.0, 1.0, 1.0]);
         let b = quantize_sign(&[1.0, 1.0, 1.0, 1.0]);

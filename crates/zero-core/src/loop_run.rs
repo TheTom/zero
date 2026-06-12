@@ -483,6 +483,92 @@ mod tests {
     }
 
     #[test]
+    fn a_wake_hands_the_model_no_tools_so_it_cannot_edit_the_gate() {
+        // Red-team #1's gate-hacking premise was "the model has repo write
+        // authority" inside a wake → it edits bench.sh to grade itself. FALSE for
+        // the current design: a wake is a single completion with an EMPTY tool set,
+        // so the model can't run any tool, let alone rewrite the gate's target. (The
+        // moment wakes DO get tool-use, gate-integrity must become a hard refusal —
+        // the lock built for exactly that already detects the change.)
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ToolSpy(AtomicUsize);
+        impl Backend for ToolSpy {
+            fn name(&self) -> &str {
+                "spy"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                s: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), BackendError> {
+                s(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+            fn complete(
+                &self,
+                _c: &Conversation,
+                tools: &[crate::tools::ToolDef],
+                _to: Duration,
+            ) -> Result<Completion, BackendError> {
+                self.0.store(tools.len(), Ordering::SeqCst);
+                Ok(Completion {
+                    content: "STATE: x\nNEXT ACTION: y".into(),
+                    tool_calls: vec![],
+                    usage: None,
+                })
+            }
+        }
+        let root = tmp("notools");
+        let store = LoopStore::at(&root, "x");
+        store.create("m", TOML, "").unwrap();
+        let backend = ToolSpy(AtomicUsize::new(usize::MAX));
+        let mut runner = |_cmd: &str| ("{}".to_string(), 0);
+        run_wake(&store, &backend, &mut runner, 1, 1000).unwrap();
+        assert_eq!(
+            backend.0.load(Ordering::SeqCst),
+            0,
+            "a wake must advertise ZERO tools to the model"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn token_budget_advances_with_a_usage_reporting_backend() {
+        // "wake-count is the SOLE real backstop" holds only for a backend that
+        // reports no usage. With a usage-reporting backend the token meter DOES
+        // move and the token budget trips — as designed.
+        let root = tmp("tokbudget");
+        let store = LoopStore::at(&root, "x");
+        store
+            .create(
+                "m",
+                "[budget]\nmax_tokens = 100\non_exhaust = \"pause\"\n[[gate]]\nname=\"g\"\nrun=\"true\"\nparse=\"exit\"\npass=\"== 0\"\n",
+                "",
+            )
+            .unwrap();
+        // ScriptBackend reports prompt=100 + completion=20 = 120 tokens per wake.
+        let backend = ScriptBackend::new(&["STATE: did it\nNEXT ACTION: continue"]);
+        let mut runner = |_cmd: &str| (String::new(), 0);
+        run_wake(&store, &backend, &mut runner, 1, 1000).unwrap();
+        let summary = store.ledger().unwrap().summary();
+        assert!(summary.tokens_spent >= 120, "the token meter must advance");
+        // The next schedule decision pauses on the token budget, not just wake count.
+        let cfg = store.config().unwrap();
+        assert!(matches!(
+            decide(&TickInput {
+                config: &cfg,
+                summary: &summary,
+                now_ms: 1000,
+                deadline_ms: None,
+                paused: false,
+                event: Event::Schedule,
+            }),
+            Action::Pause(crate::loop_runner::PauseReason::BudgetExhausted)
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn loop_done_is_fenced_to_an_exact_line() {
         // A marker embedded in prose / with trailing words is NOT a done-claim.
         assert!(!parse_wake_reply("I will write LOOP DONE until the bar is met").done_claimed);
