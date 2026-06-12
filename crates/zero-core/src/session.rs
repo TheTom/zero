@@ -47,6 +47,37 @@ impl<W: Write> SessionLog<W> {
         ])
     }
 
+    /// Record a tool call the model requested — the tool name and its raw JSON
+    /// arguments, exactly as emitted. Logged at call time (honest timestamp) so the
+    /// transcript shows *what the agent actually did*, not just its final answer.
+    pub fn record_tool_call(&mut self, name: &str, arguments: &str) -> io::Result<()> {
+        self.write_object(vec![
+            ("kind".to_string(), Value::Str("tool_call".to_string())),
+            ("name".to_string(), Value::Str(name.to_string())),
+            ("arguments".to_string(), Value::Str(arguments.to_string())),
+        ])
+    }
+
+    /// Record a tool result fed back to the model. `result` is the model-facing
+    /// (possibly capped) text; `raw_bytes`/`kept_bytes` make any capping visible —
+    /// `raw_bytes > kept_bytes` means the full output was spilled to the artifact
+    /// dir and only a prefix went to the model.
+    pub fn record_tool_result(
+        &mut self,
+        name: &str,
+        result: &str,
+        raw_bytes: usize,
+        kept_bytes: usize,
+    ) -> io::Result<()> {
+        self.write_object(vec![
+            ("kind".to_string(), Value::Str("tool_result".to_string())),
+            ("name".to_string(), Value::Str(name.to_string())),
+            ("result".to_string(), Value::Str(result.to_string())),
+            ("raw_bytes".to_string(), Value::Num(raw_bytes as f64)),
+            ("kept_bytes".to_string(), Value::Num(kept_bytes as f64)),
+        ])
+    }
+
     /// Record that a turn finished, with the measured elapsed milliseconds.
     pub fn record_turn_done(&mut self, elapsed_ms: u128) -> io::Result<()> {
         self.write_object(vec![
@@ -112,6 +143,39 @@ mod tests {
             rows[0].get("elapsed_ms").and_then(Value::as_f64),
             Some(1234.0)
         );
+    }
+
+    #[test]
+    fn tool_call_records_name_and_raw_arguments() {
+        let mut log = SessionLog::from_writer(Vec::new());
+        log.record_tool_call("bash", r#"{"command":"cargo test"}"#)
+            .unwrap();
+        let row = &lines(&log.sink)[0];
+        assert_eq!(row.get("kind").and_then(Value::as_str), Some("tool_call"));
+        assert_eq!(row.get("name").and_then(Value::as_str), Some("bash"));
+        assert_eq!(
+            row.get("arguments").and_then(Value::as_str),
+            Some(r#"{"command":"cargo test"}"#)
+        );
+        assert!(row.get("ts_ms").and_then(Value::as_f64).unwrap() > 1_577_836_800_000.0);
+    }
+
+    #[test]
+    fn tool_result_records_bytes_and_makes_capping_visible() {
+        let mut log = SessionLog::from_writer(Vec::new());
+        // raw_bytes > kept_bytes ⇒ the result was capped (full output spilled).
+        log.record_tool_result("grep", "a.rs:1: hit … [elided]", 50_000, 64)
+            .unwrap();
+        let row = &lines(&log.sink)[0];
+        assert_eq!(row.get("kind").and_then(Value::as_str), Some("tool_result"));
+        assert_eq!(row.get("name").and_then(Value::as_str), Some("grep"));
+        assert_eq!(row.get("raw_bytes").and_then(Value::as_f64), Some(50_000.0));
+        assert_eq!(row.get("kept_bytes").and_then(Value::as_f64), Some(64.0));
+        assert!(row
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("hit"));
     }
 
     #[test]

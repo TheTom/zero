@@ -1076,6 +1076,10 @@ impl<I: Input, W: Write> App<I, W> {
         // Evidence for the post-turn Checker: which commands ran (and passed) and
         // whether anything was edited — used to flag unsupported completion claims.
         let evidence = RefCell::new(zero_core::rules::EvidenceLog::new());
+        // The session log, taken for the duration of the loop so the executor can
+        // append each tool call + result at its real call time (honest timestamps)
+        // — full transparency of what ran, not just the final reply. Restored after.
+        let log = RefCell::new(self.log.take());
         let res = {
             let out = RefCell::new(&mut self.out);
             // Prepend the system prompt per completion call so it leads every round
@@ -1089,6 +1093,11 @@ impl<I: Input, W: Write> App<I, W> {
                     &mut **out.borrow_mut(),
                     &format!("\x1b[2m  ⚙ {}({})\x1b[0m\n", call.name, call.arguments),
                 );
+                // Log the request the moment it's made (before the cache short-circuit
+                // or the gate), so the transcript records every tool call verbatim.
+                if let Some(l) = log.borrow_mut().as_mut() {
+                    let _ = l.record_tool_call(&call.name, &call.arguments);
+                }
                 let path = call_path(call, root.as_deref());
                 // Read cache: a repeat read of an unchanged WHOLE file returns a
                 // stub (the content is already upstream). Ranged reads always run.
@@ -1105,6 +1114,10 @@ impl<I: Input, W: Write> App<I, W> {
                                 &mut **out.borrow_mut(),
                                 &format!("\x1b[2m  ↳ (cached) {stub}\x1b[0m\n"),
                             );
+                            if let Some(l) = log.borrow_mut().as_mut() {
+                                let _ =
+                                    l.record_tool_result(&call.name, &stub, would_be, stub.len());
+                            }
                             return stub;
                         }
                     }
@@ -1154,6 +1167,11 @@ impl<I: Input, W: Write> App<I, W> {
                     &mut **out.borrow_mut(),
                     &format!("\x1b[2m  ↳ {}\x1b[0m\n", first_line(&result)),
                 );
+                // The result as the model sees it, with raw vs kept bytes so the
+                // transcript shows what was capped (full output is in the artifact).
+                if let Some(l) = log.borrow_mut().as_mut() {
+                    let _ = l.record_tool_result(&call.name, &result, raw_len, result.len());
+                }
                 result
             };
             let mut on_text = |t: &str| {
@@ -1171,6 +1189,7 @@ impl<I: Input, W: Write> App<I, W> {
         self.conv = conv;
         self.read_cache = read_cache.into_inner();
         self.context_stats = stats.into_inner();
+        self.log = log.into_inner();
         let evidence = evidence.into_inner();
         // Applied write/edit payloads are now compacted IN-LOOP by run_turn (each
         // round, so a long turn doesn't re-send a just-written file's body). The
@@ -3758,6 +3777,101 @@ mod tests {
         let full = std::fs::read_to_string(&art).unwrap();
         assert!(full.contains("\n5000\n") || full.ends_with("5000\n[exit 0]"));
         assert!(a.context_stats.capped_saved > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tool_calls_and_results_are_written_to_the_transcript() {
+        // Full-transparency logging: a tool turn must record each tool_call (with
+        // raw args) and tool_result (with raw/kept bytes), not just the final reply.
+        use std::sync::Mutex;
+        struct EchoBackend {
+            step: Arc<Mutex<u32>>,
+        }
+        impl Backend for EchoBackend {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                sink(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+            fn complete(
+                &self,
+                _c: &Conversation,
+                _t: &[ToolDef],
+                _to: Duration,
+            ) -> Result<zero_core::backend::Completion, zero_core::backend::BackendError>
+            {
+                let mut step = self.step.lock().unwrap();
+                *step += 1;
+                if *step == 1 {
+                    Ok(zero_core::backend::Completion {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall::new(
+                            "c1",
+                            "bash",
+                            r#"{"command":"echo transparency"}"#,
+                        )],
+                        usage: None,
+                    })
+                } else {
+                    Ok(zero_core::backend::Completion {
+                        content: "all set".to_string(),
+                        tool_calls: vec![],
+                        usage: None,
+                    })
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("zero-log-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (log, path) = zero_core::session::SessionLog::create_in(&dir).unwrap();
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(EchoBackend {
+                step: Arc::new(Mutex::new(0)),
+            }),
+            Some(log),
+        );
+        a.tools_enabled = true;
+        a.run_tool_turn("say hi via bash").unwrap();
+        drop(a); // flush + close the log file
+
+        let transcript = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<zero_core::json::Value> = transcript
+            .lines()
+            .map(|l| zero_core::json::Value::parse(l).unwrap())
+            .collect();
+        let kind = |r: &zero_core::json::Value| {
+            r.get("kind")
+                .and_then(zero_core::json::Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        // The user prompt, the tool call, the tool result, and the final reply all
+        // appear — the transcript shows what ran, not just the answer.
+        assert!(rows.iter().any(|r| kind(r) == "tool_call"
+            && r.get("name").and_then(zero_core::json::Value::as_str) == Some("bash")
+            && r.get("arguments")
+                .and_then(zero_core::json::Value::as_str)
+                .unwrap_or("")
+                .contains("echo transparency")));
+        assert!(rows.iter().any(|r| kind(r) == "tool_result"
+            && r.get("result")
+                .and_then(zero_core::json::Value::as_str)
+                .unwrap_or("")
+                .contains("transparency")
+            && r.get("raw_bytes")
+                .and_then(zero_core::json::Value::as_f64)
+                .is_some()));
+        assert!(rows.iter().any(|r| kind(r) == "message"
+            && r.get("role").and_then(zero_core::json::Value::as_str) == Some("assistant")));
         std::fs::remove_dir_all(&dir).ok();
     }
 
