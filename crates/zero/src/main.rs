@@ -113,6 +113,11 @@ fn run(args: &Args) -> std::io::Result<()> {
         app.set_config(cfg.clone(), Some(cfg_path.clone()), servers_path());
         app.set_log_path(log_path);
         app.set_artifact_dir(outputs_dir());
+        // MCP discovery for headless `--tools` runs too: run_once auto-connects the
+        // configured servers so the agentic loop can call their tools (same sources
+        // as the interactive path).
+        app.set_mcp_path(cfg_path.parent().map(|d| d.join("mcp.json")));
+        app.set_mcp_discovery(home(), std::env::current_dir().ok());
         app.set_tools_enabled(args.tools);
         app.set_auto_accept(args.accept_edits);
         let reply = app.run_once(prompt.trim())?;

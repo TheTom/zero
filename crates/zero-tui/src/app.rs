@@ -111,6 +111,18 @@ fn queue_preview(msg: &str, max: usize) -> String {
     preview
 }
 
+/// Truncate a (possibly ANSI-styled) line to a single physical terminal row of at
+/// most `width` display columns, preserving escapes. The input-box redraw counts
+/// one physical row per logical line, so any chrome line (status footer, slash
+/// suggestion) that would otherwise wrap MUST be capped here, or the row math
+/// desyncs and stale rules accumulate on every keystroke.
+fn one_physical_row(s: &str, width: usize) -> String {
+    crate::ansi::wrap_ansi(s, width)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
 /// Compact a token count for the status line: `840`, `1.2k`, `33k`.
 fn fmt_count(n: u64) -> String {
     if n < 1000 {
@@ -731,6 +743,12 @@ impl<I: Input, W: Write> App<I, W> {
     /// written to the output sink as usual; the binary points that at stderr so
     /// `zero -p` keeps stdout to just the returned reply.
     pub fn run_once(&mut self, prompt: &str) -> io::Result<String> {
+        // A headless `--tools` run still wants its MCP servers: auto-connect them
+        // once (idempotent — skipped if already connected or none configured), so
+        // the agentic loop can call their tools just like the interactive session.
+        if self.tools_enabled && self.mcp.is_empty() {
+            self.autoconnect_mcp()?;
+        }
         if self.tools_enabled {
             self.run_tool_turn(prompt)?;
         } else {
@@ -2381,18 +2399,22 @@ impl<I: Input, W: Write> App<I, W> {
         }
         write!(self.out, "\r\n\x1b[2m{rule}\x1b[0m")?;
 
-        // Status footer directly under the bottom rule.
-        write!(self.out, "\r\n\x1b[2m{}\x1b[0m", self.footer_text())?;
+        // Status footer directly under the bottom rule. Capped to ONE physical row:
+        // the row math below counts one physical row per logical line, so a long
+        // model name / endpoint that wraps would desync the redraw (the cursor ends
+        // up too low and the next clear leaves the top rule behind — stale rules
+        // pile up on every keystroke).
+        let footer = one_physical_row(&format!("\x1b[2m{}\x1b[0m", self.footer_text()), width);
+        write!(self.out, "\r\n{footer}")?;
 
         // Slash-command suggestions, one per line below the status footer. The
-        // first (best) match is highlighted as the one Enter/Tab completes to.
+        // first (best) match is highlighted as the one Enter/Tab completes to. Each
+        // is likewise capped to one physical row so a long description can't wrap.
         let suggestions = self.slash_suggestions();
         for (i, (name, desc)) in suggestions.iter().enumerate() {
             let mark = if i == 0 { "›" } else { " " };
-            write!(
-                self.out,
-                "\r\n\x1b[2m{mark}\x1b[0m \x1b[36m{name}\x1b[0m  \x1b[2m{desc}\x1b[0m"
-            )?;
+            let line = format!("\x1b[2m{mark}\x1b[0m \x1b[36m{name}\x1b[0m  \x1b[2m{desc}\x1b[0m");
+            write!(self.out, "\r\n{}", one_physical_row(&line, width))?;
         }
 
         // Cursor is on the last footer/suggestion line; move it up to its logical
@@ -3077,6 +3099,58 @@ mod tests {
     }
 
     #[test]
+    fn one_physical_row_caps_long_styled_footer_to_width() {
+        use crate::ansi::display_width;
+        // The real-world trigger: a long model name + endpoint in the status footer.
+        // Uncapped this is well over 80 cols and wraps to a 2nd physical row, which
+        // desynced the input-box redraw (stale rules piled up on every keystroke).
+        let footer = format!(
+            "\x1b[33mnormal\x1b[0m\x1b[2m  ·  {}  ·  192.168.50.125:8000  ·  ⇧⇥ mode\x1b[0m",
+            "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-Q5_K_M.gguf"
+        );
+        assert!(
+            display_width(&footer) > 80,
+            "test footer should overflow 80 cols"
+        );
+        let row = one_physical_row(&footer, 80);
+        assert!(
+            !row.contains('\n'),
+            "must collapse to a single physical row"
+        );
+        assert!(
+            display_width(&row) <= 80,
+            "capped row still exceeds width: {}",
+            display_width(&row)
+        );
+        // A short footer is returned unchanged (no needless truncation).
+        let short = "\x1b[2mnormal · stub\x1b[0m";
+        assert_eq!(one_physical_row(short, 80), short);
+    }
+
+    #[test]
+    fn redraw_with_a_long_footer_caps_the_status_line() {
+        use crate::ansi::display_width;
+        // Regression: a long model name made the footer wrap, desyncing the redraw.
+        // The footer the renderer emits must be a single ≤80-col physical row.
+        let mut a = app(b"");
+        a.config.model =
+            "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-Q5_K_M.gguf".to_string();
+        a.config.base_url = Some("http://192.168.50.125:8000".to_string());
+        // The footer the box would draw, capped exactly as redraw_input does it.
+        let footer = one_physical_row(&format!("\x1b[2m{}\x1b[0m", a.footer_text()), 80);
+        assert!(
+            display_width(&a.footer_text()) > 80,
+            "raw footer should overflow"
+        );
+        assert!(
+            display_width(&footer) <= 80 && !footer.contains('\n'),
+            "footer not capped to one row"
+        );
+        // And a full redraw still completes without error with this state.
+        a.redraw_input().unwrap();
+    }
+
+    #[test]
     fn mcp_with_no_sources_reports_nothing_found() {
         let mut a = app(b""); // no mcp_path, no discovery dirs
         type_str(&mut a, "/mcp");
@@ -3313,6 +3387,94 @@ mod tests {
         );
         // And the server is restored to the live set after the turn.
         assert_eq!(a.mcp.len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn headless_run_once_autoconnects_mcp_for_tools_runs() {
+        use zero_core::json::Value;
+        // The same sh MCP server (initialize, tools/list, tools/call).
+        let script = "read a; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}'; \
+             read b; read c; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"e\",\"inputSchema\":{\"type\":\"object\"}}]}}'; \
+             read d; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi from mcp\"}]}}'";
+        let cfg = Value::Object(vec![(
+            "mcpServers".to_string(),
+            Value::Object(vec![(
+                "mock".to_string(),
+                Value::Object(vec![
+                    ("command".to_string(), Value::Str("sh".to_string())),
+                    (
+                        "args".to_string(),
+                        Value::Array(vec![
+                            Value::Str("-c".to_string()),
+                            Value::Str(script.to_string()),
+                        ]),
+                    ),
+                ]),
+            )]),
+        )]);
+        let path = std::env::temp_dir().join(format!(
+            "zero-mcp-auto-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, cfg.to_json()).unwrap();
+
+        struct Bk(std::sync::Arc<std::sync::Mutex<u32>>);
+        impl Backend for Bk {
+            fn name(&self) -> &str {
+                "bk"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                s: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                s(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+            fn complete(
+                &self,
+                _c: &Conversation,
+                _t: &[ToolDef],
+                _to: Duration,
+            ) -> Result<zero_core::backend::Completion, zero_core::backend::BackendError>
+            {
+                let mut n = self.0.lock().unwrap();
+                *n += 1;
+                Ok(if *n == 1 {
+                    zero_core::backend::Completion {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall::new("c", "mock__echo", "{}")],
+                        usage: None,
+                    }
+                } else {
+                    zero_core::backend::Completion {
+                        content: "done".into(),
+                        tool_calls: vec![],
+                        usage: None,
+                    }
+                })
+            }
+        }
+
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(Bk(Arc::new(std::sync::Mutex::new(0)))),
+            None,
+        );
+        a.synchronous = true;
+        a.set_tools_enabled(true);
+        a.set_mcp_path(Some(path.clone()));
+        // No manual autoconnect: run_once must do it because tools are enabled.
+        a.run_once("use echo").unwrap();
+        assert_eq!(a.mcp.len(), 1, "run_once should have auto-connected MCP");
+        assert!(a
+            .conv
+            .messages
+            .iter()
+            .any(|m| m.role == Role::Tool && m.content.contains("hi from mcp")));
         std::fs::remove_file(&path).ok();
     }
 
