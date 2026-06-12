@@ -147,16 +147,18 @@ pub fn run_wake(
     let completion = match backend.complete(&conv, &[], WAKE_TIMEOUT) {
         Ok(c) => c,
         Err(e) => {
-            let _ = store.ledger().and_then(|mut l| {
-                l.append(TickRow {
-                    ts_ms: now_ms,
-                    wake,
-                    elapsed_ms: sw.elapsed().as_millis() as u64,
-                    state_written: false,
-                    note: format!("backend error: {e}"),
-                    ..Default::default()
-                })
-            });
+            // Bank the failed wake so it counts against budget/deadline. If banking
+            // *itself* fails (disk full / lock), surface THAT rather than swallow it
+            // — a silently-dropped increment would quietly reopen the budget bypass
+            // in exactly the disk-full case where the meter matters most.
+            store.ledger()?.append(TickRow {
+                ts_ms: now_ms,
+                wake,
+                elapsed_ms: sw.elapsed().as_millis() as u64,
+                state_written: false,
+                note: format!("backend error: {e}"),
+                ..Default::default()
+            })?;
             return Err(io::Error::other(format!("backend: {e}")));
         }
     };

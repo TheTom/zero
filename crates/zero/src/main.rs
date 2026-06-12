@@ -405,6 +405,11 @@ fn do_loop(sub: &str, rest: &[String], backend: &dyn Backend) -> std::io::Result
                 );
             }
         }
+        "arm" => {
+            let store = LoopStore::at(&root, name()?);
+            store.lock_gates()?;
+            println!("armed {:?}: gate definitions locked", name()?);
+        }
         "run" => {
             let store = LoopStore::at(&root, name()?);
             if !store.exists() {
@@ -433,6 +438,16 @@ fn run_loop(
     backend: &dyn Backend,
 ) -> std::io::Result<()> {
     use zero_core::loop_runner::{decide, Action, Event, TickInput};
+    // Gate integrity: warn loudly if the gate definitions changed since the loop was
+    // armed (an operator edit needs a re-arm; once wakes get tool-use this becomes a
+    // hard refusal so the model can't rewrite the gate that grades it).
+    if !store.gates_match_lock() {
+        eprintln!(
+            "zero: ⚠ gate definitions changed since this loop was armed — re-arm with \
+             `zero loop arm {}` if that was intentional",
+            store.name()
+        );
+    }
     // A real gate-runner: run the command via `sh -c`, combine stdout+stderr.
     let mut gates = |cmd: &str| -> (String, i32) {
         match std::process::Command::new("sh").arg("-c").arg(cmd).output() {

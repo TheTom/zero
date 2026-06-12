@@ -12,6 +12,7 @@
 //! fire times; the math is here so it's unit-tested without sleeping.
 
 use crate::loop_config::parse_duration;
+use std::time::Duration;
 
 const MS_PER_DAY: u64 = 86_400_000;
 /// Floor on a recurring `every <dur>` interval — a `0s`/`1ms` spec must not become
@@ -162,6 +163,18 @@ pub fn ms_until(target_ms: u64, now_ms: u64) -> u64 {
     target_ms.saturating_sub(now_ms)
 }
 
+/// Parse a `[schedule] heartbeat` spec to a wake interval, **clamped to the
+/// [`MIN_INTERVAL_MS`] floor** — so `heartbeat = "0s"` can't storm the wake
+/// cadence the way the clamp protects launch triggers. `None` for an unparseable
+/// spec. The scheduler thread uses this; clamping in the tested core means "no
+/// storm" is proven for *how fast a loop wakes*, not just *when it launches*.
+pub fn heartbeat_interval(spec: &str) -> Option<Duration> {
+    let d = parse_duration(spec.trim())?;
+    Some(Duration::from_millis(
+        (d.as_millis() as u64).max(MIN_INTERVAL_MS),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +284,16 @@ mod tests {
     fn ms_until_saturates() {
         assert_eq!(ms_until(100, 40), 60);
         assert_eq!(ms_until(40, 100), 0); // already due, never negative
+    }
+
+    #[test]
+    fn heartbeat_interval_clamps_the_wake_cadence() {
+        assert_eq!(heartbeat_interval("30m"), Some(Duration::from_secs(1800)));
+        // The storm guard covers cadence too, not just launch triggers.
+        assert_eq!(
+            heartbeat_interval("0s"),
+            Some(Duration::from_millis(MIN_INTERVAL_MS))
+        );
+        assert_eq!(heartbeat_interval("nope"), None);
     }
 }

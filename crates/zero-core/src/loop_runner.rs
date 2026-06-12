@@ -170,8 +170,15 @@ fn budget_exhausted(input: &TickInput) -> bool {
 fn decide_done(input: &TickInput, exit_gate: ExitGateVerdict) -> Action {
     match exit_gate {
         ExitGateVerdict::Passed => Action::Stop(StopReason::GoalMet),
+        // No scoreable gate: escalate by default, OR self-stop if the operator
+        // opted into autonomy for this rubric loop (accepting the model's word
+        // where the harness can't auto-verify, until the rubric grader lands).
+        ExitGateVerdict::Unverifiable if input.config.contract.autonomous_rubric_stop => {
+            Action::Stop(StopReason::GoalMet)
+        }
         ExitGateVerdict::Unverifiable => Action::EscalateToHuman(format!(
-            "loop claims done but has no scoreable gate to verify it{} — confirm?",
+            "loop claims done but has no scoreable gate to verify it{} — confirm? \
+             (set [contract] autonomous_rubric_stop = true to let it self-finish)",
             input
                 .config
                 .bar
@@ -491,6 +498,25 @@ mod tests {
             Action::EscalateToHuman(msg) => assert!(msg.contains("no scoreable gate"), "{msg}"),
             other => panic!("expected escalation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unverifiable_self_stops_when_the_operator_opts_in() {
+        // With autonomous_rubric_stop, a rubric-only loop finishes on its own (the
+        // unattended scheduled-research story) instead of parking for the operator.
+        let mut c = cfg();
+        c.contract.autonomous_rubric_stop = true;
+        let s = LedgerSummary::default();
+        assert_eq!(
+            decide(&input(
+                &c,
+                &s,
+                Event::DoneClaim {
+                    exit_gate: ExitGateVerdict::Unverifiable
+                }
+            )),
+            Action::Stop(StopReason::GoalMet)
+        );
     }
 
     #[test]

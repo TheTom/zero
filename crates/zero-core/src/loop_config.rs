@@ -48,12 +48,18 @@ pub struct Bar {
     pub remeasure: Option<String>,
 }
 
-/// `[contract]` — enforced per wake. Defaults are all-on (the safe contract).
+/// `[contract]` — enforced per wake. Defaults are the safe contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contract {
     pub inject_spec: bool,
     pub require_state_append: bool,
     pub require_next_action: bool,
+    /// Allow a **rubric-only** loop (no scoreable command gate) to self-stop on a
+    /// `LOOP DONE` claim instead of escalating to the operator. Off by default —
+    /// the operator opts in to trusting the model's word where the harness can't
+    /// auto-verify (the real fix is the fresh-context rubric grader). This is what
+    /// makes an unattended scheduled-research loop finish on its own.
+    pub autonomous_rubric_stop: bool,
 }
 
 impl Default for Contract {
@@ -62,6 +68,7 @@ impl Default for Contract {
             inject_spec: true,
             require_state_append: true,
             require_next_action: true,
+            autonomous_rubric_stop: false,
         }
     }
 }
@@ -148,6 +155,9 @@ impl LoopConfig {
                 require_next_action: t
                     .bool("require_next_action")
                     .unwrap_or(d.require_next_action),
+                autonomous_rubric_stop: t
+                    .bool("autonomous_rubric_stop")
+                    .unwrap_or(d.autonomous_rubric_stop),
             };
         }
         if let Some(t) = doc.table("budget") {
@@ -206,6 +216,36 @@ impl LoopConfig {
             }
         }
         Ok(cfg)
+    }
+}
+
+impl LoopConfig {
+    /// A stable fingerprint of the **gate definitions** (names, commands,
+    /// extractors, pass expressions, kinds). The harness locks this at arm time so
+    /// a later change to a gate — an operator edit, or (once wakes get tool-use) the
+    /// model rewriting the gate to grade itself — is detectable. FNV-1a, std-only.
+    pub fn gate_fingerprint(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |s: &str| {
+            for b in s.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            h ^= 0xff; // field separator
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        for g in &self.gates {
+            mix(&g.name);
+            mix(&g.run);
+            mix(&g.pass);
+            mix(g.rubric.as_deref().unwrap_or(""));
+            mix(match g.kind {
+                crate::gate::GateKind::Command => "command",
+                crate::gate::GateKind::Rubric => "rubric",
+            });
+            mix(&format!("{:?}", g.extractor));
+        }
+        h
     }
 }
 
@@ -597,6 +637,39 @@ mod tests {
     fn comment_inside_a_string_is_kept() {
         let c = LoopConfig::parse("[bar]\nvalue = \"a # b\"\nversion = 1\n").unwrap();
         assert_eq!(c.bar.unwrap().value, "a # b");
+    }
+
+    #[test]
+    fn gate_fingerprint_changes_when_a_gate_changes() {
+        let base = LoopConfig::parse(
+            "[[gate]]\nname=\"q\"\nrun=\"bench.sh\"\nparse=\"json:.v\"\npass=\">= 0.99\"\n",
+        )
+        .unwrap();
+        let fp = base.gate_fingerprint();
+        // Identical config → identical fingerprint.
+        assert_eq!(
+            LoopConfig::parse(
+                "[[gate]]\nname=\"q\"\nrun=\"bench.sh\"\nparse=\"json:.v\"\npass=\">= 0.99\"\n"
+            )
+            .unwrap()
+            .gate_fingerprint(),
+            fp
+        );
+        // The model lowers the bar to grade itself → fingerprint moves.
+        let tampered = LoopConfig::parse(
+            "[[gate]]\nname=\"q\"\nrun=\"bench.sh\"\nparse=\"json:.v\"\npass=\">= 0.0\"\n",
+        )
+        .unwrap();
+        assert_ne!(tampered.gate_fingerprint(), fp);
+        // Pointing the gate at a different command also moves it.
+        let retargeted = LoopConfig::parse(
+            "[[gate]]\nname=\"q\"\nrun=\"echo {\\\"v\\\":1}\"\nparse=\"json:.v\"\npass=\">= 0.99\"\n",
+        )
+        .unwrap();
+        assert_ne!(retargeted.gate_fingerprint(), fp);
+        // A non-gate change (the bar text) does NOT move the gate fingerprint.
+        let bar_only = LoopConfig::parse("[bar]\nvalue=\"x\"\nversion=2\n[[gate]]\nname=\"q\"\nrun=\"bench.sh\"\nparse=\"json:.v\"\npass=\">= 0.99\"\n").unwrap();
+        assert_eq!(bar_only.gate_fingerprint(), fp);
     }
 
     #[test]

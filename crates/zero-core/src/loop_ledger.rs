@@ -207,13 +207,19 @@ pub fn summarize(rows: &[TickRow]) -> LedgerSummary {
     let tokens_spent = rows.iter().map(|r| r.tokens).sum();
     let last_state_written = rows.last().map(|r| r.state_written).unwrap_or(true);
     let consecutive_done_claims = rows.iter().rev().take_while(|r| r.done_claimed).count() as u64;
-    // Trailing run of identical, non-empty next actions = present but not progressing.
+    // Trailing run of next actions that *normalize* to the same step = present but
+    // not progressing. Normalizing (lowercase, collapse whitespace, drop trailing
+    // punctuation) defeats the trivial-paraphrase bypass ("check logs" / "Check
+    // logs." / "check  logs"); true semantic paraphrase still needs the embedding
+    // tier, so this is a backstop, not a complete progress detector.
     let consecutive_repeat_next_action = match rows.last() {
-        Some(last) if !last.next_action.trim().is_empty() => rows
-            .iter()
-            .rev()
-            .take_while(|r| r.next_action == last.next_action)
-            .count() as u64,
+        Some(last) if !last.next_action.trim().is_empty() => {
+            let key = norm_action(&last.next_action);
+            rows.iter()
+                .rev()
+                .take_while(|r| norm_action(&r.next_action) == key)
+                .count() as u64
+        }
         _ => 0,
     };
     let last_gates = rows.last().map(|r| r.gates.clone()).unwrap_or_default();
@@ -225,6 +231,19 @@ pub fn summarize(rows: &[TickRow]) -> LedgerSummary {
         consecutive_repeat_next_action,
         last_gates,
     }
+}
+
+/// Normalize a NEXT ACTION for the no-progress check: lowercase, collapse
+/// whitespace, drop trailing punctuation — so trivial paraphrase doesn't dodge it.
+fn norm_action(s: &str) -> String {
+    let joined = s
+        .split_whitespace()
+        .map(|w| w.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    joined
+        .trim_end_matches(['.', '!', '?', ',', ';', ':'])
+        .to_string()
 }
 
 /// Parse JSONL rows, skipping a blank or torn (unparseable) trailing/any line.
@@ -320,6 +339,17 @@ mod tests {
         let mut blank = vec![row(1, 10)];
         blank[0].next_action = String::new();
         assert_eq!(summarize(&blank).consecutive_repeat_next_action, 0);
+    }
+
+    #[test]
+    fn no_progress_survives_trivial_paraphrase() {
+        // The byte-equality bypass: vary case/whitespace/punctuation. Normalization
+        // still flags these as the same step.
+        let mut rows = vec![row(1, 10), row(2, 10), row(3, 10)];
+        rows[0].next_action = "check the logs".into();
+        rows[1].next_action = "Check the  logs.".into();
+        rows[2].next_action = "CHECK THE LOGS".into();
+        assert_eq!(summarize(&rows).consecutive_repeat_next_action, 3);
     }
 
     #[test]

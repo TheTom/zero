@@ -77,6 +77,7 @@ impl LoopStore {
         fs::write(self.dir.join("rules.md"), rules)?;
         fs::write(self.dir.join("state.md"), "")?;
         self.write_config(toml)?; // atomic, written last so `exists()` flips cleanly
+        self.lock_gates()?; // arm the gate-integrity lock
         Ok(())
     }
 
@@ -110,6 +111,25 @@ impl LoopStore {
     pub fn write_rules(&self, rules: &str) -> io::Result<()> {
         fs::create_dir_all(&self.dir)?;
         fs::write(self.dir.join("rules.md"), rules)
+    }
+
+    /// Lock (arm) the current gate definitions: record their fingerprint so a later
+    /// change is detectable. Called at create and by `zero loop arm`.
+    pub fn lock_gates(&self) -> io::Result<()> {
+        let fp = self.config()?.gate_fingerprint();
+        fs::write(self.dir.join(".gates"), fp.to_string())
+    }
+
+    /// Do the current gate definitions match the armed lock? `false` if they were
+    /// changed since arm (operator edit, or — once wakes act — the model trying to
+    /// grade itself), or if no lock exists. The runner flags a mismatch; integrity
+    /// becomes a hard refusal when wakes gain tool-use.
+    pub fn gates_match_lock(&self) -> bool {
+        let locked = fs::read_to_string(self.dir.join(".gates"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        let current = self.config().ok().map(|c| c.gate_fingerprint());
+        matches!((locked, current), (Some(l), Some(c)) if l == c)
     }
 
     /// Open the tick ledger (`ticks.jsonl`).
@@ -378,6 +398,23 @@ mod tests {
         fs::create_dir_all(root.join("not-a-loop")).unwrap();
         assert_eq!(list_loops(&root), vec!["alpha", "beta"]);
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn gate_lock_detects_a_tampered_gate() {
+        let root = tmp("gatelock");
+        let s = LoopStore::at(&root, "perf");
+        s.create("m", TOML, "").unwrap();
+        // Freshly created → armed and matching.
+        assert!(s.gates_match_lock());
+        // Tamper with the gate (lower the bar to self-grade).
+        s.write_config("[[gate]]\nname=\"q\"\nparse=\"exit\"\npass=\"!= 999\"\n")
+            .unwrap();
+        assert!(!s.gates_match_lock(), "a changed gate must break the lock");
+        // Re-arm → matches again.
+        s.lock_gates().unwrap();
+        assert!(s.gates_match_lock());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -19,6 +19,8 @@
 //! the lossless store: the index is quantized, the payload never is.
 
 use std::collections::{HashMap, HashSet};
+use std::io;
+use std::path::Path;
 
 const BM25_K1: f32 = 1.2;
 const BM25_B: f32 = 0.75;
@@ -201,6 +203,68 @@ impl Semantic {
         true
     }
 
+    /// Serialize the index to a self-describing text format: a header line
+    /// `zsem1<TAB>model_id<TAB>dim` then one `id:w0,w1,…` line per packed vector.
+    /// The header is what makes a persisted index **loud-stale** rather than
+    /// silently-wrong after an embedding-model swap across runs.
+    pub fn to_text(&self) -> String {
+        let mut s = format!("zsem1\t{}\t{}\n", self.model_id, self.dim);
+        for (id, words) in &self.vecs {
+            let w: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+            s.push_str(&format!("{id}:{}\n", w.join(",")));
+        }
+        s
+    }
+
+    /// Parse a [`to_text`](Semantic::to_text) dump. `None` if the header is missing
+    /// or malformed; individual unparseable vector lines are skipped.
+    pub fn from_text(text: &str) -> Option<Semantic> {
+        let mut lines = text.lines();
+        let mut head = lines.next()?.split('\t');
+        if head.next()? != "zsem1" {
+            return None;
+        }
+        let model_id = head.next()?.to_string();
+        let dim = head.next()?.parse().ok()?;
+        let mut idx = Semantic {
+            model_id,
+            dim,
+            vecs: Vec::new(),
+        };
+        for line in lines {
+            let Some((id_s, words_s)) = line.split_once(':') else {
+                continue;
+            };
+            let Ok(id) = id_s.trim().parse::<u64>() else {
+                continue;
+            };
+            let words: Option<Vec<u64>> = words_s
+                .split(',')
+                .filter(|w| !w.is_empty())
+                .map(|w| w.trim().parse::<u64>().ok())
+                .collect();
+            if let Some(words) = words {
+                idx.vecs.push((id, words));
+            }
+        }
+        Some(idx)
+    }
+
+    /// Persist to `path` so the index **outlives the run** — the difference between
+    /// session compaction and lifetime memory (and what makes the model-swap
+    /// staleness guard guard a case that can actually happen).
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, self.to_text())
+    }
+
+    /// Load a persisted index; `None` if absent or malformed.
+    pub fn load(path: &Path) -> Option<Semantic> {
+        Semantic::from_text(&std::fs::read_to_string(path).ok()?)
+    }
+
     /// The `k` nearest ids to a query from `(query_model, query_dim)`, closest
     /// first. **Returns empty (never wrong results) if the index is stale** — built
     /// by a different embedding model or dimension than the query. If `allowlist`
@@ -351,6 +415,46 @@ mod tests {
         // A wrong-dim embedding is rejected at add time, not silently mis-packed.
         assert!(!s.add(9, &[1.0, 1.0]));
         assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn semantic_persists_and_a_loaded_index_still_refuses_a_swap() {
+        let dir = std::env::temp_dir().join(format!(
+            "zero-recall-{}-{}",
+            std::process::id(),
+            crate::clock::unix_millis()
+        ));
+        let path = dir.join("sem.idx");
+        let mut s = Semantic::new("qwen-embed-4b", 4);
+        s.add(1, &[1.0, 1.0, 1.0, 1.0]);
+        s.add(2, &[1.0, 1.0, 1.0, -1.0]);
+        s.save(&path).unwrap();
+
+        // Reload from disk — lifetime memory across runs.
+        let loaded = Semantic::load(&path).unwrap();
+        assert_eq!(loaded.model_id(), "qwen-embed-4b");
+        assert_eq!(loaded.dim(), 4);
+        assert_eq!(loaded.len(), 2);
+        // Same model → scores; the persisted index is usable.
+        assert_eq!(
+            loaded.search(&[1.0, 1.0, 1.0, 1.0], "qwen-embed-4b", 5, None)[0].0,
+            1
+        );
+        // THE reachable staleness case: a different embedding model in the NEXT run
+        // against the persisted old-space vectors → refused (loud-stale, empty),
+        // never silent garbage.
+        assert!(loaded
+            .search(&[1.0, 1.0, 1.0, 1.0], "new-embed-model", 5, None)
+            .is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn semantic_from_text_rejects_a_bad_header_keeps_good_lines() {
+        assert!(Semantic::from_text("not a header").is_none());
+        let s = Semantic::from_text("zsem1\tm\t2\n1:5,7\ngarbage line\n2:9,1\n").unwrap();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.dim(), 2);
     }
 
     #[test]
