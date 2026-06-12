@@ -54,6 +54,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "toggle the agentic tool loop (read/list/grep/write/edit)",
     ),
     ("/clip", "copy last response, or code block n"),
+    ("/rules", "inspect/author project rules (status|doctor|add)"),
+    ("/logs", "show where this session's logs + artifacts live"),
     ("/quit", "leave Zero"),
     ("/exit", "leave Zero"),
 ];
@@ -320,6 +322,9 @@ pub struct App<I: Input, W: Write> {
     /// `None` (tests/no session) → compression still runs, just without a
     /// re-fetch path. Set from the session dir by the binary.
     artifact_dir: Option<PathBuf>,
+    /// Path to this session's transcript, so `/logs` can show the user exactly
+    /// where it is. `None` when logging is off (`--no-log`) or in tests.
+    log_path: Option<PathBuf>,
     /// Project rules + soft prose + warnings, discovered at config time. The rules
     /// drive the Gate at the tool boundary; the soft prose feeds the Projector.
     registry: zero_core::rules::Registry,
@@ -379,6 +384,7 @@ impl<I: Input, W: Write> App<I, W> {
             read_cache: zero_core::context::ReadCache::new(),
             context_stats: zero_core::context::ContextStats::new(),
             artifact_dir: None,
+            log_path: None,
             registry: zero_core::rules::Registry::default(),
             rules_block: String::new(),
         }
@@ -440,6 +446,11 @@ impl<I: Input, W: Write> App<I, W> {
     /// re-fetchable. The binary points this at the session's output directory.
     pub fn set_artifact_dir(&mut self, dir: Option<PathBuf>) {
         self.artifact_dir = dir;
+    }
+
+    /// Tell the app where its transcript lives, so `/logs` can surface it.
+    pub fn set_log_path(&mut self, path: Option<PathBuf>) {
+        self.log_path = path;
     }
 
     /// Turn the agentic tool loop on/off (the `/tools` toggle, exposed for
@@ -611,6 +622,24 @@ impl<I: Input, W: Write> App<I, W> {
                     "unknown /rules subcommand '{other}' — status, doctor, active, why, init, add\n"
                 ));
             }
+        }
+        self.write_text(&format!("\x1b[2m{out}\x1b[0m"))
+    }
+
+    /// `/logs` — tell the user exactly where this session's transcript and spilled
+    /// tool-output artifacts live. Logs are never hidden: ask and you get the path.
+    fn logs_command(&mut self) -> io::Result<()> {
+        let mut out = String::new();
+        match &self.log_path {
+            Some(p) => out.push_str(&format!("transcript: {}\n", p.display())),
+            None => out.push_str("transcript: (logging disabled this session)\n"),
+        }
+        match &self.artifact_dir {
+            Some(d) => out.push_str(&format!(
+                "artifacts:  {} (full tool outputs spilled here)\n",
+                d.display()
+            )),
+            None => out.push_str("artifacts:  (none this session)\n"),
         }
         self.write_text(&format!("\x1b[2m{out}\x1b[0m"))
     }
@@ -1004,6 +1033,11 @@ impl<I: Input, W: Write> App<I, W> {
             self.rules_command(arg)?;
             return Ok(Flow::Continue);
         }
+        if trimmed == "/logs" {
+            self.echo_committed(&text)?;
+            self.logs_command()?;
+            return Ok(Flow::Continue);
+        }
         if trimmed == "/tools" {
             self.echo_committed(&text)?;
             self.tools_enabled = !self.tools_enabled;
@@ -1041,6 +1075,7 @@ impl<I: Input, W: Write> App<I, W> {
     /// (no mid-turn queue/interrupt yet) — the threaded version is a follow-up.
     fn run_tool_turn(&mut self, prompt: &str) -> io::Result<()> {
         use std::cell::RefCell;
+        let turn_sw = Stopwatch::start();
         self.conv.push(Message::user(prompt));
         if let Some(log) = self.log.as_mut() {
             let _ = log.record_message(Role::User, prompt);
@@ -1225,8 +1260,11 @@ impl<I: Input, W: Write> App<I, W> {
                     self.last_usage = Some(outcome.usage);
                 }
                 self.last_blocks = crate::markdown::code_blocks(&outcome.final_text);
+                let usage = (outcome.usage.total() > 0)
+                    .then_some((outcome.usage.prompt_tokens, outcome.usage.completion_tokens));
                 if let Some(log) = self.log.as_mut() {
                     let _ = log.record_message(Role::Assistant, &outcome.final_text);
+                    let _ = log.record_turn_done(turn_sw.elapsed().as_millis(), usage);
                 }
             }
             Err(e) => {
@@ -1381,9 +1419,10 @@ impl<I: Input, W: Write> App<I, W> {
         // not push an empty assistant message that's paid on every later turn.
         if !reply.trim().is_empty() {
             self.conv.push(Message::assistant(&reply));
+            let usage = s.usage.map(|u| (u.prompt_tokens, u.completion_tokens));
             if let Some(log) = self.log.as_mut() {
                 let _ = log.record_message(Role::Assistant, &reply);
-                let _ = log.record_turn_done(elapsed.as_millis());
+                let _ = log.record_turn_done(elapsed.as_millis(), usage);
             }
         }
         self.last_reply = reply.clone();
@@ -3209,6 +3248,36 @@ mod tests {
         assert_eq!(sys.role, Role::System);
         assert_eq!(sys.content, "custom sys prompt");
         assert!(!sys.content.contains("terminal coding assistant"));
+    }
+
+    #[test]
+    fn logs_command_shows_transcript_and_artifact_paths() {
+        let mut a = app(b"");
+        a.set_log_path(Some(PathBuf::from(
+            "/home/u/.zero/sessions/proj/zero-42.jsonl",
+        )));
+        a.set_artifact_dir(Some(PathBuf::from("/home/u/.zero/outputs/99")));
+        type_str(&mut a, "/logs");
+        a.dispatch(Key::Enter).unwrap();
+        let out = rendered(&a);
+        assert!(
+            out.contains("zero-42.jsonl"),
+            "transcript path not shown: {out}"
+        );
+        assert!(
+            out.contains("/home/u/.zero/outputs/99"),
+            "artifact dir not shown"
+        );
+    }
+
+    #[test]
+    fn logs_command_handles_no_log_session() {
+        let mut a = app(b"");
+        // No log_path / artifact_dir set (e.g. --no-log) → say so, don't crash.
+        type_str(&mut a, "/logs");
+        a.dispatch(Key::Enter).unwrap();
+        let out = rendered(&a);
+        assert!(out.contains("logging disabled") || out.contains("transcript:"));
     }
 
     #[test]

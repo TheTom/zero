@@ -147,6 +147,22 @@ fn no_log_suppresses_the_session_log_line() {
 }
 
 #[test]
+fn logs_subcommand_prints_log_and_artifact_locations() {
+    // `zero logs` must tell the user where logs + artifacts live — no backend,
+    // no hidden paths. (HOME is isolated by run_in_home.)
+    let (stdout, stderr, code, home) = run_in_home(&["logs"], None);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.contains("session logs:"), "stdout: {stdout}");
+    assert!(stdout.contains("tool artifacts:"), "stdout: {stdout}");
+    // The session path is under the isolated HOME's dot-dir.
+    assert!(
+        stdout.contains(&home.join(".zero").join("sessions").display().to_string()),
+        "session path not under HOME: {stdout}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn headless_tools_run_bash_against_a_real_http_backend() {
     // The full real path through the binary: a localhost HTTP server speaks just
     // enough OpenAI to (1) ask for a `bash` tool call running a sentinel echo,

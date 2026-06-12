@@ -78,12 +78,31 @@ impl<W: Write> SessionLog<W> {
         ])
     }
 
-    /// Record that a turn finished, with the measured elapsed milliseconds.
-    pub fn record_turn_done(&mut self, elapsed_ms: u128) -> io::Result<()> {
-        self.write_object(vec![
+    /// Record that a turn finished, with the measured elapsed milliseconds and,
+    /// when the server reported it, the real `(prompt, completion)` token usage —
+    /// honest numbers in the transcript, never an estimate. `None` (e.g. the stub
+    /// backend) omits the token fields rather than logging zeros.
+    pub fn record_turn_done(
+        &mut self,
+        elapsed_ms: u128,
+        usage: Option<(u64, u64)>,
+    ) -> io::Result<()> {
+        let mut fields = vec![
             ("kind".to_string(), Value::Str("turn_done".to_string())),
             ("elapsed_ms".to_string(), Value::Num(elapsed_ms as f64)),
-        ])
+        ];
+        if let Some((prompt, completion)) = usage {
+            fields.push(("prompt_tokens".to_string(), Value::Num(prompt as f64)));
+            fields.push((
+                "completion_tokens".to_string(),
+                Value::Num(completion as f64),
+            ));
+            fields.push((
+                "total_tokens".to_string(),
+                Value::Num((prompt + completion) as f64),
+            ));
+        }
+        self.write_object(fields)
     }
 
     /// Record a free-form metadata event (session start, model name, etc.).
@@ -137,11 +156,32 @@ mod tests {
     #[test]
     fn turn_done_records_measured_elapsed() {
         let mut log = SessionLog::from_writer(Vec::new());
-        log.record_turn_done(1234).unwrap();
+        log.record_turn_done(1234, None).unwrap();
         let rows = lines(&log.sink);
         assert_eq!(
             rows[0].get("elapsed_ms").and_then(Value::as_f64),
             Some(1234.0)
+        );
+        // No usage → token fields are omitted, not logged as zero.
+        assert!(rows[0].get("total_tokens").is_none());
+    }
+
+    #[test]
+    fn turn_done_records_real_token_usage_when_present() {
+        let mut log = SessionLog::from_writer(Vec::new());
+        log.record_turn_done(50, Some((1200, 340))).unwrap();
+        let row = &lines(&log.sink)[0];
+        assert_eq!(
+            row.get("prompt_tokens").and_then(Value::as_f64),
+            Some(1200.0)
+        );
+        assert_eq!(
+            row.get("completion_tokens").and_then(Value::as_f64),
+            Some(340.0)
+        );
+        assert_eq!(
+            row.get("total_tokens").and_then(Value::as_f64),
+            Some(1540.0)
         );
     }
 

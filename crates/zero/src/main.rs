@@ -59,6 +59,11 @@ fn run(args: &Args) -> std::io::Result<()> {
     if let Some((sub, text)) = &args.rules {
         return do_rules(sub, text.as_deref(), args.rules_global);
     }
+    // `zero logs` — print where this project's logs + spilled artifacts live, so
+    // they're never hidden. No backend needed.
+    if args.logs {
+        return do_logs();
+    }
 
     let cfg_path = args
         .config_path
@@ -89,8 +94,8 @@ fn run(args: &Args) -> std::io::Result<()> {
         }
     };
 
-    let log = if args.no_log {
-        None
+    let (log, log_path) = if args.no_log {
+        (None, None)
     } else {
         open_log(backend.name())
     };
@@ -102,6 +107,7 @@ fn run(args: &Args) -> std::io::Result<()> {
         let prompt = if p == "-" { read_stdin()? } else { p.clone() };
         let mut app = App::new(EofInput, std::io::stderr(), backend, log);
         app.set_config(cfg.clone(), Some(cfg_path.clone()), servers_path());
+        app.set_log_path(log_path);
         app.set_artifact_dir(outputs_dir());
         app.set_tools_enabled(args.tools);
         app.set_auto_accept(args.accept_edits);
@@ -129,6 +135,7 @@ fn run(args: &Args) -> std::io::Result<()> {
     })?;
     let mut app = App::new(term, std::io::stdout(), backend, log);
     app.set_config(cfg.clone(), Some(cfg_path.clone()), servers_path());
+    app.set_log_path(log_path);
     app.set_info(format!("{}\nconfig: {}", cfg.summary(), cfg_path.display()));
     // MCP server definitions live next to the config (~/.zero/mcp.json), and are
     // also imported from Claude Desktop / Claude Code + the project's .mcp.json.
@@ -191,18 +198,74 @@ fn do_rules(sub: &str, text: Option<&str>, global: bool) -> std::io::Result<()> 
     Ok(())
 }
 
-/// Open a session transcript, logging a hint to stderr. Never fatal.
-fn open_log(backend_name: &str) -> Option<SessionLog<std::fs::File>> {
-    let dir = session_dir()?;
+/// `zero logs` — tell the user exactly where their logs and spilled tool-output
+/// artifacts live (and the most recent transcript), so nothing is hidden.
+fn do_logs() -> std::io::Result<()> {
+    match session_dir() {
+        Some(dir) => {
+            println!("session logs: {}", dir.display());
+            // The most recent transcript in this project's log dir, if any.
+            if let Some(latest) = latest_transcript(&dir) {
+                println!("  latest:    {}", latest.display());
+            }
+            if let Some(d) = std::env::var_os("ZERO_SESSION_DIR") {
+                println!(
+                    "  (location set by ZERO_SESSION_DIR={})",
+                    d.to_string_lossy()
+                );
+            }
+        }
+        None => println!("session logs: unavailable (no HOME)"),
+    }
+    if let Some(out) = home().map(|h| h.join(zero_core::brand::dot_dir()).join("outputs")) {
+        println!(
+            "tool artifacts: {} (spilled full tool outputs, per launch)",
+            out.display()
+        );
+    }
+    Ok(())
+}
+
+/// Newest `*.jsonl` transcript under `dir`, by filename (names embed a unix time).
+fn latest_transcript(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut newest: Option<std::path::PathBuf> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if p.extension().is_some_and(|e| e == "jsonl")
+            && newest
+                .as_ref()
+                .is_none_or(|n| p.file_name() > n.file_name())
+        {
+            newest = Some(p);
+        }
+    }
+    newest
+}
+
+/// Open a session transcript, logging a hint to stderr. Never fatal. Returns the
+/// log and the path it opened so the frontend can show it on `/logs`.
+fn open_log(
+    backend_name: &str,
+) -> (
+    Option<SessionLog<std::fs::File>>,
+    Option<std::path::PathBuf>,
+) {
+    let Some(dir) = session_dir() else {
+        return (None, None);
+    };
     match SessionLog::create_in(&dir) {
         Ok((mut log, path)) => {
+            // Self-describing transcript: what model and which working directory.
             let _ = log.record_meta("backend", backend_name);
+            if let Ok(cwd) = std::env::current_dir() {
+                let _ = log.record_meta("cwd", &cwd.display().to_string());
+            }
             eprintln!("zero: logging to {}", path.display());
-            Some(log)
+            (Some(log), Some(path))
         }
         Err(e) => {
             eprintln!("zero: session log disabled ({e})");
-            None
+            (None, None)
         }
     }
 }
@@ -215,8 +278,35 @@ fn config_path() -> Option<std::path::PathBuf> {
     home().map(|h| h.join(zero_core::brand::dot_dir()).join("config.json"))
 }
 
+/// Where session transcripts live. Honors `ZERO_SESSION_DIR` (let the user put
+/// logs wherever they want — no hidden location), else `~/.{slug}/sessions`, and
+/// nests a **per-project** subdirectory (sanitized cwd) so "the logs for *this*
+/// repo" are findable instead of one flat pile across every project.
 fn session_dir() -> Option<std::path::PathBuf> {
-    home().map(|h| h.join(zero_core::brand::dot_dir()).join("sessions"))
+    let base = match std::env::var_os("ZERO_SESSION_DIR") {
+        Some(d) => std::path::PathBuf::from(d),
+        None => home()?.join(zero_core::brand::dot_dir()).join("sessions"),
+    };
+    Some(match std::env::current_dir().ok() {
+        Some(cwd) => base.join(project_slug(&cwd)),
+        None => base,
+    })
+}
+
+/// Turn a working-directory path into a single safe directory name, e.g.
+/// `/Users/tom/dev/zero` → `Users-tom-dev-zero` (mirrors Claude Code's scheme).
+fn project_slug(cwd: &std::path::Path) -> String {
+    let s: String = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let trimmed = s.trim_matches('-');
+    if trimmed.is_empty() {
+        "root".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Per-launch directory for spilled tool-output artifacts (the re-fetch path for
@@ -255,6 +345,8 @@ struct Args {
     rules: Option<(String, Option<String>)>,
     /// `--global`: target `~/.{slug}/` for `rules init|add` instead of the cwd.
     rules_global: bool,
+    /// `logs` headless subcommand: print where this project's logs + artifacts live.
+    logs: bool,
 }
 
 impl Args {
@@ -273,6 +365,7 @@ impl Args {
                 "--tools" => out.tools = true,
                 "--accept-edits" => out.accept_edits = true,
                 "--global" => out.rules_global = true,
+                "logs" => out.logs = true,
                 "rules" => {
                     let sub = it
                         .next()
@@ -405,7 +498,32 @@ mod tests {
             assert!(p.ends_with("config.json"));
         }
         if let Some(d) = session_dir() {
-            assert!(d.ends_with("sessions"));
+            // Now nests a per-project subdir under `sessions/`.
+            assert!(d.to_string_lossy().contains("sessions"));
+            assert!(d.parent().is_some_and(|p| p.ends_with("sessions")));
+        }
+    }
+
+    #[test]
+    fn project_slug_sanitizes_paths() {
+        assert_eq!(
+            project_slug(std::path::Path::new("/Users/tom/dev/zero")),
+            "Users-tom-dev-zero"
+        );
+        assert_eq!(project_slug(std::path::Path::new("/")), "root");
+        assert_eq!(project_slug(std::path::Path::new("/a/b_c.d")), "a-b-c-d");
+    }
+
+    #[test]
+    fn session_dir_honors_env_override() {
+        // Saving + restoring the env var keeps this test isolated.
+        let prev = std::env::var_os("ZERO_SESSION_DIR");
+        std::env::set_var("ZERO_SESSION_DIR", "/tmp/zero-logs-test");
+        let d = session_dir().unwrap();
+        assert!(d.to_string_lossy().starts_with("/tmp/zero-logs-test"));
+        match prev {
+            Some(v) => std::env::set_var("ZERO_SESSION_DIR", v),
+            None => std::env::remove_var("ZERO_SESSION_DIR"),
         }
     }
 }

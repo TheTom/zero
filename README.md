@@ -123,7 +123,21 @@ serves a different one.
 > Cloud endpoints (`https://`) aren't supported yet — Zero is local-first and
 > currently speaks plain `http` only. TLS is a later addition.
 
-Sessions log to `~/.zero/sessions/zero-<unixtime>.jsonl`.
+### Logs are never hidden
+
+Every session appends a JSONL transcript under
+`~/.zero/sessions/<project>/zero-<unixtime>.jsonl` — one file per session, nested
+in a per-project subdir so *this* repo's logs are easy to find. It records the
+full turn: user/assistant messages, **every tool call (name + raw arguments) and
+result** (with raw-vs-kept bytes so capping is visible), and per-turn elapsed +
+real server-reported token usage — measured, never estimated.
+
+- **`/logs`** (in the app) or **`zero logs`** (headless) prints exactly where the
+  current transcript and the spilled tool-output artifacts live — ask and you get
+  the path, no spelunking.
+- **`ZERO_SESSION_DIR`** redirects the log location anywhere you want.
+- Full tool outputs that were capped for the model are spilled whole to
+  `~/.zero/outputs/` and referenced from the transcript, so nothing is lost.
 
 ### Status line
 
