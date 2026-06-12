@@ -64,6 +64,10 @@ fn run(args: &Args) -> std::io::Result<()> {
     if args.logs {
         return do_logs();
     }
+    // `zero sessions` — list saved sessions for this project. No backend needed.
+    if args.sessions {
+        return do_sessions();
+    }
 
     let cfg_path = args
         .config_path
@@ -143,6 +147,18 @@ fn run(args: &Args) -> std::io::Result<()> {
     app.set_mcp_discovery(home(), std::env::current_dir().ok());
     // Where full tool outputs spill so compressed results stay re-fetchable.
     app.set_artifact_dir(outputs_dir());
+    // `resume <id>`: preload a prior session's user/assistant thread so the model
+    // continues with that context. Non-fatal — a bad id just starts fresh.
+    if let Some(id) = &args.resume {
+        match resolve_session(id).and_then(|p| zero_core::session::load_conversation(&p)) {
+            Ok(conv) => {
+                let n = conv.messages.len();
+                app.set_conversation(conv);
+                eprintln!("zero: resumed {n} message(s) from session {id}");
+            }
+            Err(e) => eprintln!("zero: resume failed ({e}); starting fresh"),
+        }
+    }
     app.run()
 }
 
@@ -196,6 +212,44 @@ fn do_rules(sub: &str, text: Option<&str>, global: bool) -> std::io::Result<()> 
         }
     }
     Ok(())
+}
+
+/// `zero sessions` — list saved sessions for this project, newest first.
+fn do_sessions() -> std::io::Result<()> {
+    let Some(dir) = session_dir() else {
+        println!("no sessions (no HOME)");
+        return Ok(());
+    };
+    let sessions = zero_core::session::list_sessions(&dir);
+    if sessions.is_empty() {
+        println!("no sessions yet under {}", dir.display());
+        return Ok(());
+    }
+    println!("sessions in {} (newest first):", dir.display());
+    for s in &sessions {
+        let preview: String = s
+            .first_prompt
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(60)
+            .collect();
+        let model = s.model.as_deref().unwrap_or("?");
+        println!(
+            "  {}  · {} turn(s) · {}  · {}",
+            s.id, s.turns, model, preview
+        );
+    }
+    println!("\nresume with: zero resume <id>");
+    Ok(())
+}
+
+/// Resolve a user-typed session id to a transcript path within this project's
+/// session dir (delegates to the core resolver).
+fn resolve_session(id: &str) -> std::io::Result<std::path::PathBuf> {
+    let dir = session_dir().ok_or_else(|| std::io::Error::other("no session dir ($HOME unset)"))?;
+    zero_core::session::resolve_session(&dir, id).map_err(std::io::Error::other)
 }
 
 /// `zero logs` — tell the user exactly where their logs and spilled tool-output
@@ -347,6 +401,12 @@ struct Args {
     rules_global: bool,
     /// `logs` headless subcommand: print where this project's logs + artifacts live.
     logs: bool,
+    /// `sessions` headless subcommand: list saved sessions for this project.
+    sessions: bool,
+    /// `resume <id>` / `--resume <id>`: preload a prior session's conversation into
+    /// the interactive TUI and continue it. `id` is a transcript stem (or a unique
+    /// prefix/substring of one).
+    resume: Option<String>,
 }
 
 impl Args {
@@ -366,6 +426,10 @@ impl Args {
                 "--accept-edits" => out.accept_edits = true,
                 "--global" => out.rules_global = true,
                 "logs" => out.logs = true,
+                "sessions" => out.sessions = true,
+                "resume" | "--resume" => {
+                    out.resume = Some(it.next().ok_or("resume needs a session id")?);
+                }
                 "rules" => {
                     let sub = it
                         .next()
@@ -426,7 +490,13 @@ fn print_usage() {
          \x20 --instant        stub streams with no pacing delay\n\
          \x20 --no-log         do not write a session transcript\n\
          \x20 -h, --help       show this help\n\n\
-         config: ~/.zero/config.json (created on first run)\n"
+         subcommands:\n\
+         \x20 logs             print where this project's logs + artifacts live\n\
+         \x20 sessions         list saved sessions for this project\n\
+         \x20 resume <id>      continue a saved session (id from `zero sessions`)\n\
+         \x20 rules <cmd>      init|add|status|doctor — project rules\n\n\
+         config: ~/.zero/config.json (created on first run)\n\
+         logs:   ~/.zero/sessions/<project>/  (override with ZERO_SESSION_DIR)\n"
     );
 }
 

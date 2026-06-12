@@ -135,6 +135,11 @@ real server-reported token usage — measured, never estimated.
 - **`/logs`** (in the app) or **`zero logs`** (headless) prints exactly where the
   current transcript and the spilled tool-output artifacts live — ask and you get
   the path, no spelunking.
+- **Sessions have ids and resume.** Each transcript stem is the session id.
+  **`/sessions`** (or `zero sessions`) lists this project's sessions newest-first
+  (id · turns · first-prompt preview); **`/resume <id>`** (or `zero resume <id>`,
+  id can be a unique prefix) restores that session's user/assistant thread and
+  continues it.
 - **`ZERO_SESSION_DIR`** redirects the log location anywhere you want.
 - Full tool outputs that were capped for the model are spilled whole to
   `~/.zero/outputs/` and referenced from the transcript, so nothing is lost.

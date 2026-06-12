@@ -147,6 +147,53 @@ fn no_log_suppresses_the_session_log_line() {
 }
 
 #[test]
+fn sessions_subcommand_lists_prior_runs() {
+    // Run two headless prompts (which now log), then `zero sessions` lists them.
+    let home = std::env::temp_dir().join(format!("zero-sess-cli-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let bin = zero_bin();
+    let run_p = |prompt: &str| {
+        Command::new(bin)
+            .args(["-p", prompt, "--stub"])
+            .env("HOME", &home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn");
+    };
+    run_p("alpha session prompt");
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    run_p("beta session prompt");
+
+    let out = Command::new(bin)
+        .args(["sessions"])
+        .env("HOME", &home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("alpha session prompt"),
+        "missing alpha: {stdout}"
+    );
+    assert!(
+        stdout.contains("beta session prompt"),
+        "missing beta: {stdout}"
+    );
+    // Newest first: beta appears before alpha.
+    let (ib, ia) = (stdout.find("beta").unwrap(), stdout.find("alpha").unwrap());
+    assert!(ib < ia, "not newest-first: {stdout}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn logs_subcommand_prints_log_and_artifact_locations() {
     // `zero logs` must tell the user where logs + artifacts live — no backend,
     // no hidden paths. (HOME is isolated by run_in_home.)

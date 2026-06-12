@@ -10,7 +10,7 @@
 
 use crate::clock::unix_millis;
 use crate::json::Value;
-use crate::message::Role;
+use crate::message::{Conversation, Message, Role};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -21,15 +21,168 @@ pub struct SessionLog<W: Write> {
 }
 
 impl SessionLog<File> {
-    /// Create `dir/zero-<unix_seconds>.jsonl`, making `dir` if needed. Returns
-    /// the log and the path it opened, so the frontend can show it to the user.
+    /// Create `dir/zero-<unix_millis>.jsonl`, making `dir` if needed. The file stem
+    /// is the **session id** (used by listing/resume). Millisecond granularity plus
+    /// a collision suffix means two launches never clobber one another's transcript.
+    /// Returns the log and the path it opened, so the frontend can show it.
     pub fn create_in(dir: impl AsRef<Path>) -> io::Result<(Self, PathBuf)> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
-        let path = dir.join(format!("zero-{}.jsonl", crate::clock::unix_seconds()));
-        let file = File::create(&path)?;
-        Ok((SessionLog { sink: file }, path))
+        let base = crate::clock::unix_millis();
+        // create_new fails if the path exists → bump a suffix instead of truncating
+        // a live transcript (File::create would clobber it).
+        for n in 0..1000 {
+            let name = if n == 0 {
+                format!("zero-{base}.jsonl")
+            } else {
+                format!("zero-{base}-{n}.jsonl")
+            };
+            let path = dir.join(name);
+            match File::options().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok((SessionLog { sink: file }, path)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::other("could not allocate a unique session file"))
     }
+}
+
+/// The session id for a transcript path: the file stem (e.g. `zero-1718…`).
+pub fn session_id(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// A one-line summary of a saved session, for `/sessions` listing and resume.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionInfo {
+    /// The session id (transcript file stem).
+    pub id: String,
+    /// Full path to the transcript.
+    pub path: PathBuf,
+    /// Wall-clock start (first `ts_ms` seen), 0 if unknown.
+    pub started_ms: u64,
+    /// Number of completed turns (`turn_done` lines).
+    pub turns: usize,
+    /// The model/backend recorded at session start, if any.
+    pub model: Option<String>,
+    /// The first user prompt — a preview to recognize the session by.
+    pub first_prompt: String,
+}
+
+/// List saved sessions under `dir`, newest first (by start time). Best-effort: an
+/// unreadable or malformed transcript is skipped, never fatal. Returns empty if the
+/// directory doesn't exist.
+pub fn list_sessions(dir: &Path) -> Vec<SessionInfo> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        out.push(summarize(session_id(&path), path.clone(), &text));
+    }
+    // Newest first; stable tie-break on id so the order is deterministic.
+    out.sort_by(|a, b| {
+        b.started_ms
+            .cmp(&a.started_ms)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    out
+}
+
+/// Summarize one transcript's text into a [`SessionInfo`].
+fn summarize(id: String, path: PathBuf, text: &str) -> SessionInfo {
+    let mut started_ms = 0u64;
+    let mut turns = 0usize;
+    let mut model = None;
+    let mut first_prompt = String::new();
+    for line in text.lines() {
+        let Ok(v) = Value::parse(line) else { continue };
+        if started_ms == 0 {
+            if let Some(ts) = v.get("ts_ms").and_then(Value::as_f64) {
+                started_ms = ts as u64;
+            }
+        }
+        match v.get("kind").and_then(Value::as_str) {
+            Some("turn_done") => turns += 1,
+            Some("meta") if v.get("key").and_then(Value::as_str) == Some("backend") => {
+                model = v.get("value").and_then(Value::as_str).map(str::to_string);
+            }
+            Some("message")
+                if first_prompt.is_empty()
+                    && v.get("role").and_then(Value::as_str) == Some("user") =>
+            {
+                first_prompt = v
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+            }
+            _ => {}
+        }
+    }
+    SessionInfo {
+        id,
+        path,
+        started_ms,
+        turns,
+        model,
+        first_prompt,
+    }
+}
+
+/// Resolve a user-typed session `id` to a transcript path under `dir`: an exact
+/// stem match wins, otherwise a *unique* substring match. `Err` carries a
+/// human-readable reason (not found / ambiguous) suitable for showing the user.
+pub fn resolve_session(dir: &Path, id: &str) -> Result<PathBuf, String> {
+    let sessions = list_sessions(dir);
+    if let Some(s) = sessions.iter().find(|s| s.id == id) {
+        return Ok(s.path.clone());
+    }
+    let matches: Vec<&SessionInfo> = sessions.iter().filter(|s| s.id.contains(id)).collect();
+    match matches.as_slice() {
+        [one] => Ok(one.path.clone()),
+        [] => Err(format!("no session matching '{id}'")),
+        many => Err(format!(
+            "'{id}' is ambiguous — matches {} sessions; use a full id",
+            many.len()
+        )),
+    }
+}
+
+/// Replay a saved transcript back into a [`Conversation`] for resume: the ordered
+/// user + assistant **text** turns. Tool calls/results stay as audit detail in the
+/// log and are not reconstructed into context (their request-id linkage isn't
+/// recoverable, and the assistant replies already summarize what happened).
+pub fn load_conversation(path: &Path) -> io::Result<Conversation> {
+    let text = fs::read_to_string(path)?;
+    let mut conv = Conversation::new();
+    for line in text.lines() {
+        let Ok(v) = Value::parse(line) else { continue };
+        if v.get("kind").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let role = v
+            .get("role")
+            .and_then(Value::as_str)
+            .and_then(Role::from_wire);
+        let body = v.get("text").and_then(Value::as_str).unwrap_or("");
+        match role {
+            Some(Role::User) => conv.push(Message::user(body)),
+            Some(Role::Assistant) => conv.push(Message::assistant(body)),
+            _ => {} // skip system/tool — rebuild a clean user↔assistant thread
+        }
+    }
+    Ok(conv)
 }
 
 impl<W: Write> SessionLog<W> {
@@ -227,6 +380,112 @@ mod tests {
         let text = String::from_utf8(log.sink).unwrap();
         assert_eq!(text.lines().count(), 3);
         assert!(text.ends_with('\n'));
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "zero-sess-{}-{}-{tag}",
+            std::process::id(),
+            crate::clock::unix_millis()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn create_in_never_clobbers_an_existing_transcript() {
+        // Two sessions opened back-to-back get distinct files, even same-millisecond.
+        let dir = temp_dir("noclobber");
+        let (mut a, pa) = SessionLog::create_in(&dir).unwrap();
+        let (mut b, pb) = SessionLog::create_in(&dir).unwrap();
+        a.record_message(Role::User, "from a").unwrap();
+        b.record_message(Role::User, "from b").unwrap();
+        assert_ne!(pa, pb, "two sessions must not share a file");
+        assert!(std::fs::read_to_string(&pa).unwrap().contains("from a"));
+        assert!(std::fs::read_to_string(&pb).unwrap().contains("from b"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_sessions_summarizes_newest_first() {
+        let dir = temp_dir("list");
+        // Session 1: one turn, a prompt.
+        {
+            let (mut log, _) = SessionLog::create_in(&dir).unwrap();
+            log.record_meta("backend", "qwen").unwrap();
+            log.record_message(Role::User, "first session prompt")
+                .unwrap();
+            log.record_message(Role::Assistant, "ok").unwrap();
+            log.record_turn_done(10, None).unwrap();
+        }
+        // Ensure a distinct, later start time for session 2.
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        {
+            let (mut log, _) = SessionLog::create_in(&dir).unwrap();
+            log.record_message(Role::User, "second session prompt")
+                .unwrap();
+            log.record_turn_done(5, None).unwrap();
+            log.record_turn_done(5, None).unwrap();
+        }
+        let sessions = list_sessions(&dir);
+        assert_eq!(sessions.len(), 2);
+        // Newest first.
+        assert_eq!(sessions[0].first_prompt, "second session prompt");
+        assert_eq!(sessions[0].turns, 2);
+        assert_eq!(sessions[1].first_prompt, "first session prompt");
+        assert_eq!(sessions[1].turns, 1);
+        assert_eq!(sessions[1].model.as_deref(), Some("qwen"));
+        assert!(sessions[0].id.starts_with("zero-"));
+        assert!(sessions[0].started_ms > 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_sessions_skips_malformed_and_missing_dir() {
+        assert!(list_sessions(std::path::Path::new("/no/such/zero/dir")).is_empty());
+        let dir = temp_dir("malformed");
+        std::fs::write(dir.join("zero-bad.jsonl"), "{not json\nalso bad").unwrap();
+        std::fs::write(dir.join("ignore.txt"), "not a transcript").unwrap();
+        // A malformed transcript still lists (as an empty-ish summary), the .txt is skipped.
+        let s = list_sessions(&dir);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].turns, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_conversation_rebuilds_the_user_assistant_thread() {
+        let dir = temp_dir("resume");
+        let path = {
+            let (mut log, path) = SessionLog::create_in(&dir).unwrap();
+            log.record_meta("backend", "m").unwrap();
+            log.record_message(Role::User, "what is 2+2").unwrap();
+            log.record_tool_call("bash", r#"{"command":"echo 4"}"#)
+                .unwrap();
+            log.record_tool_result("bash", "4", 2, 2).unwrap();
+            log.record_message(Role::Assistant, "It's 4.").unwrap();
+            log.record_turn_done(7, None).unwrap();
+            log.record_message(Role::User, "and 3+3").unwrap();
+            log.record_message(Role::Assistant, "6.").unwrap();
+            path
+        };
+        let conv = load_conversation(&path).unwrap();
+        // Clean alternating thread; tool_call/result/meta/turn_done are dropped.
+        assert_eq!(conv.messages.len(), 4);
+        assert_eq!(conv.messages[0].role, Role::User);
+        assert_eq!(conv.messages[0].content, "what is 2+2");
+        assert_eq!(conv.messages[1].role, Role::Assistant);
+        assert_eq!(conv.messages[1].content, "It's 4.");
+        assert_eq!(conv.messages[3].content, "6.");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_id_is_the_file_stem() {
+        assert_eq!(
+            session_id(std::path::Path::new("/x/zero-123.jsonl")),
+            "zero-123"
+        );
     }
 
     #[test]

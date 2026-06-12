@@ -56,6 +56,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clip", "copy last response, or code block n"),
     ("/rules", "inspect/author project rules (status|doctor|add)"),
     ("/logs", "show where this session's logs + artifacts live"),
+    ("/sessions", "list saved sessions for this project"),
+    ("/resume", "resume a saved session: /resume <id>"),
     ("/quit", "leave Zero"),
     ("/exit", "leave Zero"),
 ];
@@ -453,6 +455,11 @@ impl<I: Input, W: Write> App<I, W> {
         self.log_path = path;
     }
 
+    /// Preload a conversation (used by `resume` to continue a prior session).
+    pub fn set_conversation(&mut self, conv: Conversation) {
+        self.conv = conv;
+    }
+
     /// Turn the agentic tool loop on/off (the `/tools` toggle, exposed for
     /// headless runs and integration tests).
     pub fn set_tools_enabled(&mut self, on: bool) {
@@ -644,6 +651,62 @@ impl<I: Input, W: Write> App<I, W> {
         self.write_text(&format!("\x1b[2m{out}\x1b[0m"))
     }
 
+    /// The directory holding this project's transcripts (the log path's parent).
+    fn sessions_dir(&self) -> Option<&std::path::Path> {
+        self.log_path.as_deref().and_then(|p| p.parent())
+    }
+
+    /// `/sessions` — list saved sessions for this project, newest first.
+    fn sessions_command(&mut self) -> io::Result<()> {
+        let Some(dir) = self.sessions_dir() else {
+            return self.write_text("\x1b[2mno session dir (logging disabled)\x1b[0m\n");
+        };
+        let sessions = zero_core::session::list_sessions(dir);
+        if sessions.is_empty() {
+            return self.write_text("\x1b[2mno saved sessions yet\x1b[0m\n");
+        }
+        let mut out = String::from("saved sessions (newest first):\n");
+        for s in &sessions {
+            let preview: String = s
+                .first_prompt
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(50)
+                .collect();
+            out.push_str(&format!(
+                "  {}  · {} turn(s) · {}\n",
+                s.id, s.turns, preview
+            ));
+        }
+        out.push_str("resume with: /resume <id>\n");
+        self.write_text(&format!("\x1b[2m{out}\x1b[0m"))
+    }
+
+    /// `/resume <id>` — replace the live conversation with a prior session's
+    /// user/assistant thread and continue from there.
+    fn resume_command(&mut self, id: &str) -> io::Result<()> {
+        if id.is_empty() {
+            return self.write_text("\x1b[2musage: /resume <id> (see /sessions)\x1b[0m\n");
+        }
+        let Some(dir) = self.sessions_dir().map(std::path::Path::to_path_buf) else {
+            return self.write_text("\x1b[2mresume unavailable (logging disabled)\x1b[0m\n");
+        };
+        match zero_core::session::resolve_session(&dir, id)
+            .and_then(|p| zero_core::session::load_conversation(&p).map_err(|e| e.to_string()))
+        {
+            Ok(conv) => {
+                let n = conv.messages.len();
+                self.conv = conv;
+                self.write_text(&format!(
+                    "\x1b[2mresumed {n} message(s) from session matching '{id}'\x1b[0m\n"
+                ))
+            }
+            Err(e) => self.write_text(&format!("\x1b[2mresume failed: {e}\x1b[0m\n")),
+        }
+    }
+
     /// Read-only view of the live conversation (for headless callers and
     /// integration tests that assert on what was fed back to the model).
     pub fn conversation(&self) -> &Conversation {
@@ -671,7 +734,11 @@ impl<I: Input, W: Write> App<I, W> {
         if self.tools_enabled {
             self.run_tool_turn(prompt)?;
         } else {
+            let turn_sw = Stopwatch::start();
             self.conv.push(Message::user(prompt));
+            if let Some(log) = self.log.as_mut() {
+                let _ = log.record_message(Role::User, prompt);
+            }
             let timeout = Duration::from_secs(120);
             let req = with_system(&self.conv, &self.projected_system());
             match self.backend.complete(&req, &[], timeout) {
@@ -680,6 +747,13 @@ impl<I: Input, W: Write> App<I, W> {
                     self.conv.push(Message::assistant(&c.content));
                     if let Some(u) = c.usage {
                         self.last_usage = Some(u);
+                    }
+                    // Log the turn so headless `-p` sessions are listable + resumable
+                    // (previously the non-tools path wrote nothing to the transcript).
+                    let usage = c.usage.map(|u| (u.prompt_tokens, u.completion_tokens));
+                    if let Some(log) = self.log.as_mut() {
+                        let _ = log.record_message(Role::Assistant, &c.content);
+                        let _ = log.record_turn_done(turn_sw.elapsed().as_millis(), usage);
                     }
                     self.last_reply = c.content;
                 }
@@ -1036,6 +1110,16 @@ impl<I: Input, W: Write> App<I, W> {
         if trimmed == "/logs" {
             self.echo_committed(&text)?;
             self.logs_command()?;
+            return Ok(Flow::Continue);
+        }
+        if trimmed == "/sessions" {
+            self.echo_committed(&text)?;
+            self.sessions_command()?;
+            return Ok(Flow::Continue);
+        }
+        if let Some(id) = trimmed.strip_prefix("/resume ") {
+            self.echo_committed(&text)?;
+            self.resume_command(id.trim())?;
             return Ok(Flow::Continue);
         }
         if trimmed == "/tools" {
@@ -2773,7 +2857,7 @@ mod tests {
     #[test]
     fn tab_also_completes_a_unique_partial_command() {
         let mut a = app(b"");
-        type_into(&mut a, "/se");
+        type_into(&mut a, "/serv");
         a.dispatch(Key::Tab).unwrap();
         assert_eq!(a.editor.text(), "/servers");
     }
@@ -3278,6 +3362,60 @@ mod tests {
         a.dispatch(Key::Enter).unwrap();
         let out = rendered(&a);
         assert!(out.contains("logging disabled") || out.contains("transcript:"));
+    }
+
+    #[test]
+    fn sessions_and_resume_round_trip_through_the_tui() {
+        // Write a prior transcript, then a second App pointed at the same dir lists
+        // it via /sessions and restores its thread via /resume.
+        let dir =
+            std::env::temp_dir().join(format!("zero-resume-{}-{}", std::process::id(), line!()));
+        let prior_path = {
+            let (mut log, path) = zero_core::session::SessionLog::create_in(&dir).unwrap();
+            log.record_message(Role::User, "remember the magic word is platypus")
+                .unwrap();
+            log.record_message(Role::Assistant, "Noted: platypus.")
+                .unwrap();
+            log.record_turn_done(5, None).unwrap();
+            path
+        };
+        let id = zero_core::session::session_id(&prior_path);
+
+        // A new session whose log lives in the same dir (so sessions_dir() finds it).
+        let (live_log, live_path) = zero_core::session::SessionLog::create_in(&dir).unwrap();
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(StubBackend::instant()),
+            Some(live_log),
+        );
+        a.synchronous = true;
+        a.set_log_path(Some(live_path));
+
+        // /sessions lists the prior one by id + preview.
+        type_str(&mut a, "/sessions");
+        a.dispatch(Key::Enter).unwrap();
+        let listed = rendered(&a);
+        assert!(listed.contains(&id), "session id not listed: {listed}");
+        assert!(listed.contains("platypus"), "preview missing: {listed}");
+
+        // /resume <id> restores the prior user/assistant thread into the conversation.
+        type_str(&mut a, &format!("/resume {id}"));
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("resumed 2 message"));
+        assert_eq!(a.conv.messages.len(), 2);
+        assert_eq!(
+            a.conv.messages[0].content,
+            "remember the magic word is platypus"
+        );
+
+        // A bad id fails gracefully, leaving the conversation intact.
+        type_str(&mut a, "/resume zzz-nope");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("resume failed"));
+        assert_eq!(a.conv.messages.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
