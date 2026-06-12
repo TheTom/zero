@@ -11,3 +11,7 @@ ROADMAP.md
 # local config / discovered servers
 /config.json
 /servers.json
+# agent instructions are local-only (like /docs)
+CLAUDE.md
+# python bytecode from research scripts
+__pycache__/

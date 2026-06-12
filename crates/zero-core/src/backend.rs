@@ -19,6 +19,10 @@ pub enum StreamEvent {
     Usage(Usage),
     /// The response finished; carries why it stopped.
     Done(StopReason),
+    /// A display-only error/diagnostic note (e.g. a backend failure or a panic
+    /// caught mid-stream). Shown to the user but NOT part of the assistant reply —
+    /// it must never enter the conversation history or be re-sent on later turns.
+    Error(String),
 }
 
 /// Server-reported token counts for one turn. `prompt_tokens` is everything fed
@@ -213,6 +217,7 @@ mod tests {
             StreamEvent::Token(t) => tokens.push(t),
             StreamEvent::Usage(_) => {}
             StreamEvent::Done(r) => stop = Some(r),
+            StreamEvent::Error(_) => {}
         })
         .unwrap();
         (tokens, stop)

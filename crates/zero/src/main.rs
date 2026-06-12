@@ -51,6 +51,12 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> std::io::Result<()> {
+    // `zero rules <init|add|status>` — headless project-rules authoring/inspection,
+    // operating on the current directory. No backend/config needed.
+    if let Some((sub, text)) = &args.rules {
+        return do_rules(sub, text.as_deref(), args.rules_global);
+    }
+
     let cfg_path = args
         .config_path
         .clone()
@@ -130,6 +136,58 @@ fn run(args: &Args) -> std::io::Result<()> {
     app.run()
 }
 
+/// `zero rules <init|add|status>` — project-rules authoring on the current dir.
+fn do_rules(sub: &str, text: Option<&str>, global: bool) -> std::io::Result<()> {
+    use zero_core::rules;
+    let cwd = std::env::current_dir()?;
+    let home = home();
+
+    match sub {
+        "init" => print!("{}", rules::apply_init(&cwd, home.as_deref(), global)?),
+        "add" => {
+            let text = text.ok_or_else(|| std::io::Error::other("rules add needs text"))?;
+            println!("{}", rules::apply_add(&cwd, home.as_deref(), global, text)?);
+        }
+        "status" => {
+            let reg = rules::load(&cwd, home.as_deref());
+            println!(
+                "rules: {} enforced · {} soft source(s) · {} warning(s)",
+                reg.rules.len(),
+                reg.soft.len(),
+                reg.warnings.len()
+            );
+            for r in &reg.rules {
+                println!(
+                    "  · {} [{}] [{}/{}] {}",
+                    r.id,
+                    reg.source_of(&r.id).label(),
+                    r.on.label(),
+                    r.action.label(),
+                    r.mat
+                );
+            }
+        }
+        "doctor" => {
+            let reg = rules::load(&cwd, home.as_deref());
+            let issues = rules::doctor(&reg);
+            if issues.is_empty() {
+                println!("rules doctor: no issues");
+            } else {
+                println!("rules doctor: {} issue(s)", issues.len());
+                for i in issues {
+                    println!("  ! {i}");
+                }
+            }
+        }
+        other => {
+            return Err(std::io::Error::other(format!(
+                "unknown rules subcommand '{other}' (init|add|status|doctor)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Open a session transcript, logging a hint to stderr. Never fatal.
 fn open_log(backend_name: &str) -> Option<SessionLog<std::fs::File>> {
     let dir = session_dir()?;
@@ -190,6 +248,10 @@ struct Args {
     /// Auto-accept write/edit in a headless run (`--accept-edits`). Without it a
     /// headless `--tools` run is stuck in Normal mode, which refuses every write.
     accept_edits: bool,
+    /// `rules <sub> [text]` headless subcommand: `(sub, text)` — init|add|status|doctor.
+    rules: Option<(String, Option<String>)>,
+    /// `--global`: target `~/.{slug}/` for `rules init|add` instead of the cwd.
+    rules_global: bool,
 }
 
 impl Args {
@@ -207,6 +269,26 @@ impl Args {
                 "--stub" => out.stub = true,
                 "--tools" => out.tools = true,
                 "--accept-edits" => out.accept_edits = true,
+                "--global" => out.rules_global = true,
+                "rules" => {
+                    let sub = it
+                        .next()
+                        .ok_or("rules needs a subcommand: init|add|status")?;
+                    let text = if sub == "add" {
+                        // `--global` may appear before the text (matches the TUI's
+                        // `/rules add --global <text>`); consume it as the flag, not
+                        // as the rule body, so the text never becomes "--global".
+                        let mut next = it.next().ok_or("rules add needs text (quote it)")?;
+                        if next == "--global" {
+                            out.rules_global = true;
+                            next = it.next().ok_or("rules add needs text (quote it)")?;
+                        }
+                        Some(next)
+                    } else {
+                        None
+                    };
+                    out.rules = Some((sub, text));
+                }
                 "-p" | "--print" => out.print = Some(take("-p")?),
                 "--url" => out.url = Some(take("--url")?),
                 "--model" => out.model = Some(take("--model")?),

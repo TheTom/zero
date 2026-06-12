@@ -669,6 +669,7 @@ mod tests {
                 StreamEvent::Token(t) => text.push_str(&t),
                 StreamEvent::Usage(u) => usage = Some(u),
                 StreamEvent::Done(r) => stop = Some(r),
+                StreamEvent::Error(_) => {}
             })
             .unwrap();
         assert_eq!(usage.map(|u| u.total()), Some(7)); // usage SSE chunk parsed

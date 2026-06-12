@@ -65,7 +65,14 @@ fn split_segments(cmd: &str) -> impl Iterator<Item = &str> {
 fn segment_danger(seg: &str) -> Option<&'static str> {
     let s = seg.trim();
     let tokens: Vec<&str> = s.split_whitespace().collect();
-    let first = tokens.first().copied().unwrap_or("");
+    // argv[0] is the first token that is NOT a leading `NAME=val` environment
+    // assignment — `FOO=bar rm -rf /` runs `rm`, not a command named `FOO=bar`.
+    // (The rules matcher already skips these; safety must agree or it is bypassed.)
+    let first = tokens
+        .iter()
+        .find(|t| !is_env_assign(t))
+        .copied()
+        .unwrap_or("");
     let has = |t: &str| tokens.contains(&t);
     let any_risky_path = || tokens.iter().any(|t| is_risky_path(t));
 
@@ -148,6 +155,18 @@ fn segment_danger(seg: &str) -> Option<&'static str> {
         return Some("moves files into /dev/null (destroys them)");
     }
     None
+}
+
+/// Is `tok` a leading `NAME=value` shell environment assignment (so it precedes
+/// argv[0] rather than being the command)? Name must be a valid shell identifier.
+fn is_env_assign(tok: &str) -> bool {
+    let Some(eq) = tok.find('=') else {
+        return false;
+    };
+    let name = &tok[..eq];
+    !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
 /// Does this `rm` flag request recursion (`-r`, `-R`, `-rf`, `--recursive`)?
@@ -266,6 +285,22 @@ mod tests {
         assert!(danger("find / -exec rm {} ;"));
         assert!(danger("echo '' > /etc/passwd"));
         assert!(danger("mv secrets /dev/null"));
+    }
+
+    #[test]
+    fn env_assignment_prefix_does_not_hide_the_command() {
+        // argv[0] detection must skip leading `NAME=val` env assignments, or a
+        // dangerous command smuggles past the classifier behind a benign-looking
+        // variable. (Regression: these all returned safe before the env-skip.)
+        assert!(danger("FOO=bar rm -rf /"));
+        assert!(danger("A=1 B=2 rm -rf ~"));
+        assert!(danger("EDITOR=vi shutdown now"));
+        assert!(danger("TMPDIR=/tmp dd if=/dev/zero of=/dev/sda"));
+        // A bare `NAME=val` with no command is not itself dangerous.
+        assert!(!danger("FOO=bar"));
+        assert!(!danger("PATH=/usr/bin ls"));
+        // `=` inside a real argument must not be mistaken for an env assignment.
+        assert!(danger("rm -rf / --opt=val"));
     }
 
     #[test]
