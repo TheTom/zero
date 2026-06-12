@@ -90,6 +90,11 @@ zero --config ./other.json   # use a specific config file
 `/config` inside the app shows the active backend and model. Plain `http://`
 only (Zero is local-first; no TLS).
 
+A refused or timed-out connection is **retried up to 3 times** with a short backoff
+(and a bounded 5s per-attempt connect timeout), so a model server that's restarting
+or still loading is given a moment to come up before the error surfaces. Only the
+connect is retried — never mid-stream — so streamed output is never duplicated.
+
 ### Auto-discovery
 
 Don't know the URL? Let Zero find it:
@@ -311,11 +316,12 @@ for Zero, drop it in `~/.zero/mcp.json` (Claude-compatible shape):
 }
 ```
 
-Servers connect automatically on launch (silent if none are configured), and
-**the model can call their tools** — in a `/tools` turn, each connected server's
-tools are advertised alongside the built-ins (namespaced `{server}__{tool}` so
-they can't collide) and a call routes back to that server's `tools/call`, with
-its result fed into the loop like any other tool. The lifecycle commands:
+Servers connect automatically on launch — and on a headless `zero -p --tools` run
+too (silent if none are configured), and **the model can call their tools**: in a
+`/tools` turn, each connected server's tools are advertised alongside the built-ins
+(namespaced `{server}__{tool}` so they can't collide) and a call routes back to
+that server's `tools/call`, with its result fed into the loop like any other tool.
+The lifecycle commands:
 
 ```
 /mcp                 re-discover from all sources + connect them (shows origin)
