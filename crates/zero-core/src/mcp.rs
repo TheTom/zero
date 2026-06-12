@@ -10,8 +10,12 @@
 //! (3) spawns a real server and wires its pipes into a [`Session`]
 //! ([`Connection::connect`]).
 //!
-//! This is the discovery/plumbing layer: it connects and lists tools. Actually
-//! *invoking* a tool waits on the agentic tool-call loop.
+//! Connect, list tools ([`Connection::connect`]), and **call** them
+//! ([`Connection::call_tool`] / `tools/call`). [`tool_routes`] turns a set of
+//! live connections into namespaced [`ToolDef`]s the agentic loop advertises to
+//! the model, with [`Connection::reconnect`] to recover a dropped server.
+//!
+//! [`ToolDef`]: crate::tools::ToolDef
 
 use crate::json::Value;
 use std::io::{self, BufRead, BufReader, Write};
@@ -213,10 +217,33 @@ fn parse_spec(v: &Value) -> Option<ServerSpec> {
 }
 
 /// A tool advertised by a server.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Tool {
     pub name: String,
     pub description: String,
+    /// The tool's JSON-Schema for its arguments (MCP `inputSchema`), passed
+    /// straight through as a [`crate::tools::ToolDef`]'s `parameters` so the model
+    /// knows how to call it. Defaults to an open object schema when absent.
+    pub input_schema: Value,
+}
+
+/// The name an MCP tool is advertised to the model under: `{server}__{tool}`,
+/// sanitized to the `[A-Za-z0-9_-]` charset most function-calling APIs require.
+/// The `__` delimiter mirrors Claude's MCP naming and keeps tools from distinct
+/// servers from colliding.
+pub fn mcp_tool_name(server: &str, tool: &str) -> String {
+    let clean = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    format!("{}__{}", clean(server), clean(tool))
 }
 
 /// A JSON-RPC 2.0 session over any newline-delimited transport. Generic over the
@@ -325,13 +352,48 @@ impl<R: BufRead, W: Write> Session<R, W> {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                // Pass the server's inputSchema straight through; default to an open
+                // object schema so a tool without one is still callable.
+                let input_schema = t.get("inputSchema").cloned().unwrap_or_else(|| {
+                    Value::Object(vec![("type".to_string(), Value::Str("object".to_string()))])
+                });
                 tools.push(Tool {
                     name: name.to_string(),
                     description,
+                    input_schema,
                 });
             }
         }
         Ok(tools)
+    }
+
+    /// Call a tool (`tools/call`) and return its result as text. The MCP result is
+    /// a `content` array of typed blocks; text blocks are concatenated and any
+    /// non-text block (image/resource) is noted as `[<kind> content]`. A server
+    /// that sets `isError: true` is surfaced as an `error: …` string the model can
+    /// react to, never a hard failure.
+    pub fn call_tool(&mut self, tool: &str, arguments: Value) -> io::Result<String> {
+        let params = Value::Object(vec![
+            ("name".to_string(), Value::Str(tool.to_string())),
+            ("arguments".to_string(), arguments),
+        ]);
+        let res = self.request("tools/call", params)?;
+        let mut out = String::new();
+        if let Some(blocks) = res.get("content").and_then(Value::as_array) {
+            for b in blocks {
+                match b.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        out.push_str(b.get("text").and_then(Value::as_str).unwrap_or(""));
+                    }
+                    Some(kind) => out.push_str(&format!("[{kind} content]")),
+                    None => {}
+                }
+            }
+        }
+        if res.get("isError").and_then(Value::as_bool) == Some(true) {
+            return Ok(format!("error: {out}"));
+        }
+        Ok(out)
     }
 }
 
@@ -340,8 +402,11 @@ impl<R: BufRead, W: Write> Session<R, W> {
 pub struct Connection {
     pub name: String,
     pub tools: Vec<Tool>,
+    /// How this server was launched — kept so the connection can [`reconnect`].
+    ///
+    /// [`reconnect`]: Connection::reconnect
+    pub spec: ServerSpec,
     child: Child,
-    #[allow(dead_code)] // kept for the upcoming tool-call loop (tools/call)
     session: Session<BufReader<ChildStdout>, ChildStdin>,
 }
 
@@ -369,9 +434,30 @@ impl Connection {
         Ok(Connection {
             name: name.to_string(),
             tools,
+            spec: spec.clone(),
             child,
             session,
         })
+    }
+
+    /// Call one of this server's tools by its *raw* (un-namespaced) name.
+    pub fn call_tool(&mut self, tool: &str, arguments: Value) -> io::Result<String> {
+        self.session.call_tool(tool, arguments)
+    }
+
+    /// True if this server advertised a tool with the given raw name.
+    pub fn has_tool(&self, tool: &str) -> bool {
+        self.tools.iter().any(|t| t.name == tool)
+    }
+
+    /// Kill the current child and re-launch from the stored spec, refreshing the
+    /// tool list. Used to recover a server that died or changed its tools.
+    pub fn reconnect(&mut self) -> io::Result<()> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let fresh = Connection::connect(&self.name, &self.spec)?;
+        *self = fresh;
+        Ok(())
     }
 }
 
@@ -380,6 +466,41 @@ impl Drop for Connection {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// One MCP tool ready to expose to the model: its namespaced [`ToolDef`] plus how
+/// to route a call back — the connection index and the tool's raw (un-namespaced)
+/// name. [`crate::tools::ToolDef`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpRoute {
+    pub def: crate::tools::ToolDef,
+    /// Index into the connections slice this route was built from.
+    pub conn: usize,
+    /// The tool's raw name as the server knows it (for `tools/call`).
+    pub raw_name: String,
+}
+
+/// Build advertised tool defs + dispatch routes for a set of live connections.
+/// Names are namespaced (`{server}__{tool}`) so tools from different servers can't
+/// collide, and the description is tagged with the server for the model's benefit.
+pub fn tool_routes(conns: &[Connection]) -> Vec<McpRoute> {
+    let mut routes = Vec::new();
+    for (i, c) in conns.iter().enumerate() {
+        for t in &c.tools {
+            let name = mcp_tool_name(&c.name, &t.name);
+            let desc = if t.description.is_empty() {
+                format!("[mcp:{}] {}", c.name, t.name)
+            } else {
+                format!("[mcp:{}] {}", c.name, t.description)
+            };
+            routes.push(McpRoute {
+                def: crate::tools::ToolDef::new(name, desc, t.input_schema.clone()),
+                conn: i,
+                raw_name: t.name.clone(),
+            });
+        }
+    }
+    routes
 }
 
 #[cfg(test)]
@@ -485,6 +606,101 @@ mod tests {
         assert!(sent.contains("\"method\":\"initialize\""));
         assert!(sent.contains("notifications/initialized"));
         assert!(sent.contains("\"method\":\"tools/list\""));
+    }
+
+    #[test]
+    fn session_call_tool_extracts_text_and_flags_errors() {
+        // Text + a non-text block: text concatenated, non-text noted.
+        let out = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[\
+             {\"type\":\"text\",\"text\":\"hello \"},\
+             {\"type\":\"text\",\"text\":\"world\"},\
+             {\"type\":\"image\",\"data\":\"…\"}]}}\n";
+        let mut written = Vec::new();
+        let mut s = Session::new(Cursor::new(out.as_bytes().to_vec()), &mut written);
+        let r = s
+            .call_tool(
+                "echo",
+                Value::Object(vec![("msg".to_string(), Value::Str("hi".to_string()))]),
+            )
+            .unwrap();
+        assert_eq!(r, "hello world[image content]");
+        let sent = String::from_utf8(written).unwrap();
+        assert!(sent.contains("\"method\":\"tools/call\""));
+        assert!(sent.contains("\"name\":\"echo\""));
+        assert!(sent.contains("\"msg\":\"hi\""));
+
+        // isError → surfaced as an `error:` string, not a hard failure.
+        let err = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"isError\":true,\
+             \"content\":[{\"type\":\"text\",\"text\":\"boom\"}]}}\n";
+        let mut w2 = Vec::new();
+        let mut s2 = Session::new(Cursor::new(err.as_bytes().to_vec()), &mut w2);
+        assert_eq!(
+            s2.call_tool("x", Value::Object(vec![])).unwrap(),
+            "error: boom"
+        );
+    }
+
+    #[test]
+    fn list_tools_captures_input_schema_with_default() {
+        let out = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[\
+             {\"name\":\"add\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"number\"}}}},\
+             {\"name\":\"bare\"}]}}\n";
+        let mut written = Vec::new();
+        let mut s = Session::new(Cursor::new(out.as_bytes().to_vec()), &mut written);
+        let tools = s.list_tools().unwrap();
+        assert!(tools[0].input_schema.get("properties").is_some());
+        // Missing inputSchema → an open object schema so the tool is still callable.
+        assert_eq!(
+            tools[1].input_schema.get("type").and_then(Value::as_str),
+            Some("object")
+        );
+    }
+
+    #[test]
+    fn mcp_tool_name_namespaces_and_sanitizes() {
+        assert_eq!(mcp_tool_name("fs", "read_file"), "fs__read_file");
+        // Non-identifier chars (space, slash, dot) collapse to underscores.
+        assert_eq!(
+            mcp_tool_name("my server", "do/it.now"),
+            "my_server__do_it_now"
+        );
+    }
+
+    #[test]
+    fn connect_call_tool_and_routes_end_to_end() {
+        // A tiny stdio MCP server in sh: initialize (id1), tools/list with a schema
+        // (id2), then tools/call (id3). Exercises the real pipe path for call_tool
+        // plus tool_routes / input_schema — no mocks.
+        let script = "read a; \
+             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}'; \
+             read b; read c; \
+             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"echoes\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"msg\":{\"type\":\"string\"}}}}]}}'; \
+             read d; \
+             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"echoed: hi\"}]}}'";
+        let spec = ServerSpec {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: Vec::new(),
+        };
+        let mut conn = Connection::connect("mock", &spec).unwrap();
+        assert!(conn.has_tool("echo"));
+        assert!(conn.tools[0].input_schema.get("properties").is_some());
+
+        // Routes: namespaced name, schema carried through.
+        let routes = tool_routes(std::slice::from_ref(&conn));
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].def.name, "mock__echo");
+        assert_eq!(routes[0].raw_name, "echo");
+        assert!(routes[0].def.description.contains("mcp:mock"));
+
+        // The actual call over real pipes.
+        let res = conn
+            .call_tool(
+                "echo",
+                Value::Object(vec![("msg".to_string(), Value::Str("hi".to_string()))]),
+            )
+            .unwrap();
+        assert_eq!(res, "echoed: hi");
     }
 
     #[test]

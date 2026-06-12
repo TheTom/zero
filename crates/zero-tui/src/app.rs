@@ -45,7 +45,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/servers", "list saved servers"),
     (
         "/mcp",
-        "import + connect MCP servers ( /mcp tools to list )",
+        "MCP servers: connect · tools · status · reconnect <n> · remove <n>",
     ),
     ("/connect", "attach to a discovered model"),
     ("/model", "switch model on the current endpoint"),
@@ -1166,7 +1166,19 @@ impl<I: Input, W: Write> App<I, W> {
         }
         self.write_text(&format!("\x1b[2m{}›\x1b[0m\n", zero_core::brand::slug()))?;
 
-        let tools = zero_core::builtins::definitions();
+        let mut tools = zero_core::builtins::definitions();
+        // Advertise connected MCP servers' tools to the model (namespaced
+        // `{server}__{tool}`), and build a dispatch map name → (conn idx, raw name)
+        // so a call routes back to the right server. The connections are taken into
+        // the loop (like the read-cache/stats) and restored after.
+        let routes = zero_core::mcp::tool_routes(&self.mcp);
+        let mut mcp_map: std::collections::HashMap<String, (usize, String)> =
+            std::collections::HashMap::new();
+        for r in routes {
+            mcp_map.insert(r.def.name.clone(), (r.conn, r.raw_name));
+            tools.push(r.def);
+        }
+        let mcp_conns = RefCell::new(std::mem::take(&mut self.mcp));
         let backend = Arc::clone(&self.backend);
         let mode = self.mode;
         let root = std::env::current_dir().ok();
@@ -1241,7 +1253,20 @@ impl<I: Input, W: Write> App<I, W> {
                         }
                     }
                 }
-                let raw = gate_and_execute(mode, call, root.as_deref(), &rules);
+                // An MCP tool routes to its server's `tools/call`; everything else
+                // goes through the local gate (confinement → safety → rules → mode).
+                let raw = if let Some((idx, raw_name)) = mcp_map.get(&call.name) {
+                    let args = zero_core::tools::parse_arguments(call)
+                        .unwrap_or_else(|_| zero_core::json::Value::Object(vec![]));
+                    match mcp_conns.borrow_mut().get_mut(*idx) {
+                        Some(conn) => conn
+                            .call_tool(raw_name, args)
+                            .unwrap_or_else(|e| format!("error: MCP call failed: {e}")),
+                        None => "error: MCP server is no longer connected".to_string(),
+                    }
+                } else {
+                    gate_and_execute(mode, call, root.as_deref(), &rules)
+                };
                 // Context cap: bound what goes back into the window. The effective
                 // cap also shrinks as the per-turn budget depletes (always keeping
                 // a floor), so a turn firing many calls can't blow the window by
@@ -1309,6 +1334,7 @@ impl<I: Input, W: Write> App<I, W> {
         self.read_cache = read_cache.into_inner();
         self.context_stats = stats.into_inner();
         self.log = log.into_inner();
+        self.mcp = mcp_conns.into_inner();
         let evidence = evidence.into_inner();
         // Applied write/edit payloads are now compacted IN-LOOP by run_turn (each
         // round, so a long turn doesn't re-send a just-written file's body). The
@@ -1789,13 +1815,82 @@ impl<I: Input, W: Write> App<I, W> {
 
     // --- MCP servers (/mcp) ----------------------------------------------
 
-    /// `/mcp` connects configured servers and summarizes; `/mcp tools` lists the
-    /// tools discovered so far.
+    /// `/mcp` connects configured servers; `/mcp tools` lists their tools;
+    /// `/mcp status` shows connected servers; `/mcp reconnect <name>` re-launches
+    /// one; `/mcp remove <name>` disconnects + drops one.
     fn mcp_command(&mut self, arg: &str) -> io::Result<()> {
-        if arg == "tools" {
-            return self.print_mcp_tools();
+        let (cmd, rest) = match arg.split_once(char::is_whitespace) {
+            Some((c, r)) => (c, r.trim()),
+            None => (arg, ""),
+        };
+        match cmd {
+            "" => self.connect_mcp(),
+            "tools" => self.print_mcp_tools(),
+            "status" => self.mcp_status(),
+            "reconnect" => self.mcp_reconnect(rest),
+            "remove" | "disconnect" => self.mcp_remove(rest),
+            other => self.write_text(&format!(
+                "\x1b[2munknown /mcp subcommand '{other}' — tools, status, reconnect <name>, remove <name>\x1b[0m\n"
+            )),
         }
-        self.connect_mcp()
+    }
+
+    /// `/mcp status` — connected servers and their tool counts.
+    fn mcp_status(&mut self) -> io::Result<()> {
+        if self.mcp.is_empty() {
+            return self
+                .write_text("\x1b[2mno MCP servers connected (run /mcp to connect)\x1b[0m\n");
+        }
+        let mut out = format!("{} MCP server(s) connected:\n", self.mcp.len());
+        for c in &self.mcp {
+            out.push_str(&format!(
+                "  \x1b[32m●\x1b[0m {} \x1b[2m— {} tool(s)\x1b[0m\n",
+                c.name,
+                c.tools.len()
+            ));
+        }
+        self.write_text(&out)
+    }
+
+    /// `/mcp reconnect <name>` — kill + re-launch a server (recover a dead one or
+    /// pick up changed tools).
+    fn mcp_reconnect(&mut self, name: &str) -> io::Result<()> {
+        if name.is_empty() {
+            return self.write_text("\x1b[2musage: /mcp reconnect <name>\x1b[0m\n");
+        }
+        match self.mcp.iter_mut().find(|c| c.name == name) {
+            Some(conn) => match conn.reconnect() {
+                Ok(()) => {
+                    let n = conn.tools.len();
+                    self.write_text(&format!(
+                        "\x1b[32m✓\x1b[0m reconnected {name} \x1b[2m— {n} tool(s)\x1b[0m\n"
+                    ))
+                }
+                Err(e) => {
+                    self.write_text(&format!("\x1b[31m✗ reconnect {name} failed: {e}\x1b[0m\n"))
+                }
+            },
+            None => self.write_text(&format!(
+                "\x1b[2mno connected server named '{name}' (see /mcp status)\x1b[0m\n"
+            )),
+        }
+    }
+
+    /// `/mcp remove <name>` — disconnect a server (its child is killed on drop) and
+    /// drop it from the live set, so its tools stop being advertised.
+    fn mcp_remove(&mut self, name: &str) -> io::Result<()> {
+        if name.is_empty() {
+            return self.write_text("\x1b[2musage: /mcp remove <name>\x1b[0m\n");
+        }
+        let before = self.mcp.len();
+        self.mcp.retain(|c| c.name != name);
+        if self.mcp.len() < before {
+            self.write_text(&format!("\x1b[2mremoved MCP server '{name}'\x1b[0m\n"))
+        } else {
+            self.write_text(&format!(
+                "\x1b[2mno connected server named '{name}'\x1b[0m\n"
+            ))
+        }
     }
 
     /// The config locations to scan, highest precedence first: project
@@ -3109,6 +3204,140 @@ mod tests {
         assert!(rendered(&a).contains("already connected"));
         assert_eq!(a.mcp.len(), 1);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mcp_tool_call_routes_through_the_agentic_loop() {
+        use std::sync::Mutex;
+        use zero_core::json::Value;
+        // sh MCP server: initialize, tools/list (echo + schema), then tools/call.
+        let script = "read a; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}'; \
+             read b; read c; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"echoes\",\"inputSchema\":{\"type\":\"object\"}}]}}'; \
+             read d; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"MCP says hi\"}]}}'";
+        let cfg = Value::Object(vec![(
+            "mcpServers".to_string(),
+            Value::Object(vec![(
+                "mock".to_string(),
+                Value::Object(vec![
+                    ("command".to_string(), Value::Str("sh".to_string())),
+                    (
+                        "args".to_string(),
+                        Value::Array(vec![
+                            Value::Str("-c".to_string()),
+                            Value::Str(script.to_string()),
+                        ]),
+                    ),
+                ]),
+            )]),
+        )]);
+        let path = std::env::temp_dir().join(format!(
+            "zero-mcp-loop-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, cfg.to_json()).unwrap();
+
+        // A backend that calls the namespaced MCP tool, then answers with text.
+        struct McpBackend {
+            step: Arc<Mutex<u32>>,
+        }
+        impl Backend for McpBackend {
+            fn name(&self) -> &str {
+                "mcpbk"
+            }
+            fn stream(
+                &self,
+                _c: &Conversation,
+                sink: &mut dyn FnMut(StreamEvent),
+            ) -> Result<(), zero_core::backend::BackendError> {
+                sink(StreamEvent::Done(StopReason::EndTurn));
+                Ok(())
+            }
+            fn complete(
+                &self,
+                _c: &Conversation,
+                t: &[ToolDef],
+                _to: Duration,
+            ) -> Result<zero_core::backend::Completion, zero_core::backend::BackendError>
+            {
+                let mut step = self.step.lock().unwrap();
+                *step += 1;
+                if *step == 1 {
+                    // The MCP tool must be advertised to the model this round.
+                    assert!(
+                        t.iter().any(|d| d.name == "mock__echo"),
+                        "MCP tool not advertised: {:?}",
+                        t.iter().map(|d| &d.name).collect::<Vec<_>>()
+                    );
+                    Ok(zero_core::backend::Completion {
+                        content: String::new(),
+                        tool_calls: vec![ToolCall::new("c1", "mock__echo", r#"{"msg":"hi"}"#)],
+                        usage: None,
+                    })
+                } else {
+                    Ok(zero_core::backend::Completion {
+                        content: "done".to_string(),
+                        tool_calls: vec![],
+                        usage: None,
+                    })
+                }
+            }
+        }
+
+        let mut a = App::new(
+            ScriptedInput::new(b""),
+            Vec::new(),
+            Arc::new(McpBackend {
+                step: Arc::new(Mutex::new(0)),
+            }),
+            None,
+        );
+        a.synchronous = true;
+        a.tools_enabled = true;
+        a.set_mcp_path(Some(path.clone()));
+        a.autoconnect_mcp().unwrap();
+        assert_eq!(a.mcp.len(), 1, "server should be connected");
+
+        a.run_tool_turn("use the echo tool").unwrap();
+        // The MCP server's result flowed back into the conversation as a tool result.
+        let tool_msg = a
+            .conv
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool result in history");
+        assert!(
+            tool_msg.content.contains("MCP says hi"),
+            "MCP result missing: {}",
+            tool_msg.content
+        );
+        // And the server is restored to the live set after the turn.
+        assert_eq!(a.mcp.len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mcp_lifecycle_commands_are_graceful_with_no_servers() {
+        let mut a = app(b"");
+        type_str(&mut a, "/mcp status");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("no MCP servers connected"));
+
+        type_str(&mut a, "/mcp reconnect ghost");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("no connected server named 'ghost'"));
+
+        type_str(&mut a, "/mcp remove ghost");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("no connected server named 'ghost'"));
+
+        type_str(&mut a, "/mcp reconnect");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("usage: /mcp reconnect"));
+
+        type_str(&mut a, "/mcp bogus");
+        a.dispatch(Key::Enter).unwrap();
+        assert!(rendered(&a).contains("unknown /mcp subcommand"));
     }
 
     #[test]

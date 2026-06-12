@@ -311,21 +311,22 @@ for Zero, drop it in `~/.zero/mcp.json` (Claude-compatible shape):
 }
 ```
 
-Servers connect automatically on launch (silent if none are configured). The
-commands re-run or inspect that:
+Servers connect automatically on launch (silent if none are configured), and
+**the model can call their tools** — in a `/tools` turn, each connected server's
+tools are advertised alongside the built-ins (namespaced `{server}__{tool}` so
+they can't collide) and a call routes back to that server's `tools/call`, with
+its result fed into the loop like any other tool. The lifecycle commands:
 
 ```
-/mcp          re-discover from all sources + connect them (shows origin)
-/mcp tools    list every discovered tool (name · server · description)
+/mcp                 re-discover from all sources + connect them (shows origin)
+/mcp tools           list every discovered tool (name · server · description)
+/mcp status          show connected servers + tool counts
+/mcp reconnect <n>   kill + re-launch a server (recover a dead one / refresh tools)
+/mcp remove <n>      disconnect a server and stop advertising its tools
 ```
 
 HTTP/SSE servers (a `url` instead of a `command`) are skipped — Zero is
 stdio-only for now.
-
-> **Discovery only for now.** `/mcp` connects and lists the tools a server
-> exposes, but the model can't *call* them yet: the agentic loop (`/tools`)
-> advertises only the built-ins. Wiring MCP tools into that loop is the next
-> slice.
 
 ### Shell mode & the safety guard
 
