@@ -98,6 +98,11 @@ fn run(args: &Args) -> std::io::Result<()> {
         }
     };
 
+    // `zero loop <new|list|run|tail>` — long-running self-pacing agent loops.
+    if let Some((sub, rest)) = &args.loop_cmd {
+        return do_loop(sub, rest, backend.as_ref());
+    }
+
     let (log, log_path) = if args.no_log {
         (None, None)
     } else {
@@ -150,6 +155,7 @@ fn run(args: &Args) -> std::io::Result<()> {
     // also imported from Claude Desktop / Claude Code + the project's .mcp.json.
     app.set_mcp_path(cfg_path.parent().map(|d| d.join("mcp.json")));
     app.set_mcp_discovery(home(), std::env::current_dir().ok());
+    app.set_loops_dir(loops_dir().ok());
     // Where full tool outputs spill so compressed results stay re-fetchable.
     app.set_artifact_dir(outputs_dir());
     // `resume <id>`: preload a prior session's user/assistant thread so the model
@@ -333,6 +339,225 @@ fn home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
+/// Where loops live: `$ZERO_LOOPS_DIR` or `~/.{slug}/loops`.
+fn loops_dir() -> std::io::Result<std::path::PathBuf> {
+    if let Some(d) = std::env::var_os("ZERO_LOOPS_DIR") {
+        return Ok(std::path::PathBuf::from(d));
+    }
+    home()
+        .map(|h| h.join(zero_core::brand::dot_dir()).join("loops"))
+        .ok_or_else(|| std::io::Error::other("no loops dir ($HOME unset)"))
+}
+
+/// `zero loop <new|list|run|tail>` — long-running self-pacing agent loops.
+fn do_loop(sub: &str, rest: &[String], backend: &dyn Backend) -> std::io::Result<()> {
+    use zero_core::loop_store::{list_loops, LoopStore};
+    let root = loops_dir()?;
+    let name = || -> std::io::Result<&str> {
+        rest.first()
+            .map(String::as_str)
+            .ok_or_else(|| std::io::Error::other(format!("loop {sub} needs a <name>")))
+    };
+    match sub {
+        "new" => {
+            let template = rest.get(1).map(String::as_str).unwrap_or("perf-attack");
+            let (spec, toml, rules) = loop_template(template).ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "unknown template {template:?} (perf-attack|watcher|babysitter)"
+                ))
+            })?;
+            let store = LoopStore::at(&root, name()?);
+            store.create(spec, toml, rules)?;
+            println!("created loop {:?} at {}", name()?, store.dir().display());
+            println!(
+                "  edit spec.md / loop.toml, then: zero loop run {}",
+                name()?
+            );
+        }
+        "list" => {
+            let names = list_loops(&root);
+            if names.is_empty() {
+                println!("no loops yet under {}", root.display());
+                return Ok(());
+            }
+            println!("loops in {} :", root.display());
+            for n in names {
+                let store = LoopStore::at(&root, &n);
+                let s = store.ledger().map(|l| l.summary()).unwrap_or_default();
+                let next = store
+                    .state_tail(1)
+                    .first()
+                    .map(|r| r.next_action.clone())
+                    .unwrap_or_default();
+                println!(
+                    "  {n}  · {} wake(s) · {} tok · NEXT: {next}",
+                    s.wakes, s.tokens_spent
+                );
+            }
+        }
+        "tail" => {
+            let n: usize = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(5);
+            let store = LoopStore::at(&root, name()?);
+            for row in store.state_tail(n) {
+                println!(
+                    "── wake {} ──\n{}\nNEXT ACTION: {}\n",
+                    row.wake, row.body, row.next_action
+                );
+            }
+        }
+        "run" => {
+            let store = LoopStore::at(&root, name()?);
+            if !store.exists() {
+                return Err(std::io::Error::other(format!(
+                    "no loop {:?} (zero loop new {} first)",
+                    name()?,
+                    name()?
+                )));
+            }
+            run_loop(&store, backend)?;
+        }
+        other => {
+            return Err(std::io::Error::other(format!(
+                "unknown loop subcommand {other:?} (new|list|run|tail)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Drive a loop headlessly: wake → run → decide, back-to-back, until the state
+/// machine pauses or stops (deadline / budget / goal met / missed state write /
+/// repeated false stop). Blocking — meant for tmux / launchd / systemd.
+fn run_loop(
+    store: &zero_core::loop_store::LoopStore,
+    backend: &dyn Backend,
+) -> std::io::Result<()> {
+    use zero_core::loop_runner::{decide, Action, Event, TickInput};
+    // A real gate-runner: run the command via `sh -c`, combine stdout+stderr.
+    let mut gates = |cmd: &str| -> (String, i32) {
+        match std::process::Command::new("sh").arg("-c").arg(cmd).output() {
+            Ok(o) => {
+                let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+                s.push_str(&String::from_utf8_lossy(&o.stderr));
+                (s, o.status.code().unwrap_or(-1))
+            }
+            Err(e) => (format!("gate failed to run: {e}"), -1),
+        }
+    };
+
+    let mut wake = store.ledger()?.summary().wakes;
+    loop {
+        let cfg = store.config()?;
+        let summary = store.ledger()?.summary();
+        let now = zero_core::clock::unix_millis() as u64;
+        let deadline_ms = cfg
+            .schedule
+            .deadline
+            .as_deref()
+            .and_then(zero_core::sched::parse_rfc3339);
+        let sched_action = decide(&TickInput {
+            config: &cfg,
+            summary: &summary,
+            now_ms: now,
+            deadline_ms,
+            paused: false,
+            event: Event::Schedule,
+        });
+        match sched_action {
+            Action::Wake => {
+                wake += 1;
+                let out = zero_core::loop_run::run_wake(store, backend, &mut gates, wake, now)?;
+                let gate_note = out
+                    .tick
+                    .gates
+                    .iter()
+                    .map(|g| {
+                        format!(
+                            "{}={}{}",
+                            g.name,
+                            g.actual,
+                            if g.passed { "✓" } else { "✗" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!("zero: wake {wake} · {} tok · {gate_note}", out.tick.tokens);
+                if out.done_claimed {
+                    let summary2 = store.ledger()?.summary();
+                    let done = decide(&TickInput {
+                        config: &cfg,
+                        summary: &summary2,
+                        now_ms: now,
+                        deadline_ms,
+                        paused: false,
+                        event: Event::DoneClaim {
+                            exit_gate_passed: out.gates_all_passed,
+                        },
+                    });
+                    match done {
+                        Action::Stop(r) => {
+                            println!("loop done: {r:?} (wake {wake})");
+                            return Ok(());
+                        }
+                        Action::EscalateToHuman(msg) => {
+                            println!("loop needs you: {msg}");
+                            return Ok(());
+                        }
+                        Action::Revitalize(msg) => eprintln!("zero: revitalize — {msg}"),
+                        _ => {}
+                    }
+                }
+            }
+            Action::Pause(r) => {
+                println!("loop paused: {r:?} (wake {wake})");
+                return Ok(());
+            }
+            Action::Stop(r) => {
+                println!("loop stopped: {r:?} (wake {wake})");
+                return Ok(());
+            }
+            Action::Revitalize(_) | Action::EscalateToHuman(_) => return Ok(()),
+        }
+    }
+}
+
+/// Built-in loop templates: `(spec.md, loop.toml, rules.md)` skeletons with holes.
+fn loop_template(name: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    let rules = "# Verified rules (promote only with a citation)\n";
+    match name {
+        "perf-attack" => Some((
+            "# Mission: push <METRIC> past <BAR>\n\n\
+             ## What should be TRUE when done\n<one sentence: the measured outcome>\n\n\
+             ## Iteration\n1. pick the worst bucket on the scorecard\n2. instrument it\n\
+             3. make a structural change (not just a scalar knob)\n4. run the gate, bank the result\n\n\
+             ## When stuck\nprofile what already wins; study a reference; convert gaps to work items.\n",
+            "[schedule]\nheartbeat = \"5m\"\n\n[bar]\nvalue = \"<measure this on THIS box>\"\nversion = 1\n\n\
+             [contract]\ninject_spec = true\nrequire_state_append = true\nrequire_next_action = true\n\n\
+             [[gate]]\nname = \"quality\"\nrun = \"<command that measures the metric>\"\nparse = \"json:.value\"\npass = \">= 0\"\n\n\
+             [budget]\nmax_wakes = 100\non_exhaust = \"pause\"\n",
+            rules,
+        )),
+        "watcher" => Some((
+            "# Mission: watch <THING> and act on change\n\n\
+             ## Iteration\n1. poll the thing\n2. if it changed since last good run, act\n3. bank what you saw\n",
+            "[schedule]\nheartbeat = \"15m\"\n\n[contract]\nrequire_state_append = true\nrequire_next_action = true\n\n\
+             [[gate]]\nname = \"changed\"\nrun = \"<command that reports state>\"\nparse = \"exit\"\npass = \"== 0\"\n\n\
+             [budget]\nmax_wakes = 200\non_exhaust = \"pause\"\n",
+            rules,
+        )),
+        "babysitter" => Some((
+            "# Mission: keep <JOB> alive; restart within caps; postmortem on death\n\n\
+             ## Iteration\n1. is the job alive? 2. if dead and under the cap, restart 3. bank the event\n",
+            "[schedule]\nheartbeat = \"2m\"\n\n[contract]\nrequire_state_append = true\nrequire_next_action = true\n\n\
+             [authority]\nmax_restarts = { host = 3 }\n\n\
+             [[gate]]\nname = \"alive\"\nrun = \"<healthcheck command>\"\nparse = \"exit\"\npass = \"== 0\"\n\n\
+             [budget]\nmax_wakes = 500\non_exhaust = \"pause\"\n",
+            rules,
+        )),
+        _ => None,
+    }
+}
+
 fn config_path() -> Option<std::path::PathBuf> {
     home().map(|h| h.join(zero_core::brand::dot_dir()).join("config.json"))
 }
@@ -412,6 +637,9 @@ struct Args {
     /// the interactive TUI and continue it. `id` is a transcript stem (or a unique
     /// prefix/substring of one).
     resume: Option<String>,
+    /// `loop <sub> [args…]` headless subcommand: `(sub, rest)` —
+    /// new|list|run|tail.
+    loop_cmd: Option<(String, Vec<String>)>,
 }
 
 impl Args {
@@ -432,6 +660,11 @@ impl Args {
                 "--global" => out.rules_global = true,
                 "logs" => out.logs = true,
                 "sessions" => out.sessions = true,
+                "loop" => {
+                    let sub = it.next().ok_or("loop needs: new|list|run|tail")?;
+                    let rest: Vec<String> = it.by_ref().collect();
+                    out.loop_cmd = Some((sub, rest));
+                }
                 "resume" | "--resume" => {
                     out.resume = Some(it.next().ok_or("resume needs a session id")?);
                 }
