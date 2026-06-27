@@ -411,6 +411,73 @@ Copy to the system clipboard (`pbcopy` / `wl-copy` / `xclip`):
 - `/clip <n>` — copy code block *n* (blocks render a `── rust · ⧉ copy ──`
   footer marking the target). `/clip` copies the whole last response.
 
+## Loops — long-running agents (alpha · experimental)
+
+> **⚠️ Alpha / experimental.** Loops are new and rough — expect sharp edges. Run
+> them only on work you can supervise, never point one at anything irreversible
+> without a tested stop, and assume the on-disk format may still change.
+
+A **loop** is a long-running, self-pacing agent: it wakes on a schedule, reads a
+spec from disk, runs one iteration, banks its state, and sleeps — for hours or
+days. The *harness* (not the model) owns the schedule, the state, and the
+pass/fail gates, so even a small, forgetful local model can make durable
+progress across many wakes.
+
+Everything for a loop lives on disk under `~/.zero/loops/<name>/` (override the
+root with `$ZERO_LOOPS_DIR`):
+
+```
+spec.md      the mission: goal, iteration procedure, authority bounds — you edit this
+loop.toml    the machine half: schedule, gates, budgets, stop conditions
+state.md     append-only; scorecard + one row per wake, each ending in a NEXT ACTION
+rules.md     distilled, verified rules only
+ticks.jsonl  harness-written ledger: one row per wake (tokens, elapsed, gate results)
+```
+
+### Commands (headless)
+
+```bash
+zero loop new <name> [template]   # scaffold a loop — template: perf-attack (default) | watcher | babysitter
+zero loop list                    # all loops: wakes · tokens · NEXT action
+zero loop tail <name> [n]         # last n state rows (default 5)
+zero loop arm <name>              # lock the gate definitions (later edits need a re-arm)
+zero loop run <name>              # drive it: wake → run → decide, repeatedly
+```
+
+`zero loop run` **blocks** and is meant to live under tmux / launchd / systemd.
+It keeps waking until a stop condition trips — deadline, budget exhausted, goal
+met, or a wake that failed to bank a state row. In the TUI, **`/loops`** lists
+your loops read-only (you still start them with `zero loop run`).
+
+### Shaping a loop
+
+After `zero loop new`, edit `spec.md` (the mission, in prose) and `loop.toml`
+(the part the harness enforces and never delegates):
+
+```toml
+[schedule]
+heartbeat = "30m"                          # fallback wake cadence
+deadline  = "2026-06-13T11:00:00-05:00"    # absolute, harness-enforced
+
+[contract]
+require_state_append = true                # a wake that banks no state row pauses + flags
+require_next_action  = true                # the state row must end with a NEXT ACTION:
+
+[[gate]]                                   # the harness runs these; the model only cites them
+name  = "quality"
+run   = "your-measure-command"
+parse = "json:.value"                      # or "exit"
+pass  = ">= 0.99"                          # or "== 0", "contains <s>", true/false
+
+[budget]
+max_wakes  = 200
+on_exhaust = "pause"                       # never a silent stop
+```
+
+Gates are **measured, not asserted**: a win needs a real number from a real
+command, compared against a bar — the model can't simply claim success. The same
+honest-timestamps and discoverable-logging rules as the rest of Zero apply.
+
 ## Test & coverage
 
 ```bash
