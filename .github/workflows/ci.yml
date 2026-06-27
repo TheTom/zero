@@ -27,7 +27,7 @@ jobs:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # rust-toolchain.toml pins the channel (1.93.1) and the clippy + rustfmt
       # components, so `rustup show` installs exactly what local builds use —
@@ -60,7 +60,7 @@ jobs:
     name: coverage (>= 95% lines)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pinned toolchain
         run: rustup show
