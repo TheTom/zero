@@ -68,21 +68,36 @@ fn is_retryable_connect(e: &io::Error) -> bool {
 /// level errors up to [`CONNECT_ATTEMPTS`] times with a short increasing backoff.
 /// Returns before any request is sent, so retrying is always safe (no duplicated
 /// output). The final error is the last connect failure.
+///
+/// A hostname can resolve to several addresses (IPv4 + IPv6). We try **all** of
+/// them each round, **IPv4 first** — an mDNS name like `train.local` often resolves
+/// to a link-local IPv6 first, but a local model server typically binds IPv4 only,
+/// so connecting to that first address would hang until timeout. (curl dodges this
+/// with Happy-Eyeballs; the std-only client has to be explicit.)
 fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
-    let addr = (host, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::other("could not resolve host"))?;
+    let mut addrs: Vec<std::net::SocketAddr> = (host, port).to_socket_addrs()?.collect();
+    if addrs.is_empty() {
+        return Err(io::Error::other("could not resolve host"));
+    }
+    // IPv4 (false → 0) sorts before IPv6 (true → 1); stable so order within a
+    // family is preserved.
+    addrs.sort_by_key(|a| a.is_ipv6());
     let mut last: Option<io::Error> = None;
     for attempt in 0..CONNECT_ATTEMPTS {
-        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
-            Ok(s) => return Ok(s),
-            Err(e) if attempt + 1 < CONNECT_ATTEMPTS && is_retryable_connect(&e) => {
+        for addr in &addrs {
+            match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
+                Ok(s) => return Ok(s),
+                Err(e) => last = Some(e),
+            }
+        }
+        // Every address failed this round. Retry (with backoff) only if the last
+        // failure looks transient — a server still coming up.
+        match &last {
+            Some(e) if attempt + 1 < CONNECT_ATTEMPTS && is_retryable_connect(e) => {
                 // 500ms, then 1000ms — give a loading server a moment to come up.
                 std::thread::sleep(Duration::from_millis(500 * (attempt as u64 + 1)));
-                last = Some(e);
             }
-            Err(e) => return Err(e),
+            _ => break,
         }
     }
     Err(last.unwrap_or_else(|| io::Error::other("connect failed")))
@@ -185,11 +200,9 @@ pub fn post(
 /// Used for short, non-streamed responses like `/v1/models` during discovery.
 pub fn get(url: &str, timeout: Duration) -> io::Result<(u16, String)> {
     let u = parse_url(url).map_err(io::Error::other)?;
-    let addr = (u.host.as_str(), u.port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::other("could not resolve host"))?;
-    let stream = TcpStream::connect_timeout(&addr, timeout)?;
+    // Share the connect() helper so GET gets the same all-addresses, IPv4-first
+    // behavior as POST (an mDNS host that resolves to IPv6 first must not stall).
+    let stream = connect(&u.host, u.port)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let mut stream = stream;
@@ -495,6 +508,25 @@ mod tests {
     #[test]
     fn get_on_refused_port_errors() {
         assert!(get("http://127.0.0.1:1/v1/models", Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn connect_reaches_ipv4_for_a_multi_address_host() {
+        // `localhost` resolves to 127.0.0.1 and, on dual-stack hosts, ::1 too. The
+        // server binds IPv4 only, so connect() must sort IPv4 first and reach it
+        // rather than stalling on an unreachable IPv6 address — the regression that
+        // made `train.local` (link-local IPv6 first) time out on every request.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            drain_request(&mut sock);
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\n\r\n{\"ok\":true}");
+        });
+        let url = format!("http://localhost:{port}/v1/models");
+        let (code, body) = get(&url, Duration::from_secs(2)).unwrap();
+        assert_eq!(code, 200);
+        assert!(body.contains("ok"));
     }
 
     #[test]
