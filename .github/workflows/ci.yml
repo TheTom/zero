@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Zero Contributors
+#
+# CI mirrors Zero's local pre-push gate (scripts/hooks/pre-push) so the same
+# bar that blocks a push also blocks a merge: tests pass and line coverage
+# stays >= 95%. It additionally enforces formatting and the crate-level
+# `clippy = "deny"` lint policy. Zero has zero runtime dependencies, so there
+# is nothing to download or cache — a clean checkout builds the whole workspace.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token: CI only builds and tests, it never writes to the repo.
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel (1.93.1) and the clippy + rustfmt
+      # components, so `rustup show` installs exactly what local builds use —
+      # CI and a developer's machine run the same compiler, bit for bit.
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Versions
+        run: |
+          rustc --version
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # `-D warnings` promotes any rustc/clippy warning to an error, on top of
+      # the per-crate `[lints.clippy] all = "deny"` already in the manifests.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  coverage:
+    name: coverage (>= 95% lines)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      # llvm-tools-preview supplies the instrumentation runtime cargo-llvm-cov needs.
+      - name: Install llvm-tools
+        run: rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      # scripts/coverage.sh is the exact gate the pre-push hook runs: line
+      # coverage >= 95% across the workspace, excluding the tty/bootstrap I/O
+      # shell (term.rs, main.rs) that can't run without real hardware.
+      - name: Coverage gate
+        run: ./scripts/coverage.sh --summary-only
