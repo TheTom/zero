@@ -11,7 +11,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 use zero_core::backend::{Backend, StubBackend};
 use zero_core::config::Config;
+use zero_core::fleet_config::FleetConfig;
 use zero_core::openai::OpenAiBackend;
+use zero_core::orchestrator::{FleetSignal, OrchestratorBackend};
 use zero_core::session::SessionLog;
 use zero_tui::{App, Input, RawTerminal};
 
@@ -84,19 +86,9 @@ fn run(args: &Args) -> std::io::Result<()> {
     let mut cfg = Config::load(&cfg_path).unwrap_or_default();
     args.apply_to(&mut cfg);
 
-    // Pick the backend: stub if forced or no URL, otherwise OpenAI-compatible.
-    let backend: std::sync::Arc<dyn Backend> = if args.stub || !cfg.has_backend() {
-        if args.instant {
-            std::sync::Arc::new(StubBackend::instant())
-        } else {
-            std::sync::Arc::new(StubBackend::paced(Duration::from_millis(18)))
-        }
-    } else {
-        match OpenAiBackend::from_config(&cfg) {
-            Some(b) => std::sync::Arc::new(b),
-            None => std::sync::Arc::new(StubBackend::paced(Duration::from_millis(18))),
-        }
-    };
+    // Pick the backend. An active `~/.zero/fleet.toml` builds the multi-tier
+    // orchestrator; otherwise it's a single OpenAI-compatible backend, or the stub.
+    let backend = build_backend(args, &cfg);
 
     // `zero loop <new|list|run|tail>` — long-running self-pacing agent loops.
     if let Some((sub, rest)) = &args.loop_cmd {
@@ -573,6 +565,64 @@ fn loop_template(name: &str) -> Option<(&'static str, &'static str, &'static str
     }
 }
 
+/// Build the model backend. Tries the optional fleet orchestrator first (an
+/// active `~/.zero/fleet.toml`), then a single OpenAI-compatible backend, then the
+/// stub — matching the prior single-model behavior exactly when no fleet is set.
+fn build_backend(args: &Args, cfg: &Config) -> std::sync::Arc<dyn Backend> {
+    // A fleet declares its own per-tier URLs, so it can be active even when
+    // config.json has no base_url. It steps aside for `--stub` or an explicit
+    // `--url` (an explicit single-model override).
+    if !args.stub && args.url.is_none() {
+        if let Some(orch) = try_build_fleet() {
+            eprintln!("zero: fleet active — {}", orch.name());
+            return std::sync::Arc::new(orch);
+        }
+    }
+    if args.stub || !cfg.has_backend() {
+        if args.instant {
+            std::sync::Arc::new(StubBackend::instant())
+        } else {
+            std::sync::Arc::new(StubBackend::paced(Duration::from_millis(18)))
+        }
+    } else {
+        match OpenAiBackend::from_config(cfg) {
+            Some(b) => std::sync::Arc::new(b),
+            None => std::sync::Arc::new(StubBackend::paced(Duration::from_millis(18))),
+        }
+    }
+}
+
+/// Load `~/.zero/fleet.toml` and, if it declares an active multi-tier fleet, build
+/// the orchestrator over a real `OpenAiBackend` per tier. `None` when there is no
+/// fleet, it's disabled, or the file is malformed (a warning is printed for the
+/// last so the misconfiguration isn't silent).
+fn try_build_fleet() -> Option<OrchestratorBackend> {
+    let path = fleet_path()?;
+    let fleet = match FleetConfig::load(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("zero: ignoring {} ({e})", path.display());
+            return None;
+        }
+    };
+    if !fleet.is_active() {
+        return None;
+    }
+    let signal = std::sync::Arc::new(FleetSignal::new());
+    OrchestratorBackend::new(
+        fleet,
+        |tc| {
+            OpenAiBackend::from_config(&tc.to_config())
+                .map(|b| std::sync::Arc::new(b) as std::sync::Arc<dyn Backend>)
+        },
+        signal,
+    )
+}
+
+fn fleet_path() -> Option<std::path::PathBuf> {
+    home().map(|h| h.join(zero_core::brand::dot_dir()).join("fleet.toml"))
+}
+
 fn config_path() -> Option<std::path::PathBuf> {
     home().map(|h| h.join(zero_core::brand::dot_dir()).join("config.json"))
 }
@@ -749,6 +799,7 @@ fn print_usage() {
          \x20 resume <id>      continue a saved session (id from `zero sessions`)\n\
          \x20 rules <cmd>      init|add|status|doctor — project rules\n\n\
          config: ~/.zero/config.json (created on first run)\n\
+         fleet:  ~/.zero/fleet.toml  (optional multi-tier model orchestrator)\n\
          logs:   ~/.zero/sessions/<project>/  (override with ZERO_SESSION_DIR)\n"
     );
 }
