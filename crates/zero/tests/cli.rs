@@ -1045,3 +1045,88 @@ fn doctor_does_not_flag_project_operational_rule() {
     assert!(out.contains("no issues"), "{out}");
     std::fs::remove_dir_all(&base).ok();
 }
+
+// --- loops (zero loop new|list|run|tail) -----------------------------------
+fn loop_env(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = std::env::temp_dir().join(format!("zero-loop-cli-{}-{tag}", std::process::id()));
+    let home = base.join("home");
+    let loops = base.join("loops");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&loops).unwrap();
+    (base, loops)
+}
+
+fn run_loop(
+    loops: &std::path::Path,
+    home: &std::path::Path,
+    args: &[&str],
+) -> (String, String, i32) {
+    let out = Command::new(zero_bin())
+        .args(args)
+        .env("HOME", home)
+        .env("ZERO_LOOPS_DIR", loops)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn loop_new_scaffolds_and_list_shows_it() {
+    let (base, loops) = loop_env("new");
+    let home = base.join("home");
+    let (out, err, code) = run_loop(&loops, &home, &["loop", "new", "myperf", "perf-attack"]);
+    assert_eq!(code, 0, "stderr={err}");
+    assert!(out.contains("created loop"), "{out}");
+    assert!(loops.join("myperf/loop.toml").is_file());
+    assert!(loops.join("myperf/spec.md").is_file());
+
+    let (lout, _e, lcode) = run_loop(&loops, &home, &["loop", "list"]);
+    assert_eq!(lcode, 0);
+    assert!(lout.contains("myperf"), "list: {lout}");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn loop_run_banks_a_wake_then_pauses_on_budget() {
+    let (base, loops) = loop_env("run");
+    let home = base.join("home");
+    // A minimal loop: one passing exit gate, budget of exactly one wake.
+    std::fs::create_dir_all(loops.join("tiny")).unwrap();
+    std::fs::write(loops.join("tiny/spec.md"), "do the thing").unwrap();
+    std::fs::write(loops.join("tiny/rules.md"), "").unwrap();
+    std::fs::write(loops.join("tiny/state.md"), "").unwrap();
+    std::fs::write(
+        loops.join("tiny/loop.toml"),
+        "[budget]\nmax_wakes = 1\non_exhaust = \"pause\"\n[[gate]]\nname=\"ok\"\nrun=\"true\"\nparse=\"exit\"\npass=\"== 0\"\n",
+    )
+    .unwrap();
+
+    let (out, err, code) = run_loop(&loops, &home, &["loop", "run", "tiny", "--stub"]);
+    assert_eq!(code, 0, "stderr={err}");
+    // Exactly one wake ran, then the budget paused it (never a silent stop).
+    assert!(out.contains("BudgetExhausted"), "stdout: {out}");
+    let ticks = std::fs::read_to_string(loops.join("tiny/ticks.jsonl")).unwrap();
+    assert_eq!(ticks.lines().count(), 1, "exactly one wake banked");
+    assert!(
+        ticks.contains("\"name\":\"ok\""),
+        "gate result recorded: {ticks}"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn loop_run_refuses_a_missing_loop() {
+    let (base, loops) = loop_env("missing");
+    let home = base.join("home");
+    let (_o, err, code) = run_loop(&loops, &home, &["loop", "run", "ghost", "--stub"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("no loop"), "stderr: {err}");
+    std::fs::remove_dir_all(&base).ok();
+}
